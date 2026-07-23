@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -68,9 +69,9 @@ struct XCONTENT_DATA {
   }
 
   std::string file_name() const {
-    std::string value;
-    value.assign(file_name_raw, std::min(strlen(file_name_raw), countof(file_name_raw)));
-    return value;
+    const auto* end =
+        std::find(file_name_raw, file_name_raw + countof(file_name_raw), '\0');
+    return std::string(file_name_raw, end);
   }
 
   void set_display_name(const std::u16string_view value) {
