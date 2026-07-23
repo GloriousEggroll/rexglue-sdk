@@ -11,8 +11,6 @@
 
 #include "ppc/instruction.h"
 
-#include <unordered_set>
-
 #include <rex/codegen/phases.h>
 #include "phase_helpers.h"
 
@@ -29,16 +27,13 @@ using rex::memory::load_and_swap;
 
 namespace rex::codegen {
 
-namespace {
-
 //=============================================================================
 // GapFill to register uncovered code regions
 //=============================================================================
 
 // Split a code region into function segments based on terminators (blr, tail calls).
-std::vector<CodeRegion> splitRegionOnTerminators(
-    const CodeRegion& region, const BinaryView& binary,
-    const std::unordered_set<uint32_t>& knownCallables) {
+std::vector<CodeRegion> splitCodeRegionOnTerminators(
+    const CodeRegion& region, const BinaryView& binary, const FunctionGraph& graph) {
   std::vector<CodeRegion> segments;
   uint32_t segmentStart = region.start;
 
@@ -56,10 +51,13 @@ std::vector<CodeRegion> splitRegionOnTerminators(
     if (decoded.is_return()) {
       shouldSplit = true;
       reason = "blr";
+    } else if (decoded.opcode == Opcode::bcctr && !decoded.is_conditional()) {
+      shouldSplit = true;
+      reason = "bctr";
     } else if (decoded.opcode == Opcode::b && decoded.branch_target.has_value()) {
       uint32_t target = decoded.branch_target.value();
       // Don't split on tail recursion (branch to own segment start)
-      if (target != segmentStart && knownCallables.contains(target)) {
+      if (target != segmentStart && graph.isEntryPoint(target)) {
         shouldSplit = true;
         reason = "tail call";
       }
@@ -83,6 +81,8 @@ std::vector<CodeRegion> splitRegionOnTerminators(
 
   return segments;
 }
+
+namespace {
 
 // Check if address looks like exception handler data (handler ptr + rdata ptr)
 bool looksLikeExceptionData(const BinaryView& binary, const FunctionGraph& graph, uint32_t addr) {
@@ -126,18 +126,12 @@ void gapFillCodeRegions(CodegenContext& ctx) {
   auto& binary = ctx.binary();
   auto& scan = ctx.scan;
 
-  // Build set of known callables for tail call detection
-  std::unordered_set<uint32_t> knownCallables;
-  for (const auto& [addr, node] : graph.functions()) {
-    knownCallables.insert(addr);
-  }
-
   size_t gapsFound = 0;
   size_t segmentsCreated = 0;
 
   for (const auto& region : scan.codeRegions) {
     // Split region on terminators (blr, tail calls), then check each segment
-    auto segments = splitRegionOnTerminators(region, binary, knownCallables);
+    auto segments = splitCodeRegionOnTerminators(region, binary, graph);
 
     for (const auto& segment : segments) {
       // Skip if this segment's start is already a registered function entry
@@ -145,7 +139,7 @@ void gapFillCodeRegions(CodegenContext& ctx) {
         continue;
 
       // Skip if this segment's start is inside another function
-      if (auto* containingFunc = graph.getFunctionContaining(segment.start)) {
+      if (graph.getFunctionContaining(segment.start)) {
         continue;
       }
 

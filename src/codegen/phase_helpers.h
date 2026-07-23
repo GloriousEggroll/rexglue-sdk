@@ -12,6 +12,7 @@
 #pragma once
 
 #include <unordered_set>
+#include <vector>
 
 #include <rex/codegen/codegen_context.h>
 
@@ -33,6 +34,10 @@ inline std::unordered_set<uint32_t> buildKnownFunctions(const FunctionGraph& gra
   }
   return result;
 }
+
+/// Split a code region at function terminators for gap-fill discovery.
+std::vector<CodeRegion> splitCodeRegionOnTerminators(
+    const CodeRegion& region, const BinaryView& binary, const FunctionGraph& graph);
 
 /// Discover blocks for all pending functions.
 size_t discoverPendingFunctions(CodegenContext& ctx,
