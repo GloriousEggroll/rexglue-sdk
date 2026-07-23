@@ -74,7 +74,9 @@ function(rexglue_configure_target target_name)
         # Stage runtime DLLs (rexruntime, TracyClient, etc.) next to the host
         # binary on every link. copy_if_different is a no-op when up to date.
         add_custom_command(TARGET ${target_name} POST_BUILD
-            COMMAND "$<$<BOOL:$<TARGET_RUNTIME_DLLS:${target_name}>>:${CMAKE_COMMAND};-E;copy_if_different;$<TARGET_RUNTIME_DLLS:${target_name}>;$<TARGET_FILE_DIR:${target_name}>>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:${target_name}>
+                $<TARGET_FILE_DIR:${target_name}>
             COMMAND_EXPAND_LISTS
             VERBATIM
         )
