@@ -367,14 +367,30 @@ BoundsInfo scanForBounds(const FunctionScanner& scanner, guest_addr_t bctr_addre
 // Helper: Read table entries based on type
 //=============================================================================
 std::vector<guest_addr_t> read_table_entries(const FunctionScanner& scanner,
-                                             const JumpTableMatch& match, u32 entry_count) {
+                                             const JumpTableMatch& match, u32 entry_count,
+                                             guest_addr_t bctr_address) {
   std::vector<guest_addr_t> targets;
   guest_addr_t table_addr = match.table_address();
+  const u32 max_entries = REXCVAR_GET(max_jump_table_entries);
+
+  // Some compiler-generated switches merge multiple index-building paths before
+  // an inline absolute table. A mask on the nearest path may describe only a
+  // subset of the table. The first forward case label still gives the exact end
+  // of an inline table, so use it to extend a too-small bounds estimate.
+  const bool is_inline_absolute =
+      match.type == JumpTableType::kAbsolute && table_addr == bctr_address + 4;
+  guest_addr_t inline_table_end = 0;
 
   // entry_count comes from bounds check analysis - use it exactly if available
   // If no bounds check was found (entry_count == 0), read until we hit invalid entries
   // Loop terminates via goto done when invalid memory is hit
-  for (u32 i = 0; entry_count == 0 || i < entry_count; ++i) {
+  for (u32 i = 0; i < max_entries; ++i) {
+    const guest_addr_t entry_addr = table_addr + (i * 4);
+    if (entry_count != 0 && i >= entry_count &&
+        (!is_inline_absolute || inline_table_end == 0 || entry_addr >= inline_table_end)) {
+      break;
+    }
+
     guest_addr_t target = 0;
 
     switch (match.type) {
@@ -436,6 +452,11 @@ std::vector<guest_addr_t> read_table_entries(const FunctionScanner& scanner,
     }
 
     targets.push_back(target);
+
+    if (is_inline_absolute && target > table_addr &&
+        (inline_table_end == 0 || target < inline_table_end)) {
+      inline_table_end = target;
+    }
   }
 
 done:
@@ -824,7 +845,8 @@ std::optional<JumpTable> FunctionScanner::detect_jump_table(guest_addr_t bctr_ad
                    bounds.found, bounds.maxEntries, bounds.defaultTarget, bounds.indexReg);
 
   // Read table entries
-  std::vector<guest_addr_t> targets = read_table_entries(*this, match, bounds.maxEntries);
+  std::vector<guest_addr_t> targets =
+      read_table_entries(*this, match, bounds.maxEntries, bctr_address);
 
   // Require at least 2 entries
   if (targets.size() < 2) {
@@ -1681,6 +1703,9 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
   // If bounds not found (e.g., state machine pattern with forward bounds check),
   // use max entries and let the validation loop determine actual table size
   uint32_t entryCount = bounds.found ? bounds.maxEntries : kMaxTableEntries;
+  const bool isInlineAbsolute =
+      tableType == JumpTableType::kAbsolute && tableAddr == bctrAddr + 4;
+  uint32_t inlineTableEnd = 0;
 
   // Read table entries
   JumpTable jt;
@@ -1692,7 +1717,13 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
       "detectJumpTable: bctr=0x{:08X} reading {} entries from table=0x{:08X} base=0x{:08X} type={}",
       bctrAddr, entryCount, tableAddr, baseAddr, static_cast<int>(tableType));
 
-  for (uint32_t i = 0; i < entryCount; i++) {
+  for (uint32_t i = 0; i < kMaxTableEntries; i++) {
+    const uint32_t entryAddr = tableAddr + i * 4;
+    if (i >= entryCount &&
+        (!isInlineAbsolute || inlineTableEnd == 0 || entryAddr >= inlineTableEnd)) {
+      break;
+    }
+
     uint32_t target = 0;
 
     switch (tableType) {
@@ -1793,6 +1824,13 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
     }
 
     jt.targets.push_back(target);
+
+    // Inline absolute tables end where their first forward case begins. This
+    // extends path-local bounds estimates without consuming adjacent code.
+    if (isInlineAbsolute && target > tableAddr &&
+        (inlineTableEnd == 0 || target < inlineTableEnd)) {
+      inlineTableEnd = target;
+    }
   }
 
   if (jt.targets.empty()) {
