@@ -18,6 +18,7 @@ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
+option(REXGLUE_REGISTER_PACKAGE            "Register installs in the CMake user package registry" ON)
 # Propagate profiling defines globally (compiled out in Release)
 if(REXGLUE_ENABLE_TRACY)
     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
@@ -99,16 +100,36 @@ if(NOT WIN32)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
+# The AMD64 memory byte-swap routines use SSSE3 intrinsics. clang-cl enforces
+# intrinsic target features even though MSVC itself accepts these intrinsics
+# without an explicit architecture flag.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND
+   CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    add_compile_options(-msse4.1)
+endif()
+
 # Global compile options
-add_compile_options(
-    -fno-strict-aliasing
-    -ffp-model=strict
-    $<$<CONFIG:DEBUG>:-g>
-    $<$<CONFIG:DEBUG>:-O0>
-    $<$<CONFIG:RELEASE>:-O3>
-    $<$<CONFIG:RELEASE>:-DNDEBUG>
-    -fno-char8_t
-)
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    add_compile_options(
+        -fno-strict-aliasing
+        /fp:strict
+        $<$<COMPILE_LANGUAGE:CXX>:/Zc:char8_t->
+        $<$<CONFIG:DEBUG>:/Zi>
+        $<$<CONFIG:DEBUG>:/Od>
+        $<$<CONFIG:RELEASE>:/O2>
+        $<$<CONFIG:RELEASE>:/DNDEBUG>
+    )
+else()
+    add_compile_options(
+        -fno-strict-aliasing
+        -ffp-model=strict
+        $<$<CONFIG:DEBUG>:-g>
+        $<$<CONFIG:DEBUG>:-O0>
+        $<$<CONFIG:RELEASE>:-O3>
+        $<$<CONFIG:RELEASE>:-DNDEBUG>
+        -fno-char8_t
+    )
+endif()
 
 # Platform detection (supports AMD64 and ARM64)
 if(WIN32)
@@ -189,11 +210,16 @@ endif()
 # Third-party dependencies (vendored sources only)
 add_subdirectory(thirdparty)
 
-# Enable warnings after thirdparty
-add_compile_options(
-    -Wall
-    -Wextra
-)
+# Enable warnings after thirdparty. In clang-cl, `-Wall` aliases MSVC's
+# extremely noisy `/Wall`, rather than Clang's usual warning group.
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    add_compile_options(/W4)
+else()
+    add_compile_options(
+        -Wall
+        -Wextra
+    )
+endif()
 
 include_directories(${REXGLUE_ROOT}/include)
 

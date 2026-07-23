@@ -28,10 +28,9 @@ function(rexglue_apply_target_settings target_name)
         endif()
     endif()
 
-    if(NOT MSVC)
-        if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-            target_compile_options(${target_name} PRIVATE -msse4.1)
-        endif()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND
+       (NOT MSVC OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
+        target_compile_options(${target_name} PRIVATE -msse4.1)
     endif()
 endfunction()
 
