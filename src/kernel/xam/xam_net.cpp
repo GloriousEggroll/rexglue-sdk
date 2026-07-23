@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
@@ -40,11 +41,22 @@
 #include <sys/socket.h>
 #endif
 
+REXCVAR_DEFINE_BOOL(network_enabled, true, "Network",
+                    "Allow Xbox network APIs to create host sockets");
+
 namespace rex {
 namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+constexpr u32 kWsaNetDown = 0x2742;
+constexpr u32 kWsaNoProtoOpt = 0x273A;
+
+u32 SetSocketError(u32 error) {
+  XThread::SetLastError(error);
+  return u32(-1);
+}
 
 // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
 enum {
@@ -235,6 +247,19 @@ u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
 }
 
 u32 NetDll_WSAStartup_entry(u32 caller, u16 version, ppc_ptr_t<X_WSADATA> data_ptr) {
+  if (!REXCVAR_GET(network_enabled)) {
+    if (data_ptr) {
+      data_ptr->version = version;
+      data_ptr->version_high = version;
+      data_ptr->description[0] = '\0';
+      data_ptr->system_status[0] = '\0';
+      data_ptr->max_sockets = 0;
+      data_ptr->max_udpdg = 0;
+    }
+    REXKRNL_INFO("NetDll_WSAStartup: host networking disabled");
+    return 0;
+  }
+
 // TODO(benvanik): abstraction layer needed.
 #if REX_PLATFORM_WIN32
   WSADATA wsaData;
@@ -432,6 +457,11 @@ struct XnAddrStatus {
 };
 
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+  if (!REXCVAR_GET(network_enabled)) {
+    addr_ptr.Zero();
+    return XnAddrStatus::XNET_GET_XNADDR_NONE;
+  }
+
   // Just return a loopback address atm.
   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
   addr_ptr->inaOnline.s_addr = 0;
@@ -575,6 +605,10 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
 }
 
 u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
+  if (!REXCVAR_GET(network_enabled)) {
+    return SetSocketError(kWsaNetDown);
+  }
+
   XSocket* socket = new XSocket(REX_KERNEL_STATE());
   X_STATUS result =
       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
@@ -637,6 +671,22 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
 
   X_STATUS status = socket->SetOption(level, optname, optval_ptr, optlen);
   return XSUCCEEDED(status) ? 0 : -1;
+}
+
+i32 NetDll_getsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
+                            mapped_void optval_ptr, mapped_u32 optlen_ptr) {
+  if (!REXCVAR_GET(network_enabled)) {
+    return static_cast<i32>(SetSocketError(kWsaNetDown));
+  }
+
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    return static_cast<i32>(SetSocketError(0x2736));  // WSAENOTSOCK
+  }
+
+  REXKRNL_WARN("NetDll_getsockopt: option {} at level {} is unimplemented",
+               optname, level);
+  return static_cast<i32>(SetSocketError(kWsaNoProtoOpt));
 }
 
 u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
@@ -969,6 +1019,7 @@ REX_EXPORT(__imp__NetDll_socket, rex::kernel::xam::NetDll_socket_entry)
 REX_EXPORT(__imp__NetDll_closesocket, rex::kernel::xam::NetDll_closesocket_entry)
 REX_EXPORT(__imp__NetDll_shutdown, rex::kernel::xam::NetDll_shutdown_entry)
 REX_EXPORT(__imp__NetDll_setsockopt, rex::kernel::xam::NetDll_setsockopt_entry)
+REX_EXPORT(__imp__NetDll_getsockopt, rex::kernel::xam::NetDll_getsockopt_entry)
 REX_EXPORT(__imp__NetDll_ioctlsocket, rex::kernel::xam::NetDll_ioctlsocket_entry)
 REX_EXPORT(__imp__NetDll_bind, rex::kernel::xam::NetDll_bind_entry)
 REX_EXPORT(__imp__NetDll_connect, rex::kernel::xam::NetDll_connect_entry)
@@ -1095,4 +1146,3 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
 REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
 REX_EXPORT_STUB(__imp__NetDll_getpeername);
 REX_EXPORT_STUB(__imp__NetDll_getsockname);
-REX_EXPORT_STUB(__imp__NetDll_getsockopt);
