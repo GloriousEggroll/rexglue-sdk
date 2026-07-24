@@ -113,13 +113,19 @@ bool build_vnmsubfp(BuilderContext& ctx) {
 
 bool build_vmaxfp(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("max");
+  ctx.println(
+      "\tsimde_mm_store_ps({}.f32, rex::ppc::simde_mm_vmaxfp_ps_(simde_mm_load_ps({}.f32), "
+      "simde_mm_load_ps({}.f32)));",
+      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
   return true;
 }
 
 bool build_vminfp(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("min");
+  ctx.println(
+      "\tsimde_mm_store_ps({}.f32, rex::ppc::simde_mm_vminfp_ps_(simde_mm_load_ps({}.f32), "
+      "simde_mm_load_ps({}.f32)));",
+      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
   return true;
 }
 
