@@ -11,6 +11,7 @@ add_library(rexcore OBJECT
     exception_handler.cpp
     filesystem.cpp
     filesystem_wildcard.cpp
+    guest_function_trace.cpp
     logging.cpp
     memory.cpp
     mutex.cpp
@@ -101,4 +102,3 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
     target_compile_definitions(rexcore PUBLIC
         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
 endif()
-

@@ -33,6 +33,7 @@
 #include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/chrono/clock.h>
+#include <rex/trace/guest_function.h>
 #include <rex/perf/counter.h>
 #include <rex/thread/mutex.h>
 #include <rex/system/mmio_handler.h>
@@ -67,6 +68,17 @@ extern PPCFuncMapping PPCFuncMappings[];
 //=============================================================================
 // Function Prologue
 //=============================================================================
+
+#if defined(REXGLUE_ENABLE_GUEST_FUNCTION_TRACE)
+#define REX_TRACE_GUEST_FUNCTION(address)                \
+  do {                                                   \
+    if (rex::debug::IsGuestFunctionTraceEnabled()) {     \
+      rex::debug::TraceGuestFunction((uint32_t)address); \
+    }                                                    \
+  } while (0)
+#else
+#define REX_TRACE_GUEST_FUNCTION(address) ((void)0)
+#endif
 
 #if defined(REXGLUE_PROFILE_GUEST_FUNCTIONS) && defined(REXGLUE_ENABLE_PROFILING)
 #include <tracy/Tracy.hpp>
