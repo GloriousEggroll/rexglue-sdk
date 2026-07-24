@@ -131,10 +131,8 @@ bool build_vrefp(BuilderContext& ctx) {
 }
 
 bool build_vrsqrtefp(BuilderContext& ctx) {
-  // TODO: see if we can use rsqrt safely
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_unary_expr(
-      "simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({vA}.f32)))");
+  ctx.emit_vec_fp_unary_expr("rex::ppc::simde_mm_vrsqrtefp_ps_(simde_mm_load_ps({vA}.f32))");
   return true;
 }
 

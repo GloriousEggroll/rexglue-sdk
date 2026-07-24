@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <bit>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -169,6 +170,72 @@ inline simde__m128 simde_mm_vmsum4fp_ps_(simde__m128 a, simde__m128 b) {
   const double z = double(a_.f32[1]) * double(b_.f32[1]);
   const double w = double(a_.f32[0]) * double(b_.f32[0]);
   return simde_mm_set1_ps(vmx_dot_result_((x + z) + (y + w)));
+}
+
+inline uint32_t vmx_vrsqrtefp_lane_(uint32_t bits) {
+  static constexpr uint32_t table[32] = {
+      0x0568B4FD, 0x04F3AF97, 0x048DAAA5, 0x0435A618, 0x03E7A1E4, 0x03A29DFE,
+      0x03659A5C, 0x032E96F8, 0x02FC93CA, 0x02D090CE, 0x02A88DFE, 0x02838B57,
+      0x026188D4, 0x02438673, 0x02268431, 0x020B820B, 0x03D27FFA, 0x03807C29,
+      0x033878AA, 0x02F97572, 0x02C27279, 0x02926FB7, 0x02666D26, 0x023F6AC0,
+      0x021D6881, 0x01FD6665, 0x01E16468, 0x01C76287, 0x01AF60C1, 0x01995F12,
+      0x01855D79, 0x01735BF4,
+  };
+
+  const uint32_t sign = bits >> 31;
+  const uint32_t biased_exp = (bits >> 23) & 0xFF;
+  const uint32_t mantissa = bits & 0x007FFFFF;
+
+  if (bits == 0xFF800000u) {
+    return 0x7FC00000u;
+  }
+  if (biased_exp == 0) {
+    return sign ? 0xFF800000u : 0x7F800000u;
+  }
+  if (biased_exp == 0xFF) {
+    if (mantissa == 0) {
+      return 0;
+    }
+    return bits | 0x00400000u;
+  }
+  if (sign) {
+    return 0x7FC00000u;
+  }
+
+  const int32_t unbiased_exp = int32_t(biased_exp) - 127;
+  const uint32_t exp_parity = (uint32_t(unbiased_exp) << 4) & 16;
+  const uint32_t index = (exp_parity | (mantissa >> 19)) ^ 16;
+  const uint32_t interp = (mantissa >> 9) & 1023;
+  int32_t result_exp = (127 - int32_t(biased_exp)) >> 1;
+
+  const uint32_t entry = table[index];
+  uint32_t raw = ((entry << 10) & 0x3FFFC00u) - interp * (entry >> 16);
+  if (!(raw & (1u << 25))) {
+    const uint32_t value = raw & 0x1FFFFFF;
+    const uint32_t leading_zeros = std::countl_zero(value);
+    const uint32_t shift = leading_zeros - 6;
+    result_exp += 6 - int32_t(leading_zeros);
+    raw <<= shift;
+  }
+  if ((raw & 5) && (raw & 2)) {
+    raw += 4;
+  }
+
+  const uint32_t result =
+      (uint32_t(result_exp * (1 << 23)) + 0x3F800000u) | ((raw >> 2) & 0x7FFFFF);
+  if (((result >> 23) & 0xFF) == 0 && (result & 0x7FFFFF)) {
+    return 0;
+  }
+  return result;
+}
+
+inline simde__m128 simde_mm_vrsqrtefp_ps_(simde__m128 value) {
+  simde__m128_private value_ = simde__m128_to_private(value);
+  simde__m128_private result_;
+  for (size_t i = 0; i < 4; ++i) {
+    result_.u32[i] = vmx_vrsqrtefp_lane_(value_.u32[i]);
+  }
+  return simde__m128_from_private(result_);
 }
 
 // Unsigned 32-bit saturating add
