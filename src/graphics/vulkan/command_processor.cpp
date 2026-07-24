@@ -69,6 +69,10 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_log_shader_loads, false, "GPU/Vulkan",
+                    "Log guest shader addresses, sizes, and microcode hashes")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -3597,7 +3601,13 @@ void VulkanCommandProcessor::OnPrimaryBufferEnd() {
 
 Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                            const uint32_t* host_address, uint32_t dword_count) {
-  return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+  Shader* shader = pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+  if (REXCVAR_GET(vulkan_log_shader_loads)) {
+    REXGPU_INFO("GPU shader load: type={} guest=0x{:08X} dwords={} hash={:016X}",
+                shader_type == xenos::ShaderType::kVertex ? "VS" : "PS", guest_address, dword_count,
+                shader ? shader->ucode_data_hash() : 0);
+  }
+  return shader;
 }
 
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
