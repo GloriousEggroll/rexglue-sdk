@@ -141,6 +141,36 @@ inline simde__m128 simde_mm_fnmsub_ps_(simde__m128 a, simde__m128 b, simde__m128
   return simde__m128_from_private(result_);
 }
 
+inline float vmx_dot_result_(double sum) {
+  float result = static_cast<float>(sum);
+  if (std::isfinite(sum) && std::isinf(result)) {
+    const uint32_t qnan = 0x7FC00000u;
+    std::memcpy(&result, &qnan, sizeof(result));
+  }
+  return result;
+}
+
+// VMX128 dot products use double-precision intermediates. ReX stores guest
+// vector elements in reverse host lane order.
+inline simde__m128 simde_mm_vmsum3fp_ps_(simde__m128 a, simde__m128 b) {
+  simde__m128_private a_ = simde__m128_to_private(a);
+  simde__m128_private b_ = simde__m128_to_private(b);
+  const double x = double(a_.f32[3]) * double(b_.f32[3]);
+  const double y = double(a_.f32[2]) * double(b_.f32[2]);
+  const double z = double(a_.f32[1]) * double(b_.f32[1]);
+  return simde_mm_set1_ps(vmx_dot_result_((x + z) + y));
+}
+
+inline simde__m128 simde_mm_vmsum4fp_ps_(simde__m128 a, simde__m128 b) {
+  simde__m128_private a_ = simde__m128_to_private(a);
+  simde__m128_private b_ = simde__m128_to_private(b);
+  const double x = double(a_.f32[3]) * double(b_.f32[3]);
+  const double y = double(a_.f32[2]) * double(b_.f32[2]);
+  const double z = double(a_.f32[1]) * double(b_.f32[1]);
+  const double w = double(a_.f32[0]) * double(b_.f32[0]);
+  return simde_mm_set1_ps(vmx_dot_result_((x + z) + (y + w)));
+}
+
 // Unsigned 32-bit saturating add
 inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b) {
   return simde_mm_add_epi32(
