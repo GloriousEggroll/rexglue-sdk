@@ -129,6 +129,18 @@ inline simde__m128 simde_mm_fmadd_ps_(simde__m128 a, simde__m128 b, simde__m128 
   return simde__m128_from_private(result_);
 }
 
+// Fused negative multiply-subtract: -(a * b - c).
+inline simde__m128 simde_mm_fnmsub_ps_(simde__m128 a, simde__m128 b, simde__m128 c) {
+  simde__m128_private a_ = simde__m128_to_private(a);
+  simde__m128_private b_ = simde__m128_to_private(b);
+  simde__m128_private c_ = simde__m128_to_private(c);
+  simde__m128_private result_;
+  for (size_t i = 0; i < 4; ++i) {
+    result_.f32[i] = -std::fma(a_.f32[i], b_.f32[i], -c_.f32[i]);
+  }
+  return simde__m128_from_private(result_);
+}
+
 // Unsigned 32-bit saturating add
 inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b) {
   return simde_mm_add_epi32(
