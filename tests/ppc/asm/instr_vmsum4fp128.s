@@ -6,3 +6,33 @@ test_vmsum4fp128_1:
   #_ REGISTER_OUT v3 [3f800000, 3fc00000, 3f8ccccd, 3ff33333]
   #_ REGISTER_OUT v4 [40000000, 40700000, 4013d70a, 40b051eb]
   #_ REGISTER_OUT v5 [41A5147B, 41A5147B, 41A5147B, 41A5147B]
+
+test_vmsum4fp128_double_intermediate:
+  # SSE dpps rounds this to 0x49096aee. VMX128 double intermediates produce
+  # 0x49096aef.
+  #_ REGISTER_IN v3 [c4608d93, c4001c20, 425e8500, 44362558]
+  #_ REGISTER_IN v4 [c4105698, c3d3ba88, 442ddbea, c391147c]
+  vmsum4fp128 v5, v3, v4
+  blr
+  #_ REGISTER_OUT v5 [49096aef, 49096aef, 49096aef, 49096aef]
+
+test_vmsum4fp128_finite_overflow:
+  #_ REGISTER_IN v3 [7f7fffff, 00000000, 00000000, 00000000]
+  #_ REGISTER_IN v4 [40000000, 00000000, 00000000, 00000000]
+  vmsum4fp128 v5, v3, v4
+  blr
+  #_ REGISTER_OUT v5 [7fc00000, 7fc00000, 7fc00000, 7fc00000]
+
+test_vmsum4fp128_positive_denormal_output:
+  #_ REGISTER_IN v3 [00800000, 00000000, 00000000, 00000000]
+  #_ REGISTER_IN v4 [3f000000, 00000000, 00000000, 00000000]
+  vmsum4fp128 v5, v3, v4
+  blr
+  #_ REGISTER_OUT v5 [00000000, 00000000, 00000000, 00000000]
+
+test_vmsum4fp128_negative_denormal_output:
+  #_ REGISTER_IN v3 [80800000, 00000000, 00000000, 00000000]
+  #_ REGISTER_IN v4 [3f000000, 00000000, 00000000, 00000000]
+  vmsum4fp128 v5, v3, v4
+  blr
+  #_ REGISTER_OUT v5 [80000000, 80000000, 80000000, 80000000]
