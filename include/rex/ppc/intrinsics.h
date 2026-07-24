@@ -238,6 +238,65 @@ inline simde__m128 simde_mm_vrsqrtefp_ps_(simde__m128 value) {
   return simde__m128_from_private(result_);
 }
 
+inline uint32_t vmx_flush_denormal_bits_(uint32_t bits) {
+  if ((bits & 0x7F800000u) == 0) {
+    return bits & 0x80000000u;
+  }
+  return bits;
+}
+
+inline bool vmx_is_nan_bits_(uint32_t bits) {
+  return (bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0;
+}
+
+inline simde__m128 simde_mm_vmaxfp_ps_(simde__m128 a, simde__m128 b) {
+  simde__m128_private a_ = simde__m128_to_private(a);
+  simde__m128_private b_ = simde__m128_to_private(b);
+  simde__m128_private result_;
+  for (size_t i = 0; i < 4; ++i) {
+    const uint32_t a_bits = vmx_flush_denormal_bits_(a_.u32[i]);
+    const uint32_t b_bits = vmx_flush_denormal_bits_(b_.u32[i]);
+    if (vmx_is_nan_bits_(a_bits)) {
+      result_.u32[i] = a_bits;
+    } else if (vmx_is_nan_bits_(b_bits)) {
+      result_.u32[i] = b_bits;
+    } else if (((a_bits | b_bits) & 0x7FFFFFFFu) == 0) {
+      result_.u32[i] = a_bits & b_bits;
+    } else {
+      float a_value;
+      float b_value;
+      std::memcpy(&a_value, &a_bits, sizeof(a_value));
+      std::memcpy(&b_value, &b_bits, sizeof(b_value));
+      result_.u32[i] = a_value > b_value ? a_bits : b_bits;
+    }
+  }
+  return simde__m128_from_private(result_);
+}
+
+inline simde__m128 simde_mm_vminfp_ps_(simde__m128 a, simde__m128 b) {
+  simde__m128_private a_ = simde__m128_to_private(a);
+  simde__m128_private b_ = simde__m128_to_private(b);
+  simde__m128_private result_;
+  for (size_t i = 0; i < 4; ++i) {
+    const uint32_t a_bits = vmx_flush_denormal_bits_(a_.u32[i]);
+    const uint32_t b_bits = vmx_flush_denormal_bits_(b_.u32[i]);
+    if (vmx_is_nan_bits_(a_bits)) {
+      result_.u32[i] = a_bits;
+    } else if (vmx_is_nan_bits_(b_bits)) {
+      result_.u32[i] = b_bits;
+    } else if (((a_bits | b_bits) & 0x7FFFFFFFu) == 0) {
+      result_.u32[i] = a_bits | b_bits;
+    } else {
+      float a_value;
+      float b_value;
+      std::memcpy(&a_value, &a_bits, sizeof(a_value));
+      std::memcpy(&b_value, &b_bits, sizeof(b_value));
+      result_.u32[i] = a_value < b_value ? a_bits : b_bits;
+    }
+  }
+  return simde__m128_from_private(result_);
+}
+
 // Unsigned 32-bit saturating add
 inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b) {
   return simde_mm_add_epi32(
