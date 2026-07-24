@@ -333,6 +333,8 @@ bool ReXApp::SetupPresentation() {
                 std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
           }
         });
+        rex::ui::RegisterBind("bind_gpu_frame_trace", "F5", "Capture next GPU frame",
+                              [graphics_system] { graphics_system->RequestFrameTrace(); });
 
         OnCreateDialogs(imgui_drawer_.get());
       }
