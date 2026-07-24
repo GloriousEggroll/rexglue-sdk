@@ -75,6 +75,11 @@ extern PPCFuncMapping PPCFuncMappings[];
     if (rex::debug::IsGuestFunctionTraceEnabled()) {     \
       rex::debug::TraceGuestFunction((uint32_t)address); \
     }                                                    \
+    if (rex::debug::IsGuestFunctionStateTraceEnabled(    \
+            (uint32_t)address)) {                        \
+      rex::debug::TraceGuestFunctionState(               \
+          (uint32_t)address, ctx, base);                  \
+    }                                                    \
   } while (0)
 #else
 #define REX_TRACE_GUEST_FUNCTION(address) ((void)0)

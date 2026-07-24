@@ -10,9 +10,14 @@
 
 #include <cstdint>
 
+struct PPCContext;
+
 namespace rex::debug {
 
 bool IsGuestFunctionTraceEnabled();
 void TraceGuestFunction(uint32_t guest_address);
+bool IsGuestFunctionStateTraceEnabled(uint32_t guest_address);
+void TraceGuestFunctionState(uint32_t guest_address, const PPCContext& context,
+                             const uint8_t* memory_base);
 
 }  // namespace rex::debug
