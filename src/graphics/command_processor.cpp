@@ -45,6 +45,13 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(
+    occlusion_query_zero_is_visible, false, "GPU",
+    "Bias zero-sample host occlusion query results to one visible sample. "
+    "This avoids premature culling in titles that cannot consume immediate "
+    "zero results safely.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
                       " none: Disable readback (default)\n"

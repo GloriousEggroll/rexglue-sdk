@@ -5036,6 +5036,9 @@ void D3D12CommandProcessor::WriteGuestOcclusionResult(
   if (!sample_counts) {
     return;
   }
+  if (!samples && REXCVAR_GET(occlusion_query_zero_is_visible)) {
+    samples = 1;
+  }
   uint32_t clamped = samples > uint64_t(UINT32_MAX) ? UINT32_MAX : uint32_t(samples);
   sample_counts->Total_A = clamped;
   sample_counts->Total_B = 0;
