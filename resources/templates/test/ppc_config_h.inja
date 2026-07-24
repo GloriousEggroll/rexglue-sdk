@@ -47,6 +47,10 @@
 #endif
 #endif
 
+#ifndef REX_TRACE_GUEST_FUNCTION
+#define REX_TRACE_GUEST_FUNCTION(address) ((void)0)
+#endif
+
 // Function definition macros (same as codegen init header)
 #ifndef DECLARE_REX_FUNC
 #define DECLARE_REX_FUNC(name) \
