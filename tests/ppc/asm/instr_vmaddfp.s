@@ -36,4 +36,16 @@ test_vmaddfp_3:
   #_ REGISTER_OUT v4 [40a00000, 40a00000, 3f800000, 3f800000]
   #_ REGISTER_OUT v5 [40a00000, 40a00000, 3f800000, 3f800000]
   #_ REGISTER_OUT v6 [3f800000, 3f800000, 3f800000, 3f800000]
-  
+
+test_vmaddfp_fused_rounding:
+  # Separate multiply and add rounds this to zero. The fused Xbox operation
+  # retains the exact product residual, 2^-46.
+  #_ REGISTER_IN v4 [3f800001, 3f800001, 3f800001, 3f800001]
+  #_ REGISTER_IN v5 [3f800001, 3f800001, 3f800001, 3f800001]
+  #_ REGISTER_IN v6 [bf800002, bf800002, bf800002, bf800002]
+  vmaddfp v3, v4, v5, v6
+  blr
+  #_ REGISTER_OUT v3 [28800000, 28800000, 28800000, 28800000]
+  #_ REGISTER_OUT v4 [3f800001, 3f800001, 3f800001, 3f800001]
+  #_ REGISTER_OUT v5 [3f800001, 3f800001, 3f800001, 3f800001]
+  #_ REGISTER_OUT v6 [bf800002, bf800002, bf800002, bf800002]

@@ -93,8 +93,8 @@ bool build_vmulfp128(BuilderContext& ctx) {
 bool build_vmaddfp(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(true);
   ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_add_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)));",
+      "\tsimde_mm_store_ps({}.f32, rex::ppc::simde_mm_fmadd_ps_(simde_mm_load_ps({}.f32), "
+      "simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));",
       ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
       ctx.v(ctx.insn.operands[3]));
   return true;
