@@ -4,6 +4,7 @@
 set(REXUI_CORE_SOURCES
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp
+    hdr_availability.cpp
     imgui_dialog.cpp
     imgui_drawer.cpp
     immediate_drawer.cpp

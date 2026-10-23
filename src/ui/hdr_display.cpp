@@ -11,7 +11,6 @@
 
 namespace rex::ui {
 namespace {
-std::atomic<bool> native_hdr_available{false};
 struct Output {
   HdrDisplay result;
   wl_output* output = nullptr;
@@ -173,6 +172,4 @@ HdrDisplay ProbeHdrOutput(wl_display* display, wl_output* output) {
   auto result = ProbeDisplay(display, output);
   return result.empty() ? HdrDisplay{} : result.front();
 }
-bool IsNativeHdrAvailable() { return native_hdr_available.load(std::memory_order_relaxed); }
-void SetNativeHdrAvailable(bool available) { native_hdr_available.store(available, std::memory_order_relaxed); }
 }
