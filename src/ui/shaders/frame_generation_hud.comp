@@ -1,7 +1,9 @@
 #version 450
-// Frame generation: interpolation warps the whole image, HUD included. Put the
-// real frame's HUD back over the generated frame wherever the producer's
-// reactive mask marks HUD pixels (render resolution, sampled bilinearly).
+// Puts the HUD of a real frame over an image wherever the producer's HUD mask
+// (render resolution, sampled bilinearly) marks it: over the output of a
+// temporal upscaler (the HUD is not jittered, so it must not go through it),
+// and over generated frames (interpolation warps the whole image). The real
+// frame is sampled bilinearly, at render or display resolution.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0, rgb10_a2) uniform image2D generated;
 layout(set = 0, binding = 1) uniform texture2D real_frame;
@@ -16,6 +18,6 @@ void main() {
   // Widen the soft edge of the upsampled mask so HUD outlines are covered.
   const float hud = clamp(textureLod(sampler2D(hud_mask, linear_sampler), uv, 0.0).r * 2.0, 0.0, 1.0);
   if (hud <= 0.0) return;
-  const vec4 real = texelFetch(sampler2D(real_frame, linear_sampler), ivec2(pixel), 0);
+  const vec4 real = textureLod(sampler2D(real_frame, linear_sampler), uv, 0.0);
   imageStore(generated, ivec2(pixel), mix(imageLoad(generated, ivec2(pixel)), real, hud));
 }

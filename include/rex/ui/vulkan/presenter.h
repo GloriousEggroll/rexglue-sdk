@@ -479,6 +479,13 @@ class VulkanPresenter final : public Presenter {
   bool EnsureFrameGeneration(uint32_t render_width, uint32_t render_height,
                              uint32_t display_width, uint32_t display_height);
   void DestroyFrameGeneration();
+  // Composites the HUD (where the producer's mask marks it) from `source`
+  // over `target` (GENERAL, storage); used after temporal upscaling and on
+  // generated frames.
+  bool EnsureHudComposite();
+  void DestroyHudComposite();
+  void RecordHudComposite(VkCommandBuffer command_buffer, VkImageView target, VkExtent2D extent,
+                          VkImageView source, VkImageView mask, size_t set_index);
   // Generates the frame between the previous and `real` (FSR output) into
   // `output`, then restores the HUD from `real`. `real` is in
   // SHADER_READ_ONLY_OPTIMAL and `output` in GENERAL.
@@ -558,7 +565,7 @@ class VulkanPresenter final : public Presenter {
   VkPipelineLayout frame_generation_hud_layout_ = VK_NULL_HANDLE;
   VkPipeline frame_generation_hud_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool frame_generation_hud_pool_ = VK_NULL_HANDLE;
-  std::array<VkDescriptorSet, 3> frame_generation_hud_sets_{};
+  std::array<VkDescriptorSet, 6> frame_generation_hud_sets_{};
   bool frame_generation_logged_ = false;
 #endif
 };

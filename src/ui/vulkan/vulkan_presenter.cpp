@@ -220,6 +220,7 @@ void VulkanPresenter::ReleaseGpuEffects() {
     DestroyFrameGeneration();
     DestroyTemporalUpscalerContext();
   }
+  DestroyHudComposite();
 #endif
 }
 
@@ -246,6 +247,7 @@ VulkanPresenter::~VulkanPresenter() {
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   vendor_upscaler_.reset();
   DestroyFrameGeneration();
+  DestroyHudComposite();
   DestroyTemporalUpscalerContext();
 #endif
 
@@ -536,6 +538,11 @@ void VulkanPresenter::DestroyFrameGeneration() {
   frame_generation_history_ = false;
   frame_generation_render_width_ = frame_generation_render_height_ = 0;
   frame_generation_display_width_ = frame_generation_display_height_ = 0;
+}
+
+void VulkanPresenter::DestroyHudComposite() {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
   util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, frame_generation_hud_pipeline_);
   util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device, frame_generation_hud_layout_);
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device, frame_generation_hud_pool_);
@@ -544,22 +551,12 @@ void VulkanPresenter::DestroyFrameGeneration() {
   frame_generation_hud_sets_ = {};
 }
 
-bool VulkanPresenter::EnsureFrameGeneration(uint32_t render_width, uint32_t render_height,
-                                            uint32_t display_width, uint32_t display_height) {
-  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
-  const VkDevice device = vulkan_device_->device();
-  if (frame_generation_context_ && frame_generation_render_width_ == render_width &&
-      frame_generation_render_height_ == render_height &&
-      frame_generation_display_width_ == display_width &&
-      frame_generation_display_height_ == display_height) {
+bool VulkanPresenter::EnsureHudComposite() {
+  if (frame_generation_hud_pipeline_) {
     return true;
   }
-  // Size changes recreate everything; the paint submissions that used the old
-  // objects are awaited first.
-  paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
-  DestroyFrameGeneration();
-
-  // HUD composite pipeline.
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
   VkDescriptorSetLayoutBinding bindings[4] = {};
   const VkDescriptorType types[4] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                      VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
@@ -587,10 +584,10 @@ bool VulkanPresenter::EnsureFrameGeneration(uint32_t render_width, uint32_t rend
   module_info.pCode = shaders::frame_generation_hud_cs;
   VkShaderModule module = VK_NULL_HANDLE;
   const VkDescriptorPoolSize pool_sizes[] = {
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 6},
-      {VK_DESCRIPTOR_TYPE_SAMPLER, 3}};
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 12},
+      {VK_DESCRIPTOR_TYPE_SAMPLER, 6}};
   VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-  pool_info.maxSets = 3;
+  pool_info.maxSets = 6;
   pool_info.poolSizeCount = 3;
   pool_info.pPoolSizes = pool_sizes;
   if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
@@ -601,7 +598,7 @@ bool VulkanPresenter::EnsureFrameGeneration(uint32_t render_width, uint32_t rend
       dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &frame_generation_hud_pool_) !=
           VK_SUCCESS) {
     if (module) dfn.vkDestroyShaderModule(device, module, nullptr);
-    DestroyFrameGeneration();
+    DestroyHudComposite();
     return false;
   }
   VkComputePipelineCreateInfo pipeline_info = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -613,16 +610,72 @@ bool VulkanPresenter::EnsureFrameGeneration(uint32_t render_width, uint32_t rend
   const VkResult pipeline_result = dfn.vkCreateComputePipelines(
       device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &frame_generation_hud_pipeline_);
   dfn.vkDestroyShaderModule(device, module, nullptr);
-  std::array<VkDescriptorSetLayout, 3> set_layouts;
+  std::array<VkDescriptorSetLayout, 6> set_layouts;
   set_layouts.fill(frame_generation_hud_set_layout_);
   VkDescriptorSetAllocateInfo allocate_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
   allocate_info.descriptorPool = frame_generation_hud_pool_;
-  allocate_info.descriptorSetCount = 3;
+  allocate_info.descriptorSetCount = uint32_t(set_layouts.size());
   allocate_info.pSetLayouts = set_layouts.data();
   if (pipeline_result != VK_SUCCESS ||
       dfn.vkAllocateDescriptorSets(device, &allocate_info, frame_generation_hud_sets_.data()) !=
           VK_SUCCESS) {
-    DestroyFrameGeneration();
+    DestroyHudComposite();
+    return false;
+  }
+  return true;
+}
+
+void VulkanPresenter::RecordHudComposite(VkCommandBuffer command_buffer, VkImageView target,
+                                         VkExtent2D extent, VkImageView source,
+                                         VkImageView mask, size_t set_index) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDescriptorSet set = frame_generation_hud_sets_[set_index % frame_generation_hud_sets_.size()];
+  VkDescriptorImageInfo images[3] = {
+      {VK_NULL_HANDLE, target, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+      {VK_NULL_HANDLE, mask, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+  VkWriteDescriptorSet writes[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = set;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[i].pImageInfo = &images[i];
+  }
+  dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 3, writes, 0, nullptr);
+  VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0,
+                           nullptr);
+  dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        frame_generation_hud_pipeline_);
+  dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              frame_generation_hud_layout_, 0, 1, &set, 0, nullptr);
+  const uint32_t size[2] = {extent.width, extent.height};
+  dfn.vkCmdPushConstants(command_buffer, frame_generation_hud_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                         0, sizeof(size), size);
+  dfn.vkCmdDispatch(command_buffer, (extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+}
+
+bool VulkanPresenter::EnsureFrameGeneration(uint32_t render_width, uint32_t render_height,
+                                            uint32_t display_width, uint32_t display_height) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  if (frame_generation_context_ && frame_generation_render_width_ == render_width &&
+      frame_generation_render_height_ == render_height &&
+      frame_generation_display_width_ == display_width &&
+      frame_generation_display_height_ == display_height) {
+    return true;
+  }
+  // Size changes recreate everything; the paint submissions that used the old
+  // objects are awaited first.
+  paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+  DestroyFrameGeneration();
+
+  if (!EnsureHudComposite()) {
     return false;
   }
 
@@ -757,38 +810,9 @@ bool VulkanPresenter::DispatchFrameGeneration(VkCommandBuffer command_buffer,
   frame_generation_history_ = true;
 
   // Restore the HUD of the real frame over the generated one.
-  if (inputs.reactive.view) {
-    const VulkanDevice::Functions& dfn = vulkan_device_->functions();
-    const VkDescriptorSet set = frame_generation_hud_sets_[descriptor_slot % 3];
-    VkDescriptorImageInfo images[3] = {
-        {VK_NULL_HANDLE, output.view(), VK_IMAGE_LAYOUT_GENERAL},
-        {VK_NULL_HANDLE, real.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, inputs.reactive.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
-    VkWriteDescriptorSet writes[3] = {};
-    for (uint32_t i = 0; i < 3; ++i) {
-      writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      writes[i].dstSet = set;
-      writes[i].dstBinding = i;
-      writes[i].descriptorCount = 1;
-      writes[i].descriptorType =
-          i ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-      writes[i].pImageInfo = &images[i];
-    }
-    dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 3, writes, 0, nullptr);
-    VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0,
-                             nullptr);
-    dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          frame_generation_hud_pipeline_);
-    dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                frame_generation_hud_layout_, 0, 1, &set, 0, nullptr);
-    const uint32_t size[2] = {extent.width, extent.height};
-    dfn.vkCmdPushConstants(command_buffer, frame_generation_hud_layout_,
-                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(size), size);
-    dfn.vkCmdDispatch(command_buffer, (extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+  if (inputs.hudless_color.image && inputs.reactive.view) {
+    RecordHudComposite(command_buffer, output.view(), extent, real.view(), inputs.reactive.view,
+                       descriptor_slot * 2 + 1);
   }
   return true;
 }
@@ -2515,6 +2539,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                                          *guest_output_temporal_inputs)) {
               temporal_upscaler_last_serial_ = guest_output_refresh_serial;
               temporal_upscaler_last_output_ = output_image;
+              // The HUD is not jittered: take it from the guest frame,
+              // scaled, rather than through the temporal upscaler.
+              if (guest_output_temporal_inputs->hudless_color.image &&
+                  guest_output_temporal_inputs->reactive.view && EnsureHudComposite()) {
+                RecordHudComposite(draw_command_buffer, upscale_view,
+                                   {effect_rect_size.first, effect_rect_size.second}, source_view,
+                                   guest_output_temporal_inputs->reactive.view,
+                                   size_t(current_paint_submission_index) * 2);
+              }
               image_barrier(upscale_image, VK_IMAGE_LAYOUT_GENERAL,
                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
                             VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
