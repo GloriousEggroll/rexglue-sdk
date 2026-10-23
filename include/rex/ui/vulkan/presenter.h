@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -26,6 +27,7 @@
 #include <rex/ui/vulkan/presenter_gpu_timing.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/temporal_upscale.h>
+#include <rex/ui/vulkan/vendor_upscalers.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 
 namespace rex {
@@ -466,9 +468,10 @@ class VulkanPresenter final : public Presenter {
   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
                                      uint32_t output_width, uint32_t output_height);
   bool DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VkImage input_image,
-                                uint32_t input_width, uint32_t input_height, VkImage output_image,
-                                uint32_t output_width, uint32_t output_height,
-                                const GuestOutputPaintConfig& config,
+                                VkImageView input_view, uint32_t input_width,
+                                uint32_t input_height, VkImage output_image,
+                                VkImageView output_view, uint32_t output_width,
+                                uint32_t output_height, const GuestOutputPaintConfig& config,
                                 const TemporalUpscaleInputs& inputs);
   void DestroyTemporalUpscalerContext();
   // Frame generation (FSR 3.1 frame interpolation, dispatched directly; the
@@ -539,6 +542,9 @@ class VulkanPresenter final : public Presenter {
   std::vector<std::pair<uint64_t, std::shared_ptr<const TemporalUpscaleInputs>>>
       temporal_inputs_in_flight_;
 
+  // DLSS or XeSS when present_effect selects one and it is available.
+  std::unique_ptr<VendorUpscaler> vendor_upscaler_;
+  std::string vendor_upscaler_choice_;
   void* frame_generation_context_ = nullptr;
   uint32_t frame_generation_render_width_ = 0, frame_generation_render_height_ = 0;
   uint32_t frame_generation_display_width_ = 0, frame_generation_display_height_ = 0;

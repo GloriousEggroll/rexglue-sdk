@@ -47,6 +47,9 @@
 #endif
 
 REXCVAR_DECLARE(bool, vsync);
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+REXCVAR_DECLARE(std::string, present_effect);
+#endif
 REXCVAR_DEFINE_BOOL(present_frame_generation, false, "UI/Presenter",
                     "FSR 3.1 frame generation: show a generated frame between game frames. "
                     "Needs present_effect=fsr3 and a renderer that supplies scene inputs");
@@ -210,9 +213,10 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
 void VulkanPresenter::ReleaseGpuEffects() {
   Presenter::ReleaseGpuEffects();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-  if (temporal_upscaler_context_ || frame_generation_context_) {
+  if (temporal_upscaler_context_ || frame_generation_context_ || vendor_upscaler_) {
     paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
-    REXLOG_INFO("VulkanPresenter: releasing FidelityFX contexts");
+    REXLOG_INFO("VulkanPresenter: releasing upscaler contexts");
+    vendor_upscaler_.reset();
     DestroyFrameGeneration();
     DestroyTemporalUpscalerContext();
   }
@@ -240,6 +244,7 @@ VulkanPresenter::~VulkanPresenter() {
   ui_submission_tracker_.Shutdown();
   guest_output_image_refresher_submission_tracker_.Shutdown();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  vendor_upscaler_.reset();
   DestroyFrameGeneration();
   DestroyTemporalUpscalerContext();
 #endif
@@ -367,8 +372,9 @@ bool VulkanPresenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint3
 }
 
 bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VkImage input_image,
-                                               uint32_t input_width, uint32_t input_height,
-                                               VkImage output_image, uint32_t output_width,
+                                               VkImageView input_view, uint32_t input_width,
+                                               uint32_t input_height, VkImage output_image,
+                                               VkImageView output_view, uint32_t output_width,
                                                uint32_t output_height,
                                                const GuestOutputPaintConfig& config,
                                                const TemporalUpscaleInputs& inputs) {
@@ -385,6 +391,56 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
     }
     return false;
   }
+  // DLSS or XeSS when selected and available; FSR 3.1 otherwise.
+  {
+    const std::string choice = REXCVAR_GET(present_effect);
+    if (choice != vendor_upscaler_choice_) {
+      if (vendor_upscaler_) {
+        paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+        vendor_upscaler_.reset();
+      }
+      vendor_upscaler_choice_ = choice;
+      if (choice == "dlss" || choice == "xess") {
+        vendor_upscaler_ = VendorUpscaler::Create(
+            choice == "dlss" ? VendorUpscalerKind::kDlss : VendorUpscalerKind::kXess,
+            vulkan_device_);
+        if (!vendor_upscaler_) {
+          REXLOG_WARN("VulkanPresenter: {} is unavailable; using FSR 3.1", choice);
+        }
+      }
+    }
+    if (vendor_upscaler_) {
+      auto image = [&](VkImage image, VkImageView view, VkFormat format, uint32_t width,
+                       uint32_t height) {
+        return VendorUpscaler::Image{image, view, format, width, height};
+      };
+      VendorUpscaler::Dispatch dispatch;
+      dispatch.command_buffer = command_buffer;
+      dispatch.color = image(input_image, input_view, kGuestOutputFormat, input_width, input_height);
+      dispatch.depth = image(inputs.depth.image, inputs.depth.view, inputs.depth.format,
+                             input_width, input_height);
+      dispatch.motion_vectors = image(inputs.motion_vectors.image, inputs.motion_vectors.view,
+                                      inputs.motion_vectors.format, input_width, input_height);
+      dispatch.reactive = image(inputs.reactive.image, inputs.reactive.view,
+                                inputs.reactive.format, input_width, input_height);
+      dispatch.output =
+          image(output_image, output_view, kGuestOutputFormat, output_width, output_height);
+      dispatch.jitter_x = inputs.jitter_x;
+      dispatch.jitter_y = inputs.jitter_y;
+      dispatch.reset = inputs.reset || inputs.frame_id != temporal_upscaler_last_frame_id_ + 1;
+      dispatch.frame_time_ms = inputs.frame_time_ms;
+      if (vendor_upscaler_->Evaluate(dispatch, [this] {
+            paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+          })) {
+        temporal_upscaler_last_frame_id_ = inputs.frame_id;
+        return true;
+      }
+      REXLOG_WARN("VulkanPresenter: {} dispatch failed; using FSR 3.1", vendor_upscaler_->name());
+      paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+      vendor_upscaler_.reset();
+    }
+  }
+
   if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
     return false;
   }
@@ -607,8 +663,15 @@ bool VulkanPresenter::EnsureFrameGeneration(uint32_t render_width, uint32_t rend
   ffxConfigureDescFrameGeneration configure = {};
   configure.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
   configure.frameGenerationEnabled = true;
+  // No FidelityFX swapchain: interpolation only (the presenter paces). The
+  // notification would call a swapchain hook that is null off Windows.
+  configure.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
   configure.frameID = frame_generation_frame_id_;
-  ffxConfigure(context, &configure.header);
+  if (ffxConfigure(context, &configure.header) != FFX_API_RETURN_OK) {
+    REXLOG_WARN("VulkanPresenter: Failed to configure FidelityFX frame generation");
+    DestroyFrameGeneration();
+    return false;
+  }
   frame_generation_render_width_ = render_width;
   frame_generation_render_height_ = render_height;
   frame_generation_display_width_ = display_width;
@@ -2440,8 +2503,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             temporal_upscaler_last_serial_ = 0;
             frame_generation_real_pending_ = false;
-            if (DispatchTemporalUpscaler(draw_command_buffer, source_image, effect_input_width,
-                                         effect_input_height, upscale_image, effect_rect_size.first,
+            const VkImageView source_view =
+                i ? paint_context_.guest_output_intermediate_images[i - 1]->view()
+                  : guest_output_image->view();
+            const VkImageView upscale_view =
+                frame_generation ? frame_generation_real_->view() : output.view();
+            if (DispatchTemporalUpscaler(draw_command_buffer, source_image, source_view,
+                                         effect_input_width, effect_input_height, upscale_image,
+                                         upscale_view, effect_rect_size.first,
                                          effect_rect_size.second, guest_output_paint_config,
                                          *guest_output_temporal_inputs)) {
               temporal_upscaler_last_serial_ = guest_output_refresh_serial;

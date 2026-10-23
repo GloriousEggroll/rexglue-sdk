@@ -39,6 +39,7 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_submission_tracker.cpp
     vulkan/vulkan_upload_buffer_pool.cpp
     vulkan/vulkan_util.cpp
+    vulkan/vendor_upscalers.cpp
 )
 
 # D3D12 UI backend
@@ -122,6 +123,36 @@ endif()
 if(REXUI_HAS_FIDELITYFX_RUNTIME)
     target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_RUNTIME=1)
 endif()
+
+# Optional vendor upscalers from SDKs the application fetches itself (they are
+# not redistributed with this source). Runtime libraries are listed in
+# REXGLUE_VENDOR_UPSCALER_RUNTIMES for the application to place next to its
+# executable.
+set(REXGLUE_DLSS_SDK_DIR "" CACHE PATH "NVIDIA DLSS SDK root (NGX); enables DLSS Super Resolution")
+set(REXGLUE_XESS_SDK_DIR "" CACHE PATH "Intel XeSS SDK root; enables XeSS Super Resolution (Windows)")
+set(REXGLUE_VENDOR_UPSCALER_RUNTIMES "" CACHE INTERNAL "")
+set(_rex_vendor_runtimes)
+if(REXGLUE_USE_VULKAN AND REXGLUE_DLSS_SDK_DIR AND EXISTS "${REXGLUE_DLSS_SDK_DIR}/include/nvsdk_ngx_vk.h")
+    target_include_directories(rexui PRIVATE "${REXGLUE_DLSS_SDK_DIR}/include")
+    target_compile_definitions(rexui PRIVATE REX_HAS_DLSS=1)
+    if(WIN32)
+        target_link_libraries(rexui PRIVATE "${REXGLUE_DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+        file(GLOB _rex_dlss_runtime "${REXGLUE_DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll")
+    else()
+        target_link_libraries(rexui PRIVATE "${REXGLUE_DLSS_SDK_DIR}/lib/Linux_x86_64/libnvsdk_ngx.a" ${CMAKE_DL_LIBS})
+        file(GLOB _rex_dlss_runtime "${REXGLUE_DLSS_SDK_DIR}/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.*")
+    endif()
+    list(APPEND _rex_vendor_runtimes ${_rex_dlss_runtime})
+    message(STATUS "  DLSS: ${REXGLUE_DLSS_SDK_DIR}")
+endif()
+if(WIN32 AND REXGLUE_USE_VULKAN AND REXGLUE_XESS_SDK_DIR AND EXISTS "${REXGLUE_XESS_SDK_DIR}/inc/xess/xess_vk.h")
+    # libxess.dll is loaded at runtime; no import library.
+    target_include_directories(rexui PRIVATE "${REXGLUE_XESS_SDK_DIR}/inc")
+    target_compile_definitions(rexui PRIVATE REX_HAS_XESS=1)
+    list(APPEND _rex_vendor_runtimes "${REXGLUE_XESS_SDK_DIR}/bin/libxess.dll")
+    message(STATUS "  XeSS: ${REXGLUE_XESS_SDK_DIR}")
+endif()
+set(REXGLUE_VENDOR_UPSCALER_RUNTIMES "${_rex_vendor_runtimes}" CACHE INTERNAL "")
 
 if(REXGLUE_USE_VULKAN)
     target_link_libraries(rexui PUBLIC

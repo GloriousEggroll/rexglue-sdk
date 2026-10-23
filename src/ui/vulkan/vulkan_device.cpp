@@ -20,6 +20,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/vendor_upscalers.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
@@ -199,6 +200,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // #477. Also exposed by Mesa's anti-lag layer.
     XE_UI_VULKAN_STRUCT_EXTENSION(AMD_anti_lag)
   }
+  std::vector<std::unique_ptr<bool>> vendor_extensions_enabled;
+  for (const std::string& name :
+       GetVendorUpscalerDeviceExtensions(vulkan_instance->instance(), physical_device)) {
+    if (requested_extensions.count(name)) continue;
+    vendor_extensions_enabled.push_back(std::make_unique<bool>(false));
+    requested_extensions.emplace(name, vendor_extensions_enabled.back().get());
+  }
   if (with_swapchain) {
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_hdr_metadata)
     // #2.
@@ -304,6 +312,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   VkPhysicalDeviceFeatures2 supported_features_2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
 
+  // Linked only for vendor upscaler requirements (nothing else enables 1.1
+  // features through it).
+  VulkanFeatures<VkPhysicalDeviceVulkan11Features,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES>
+      features_1_1;
   VulkanFeatures<VkPhysicalDeviceVulkan12Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES>
       features_1_2;
@@ -340,9 +353,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceAntiLagFeaturesAMD,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD>
       features_AMD_anti_lag;
+  // Requested only by vendor upscalers (XeSS).
+  VulkanFeatures<VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT>
+      features_EXT_mutable_descriptor_type;
+  bool ext_EXT_mutable_descriptor_type = false;
+  if (const auto it = requested_extensions.find("VK_EXT_mutable_descriptor_type");
+      it != requested_extensions.end()) {
+    ext_EXT_mutable_descriptor_type = *it->second;
+  }
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+      features_1_1.Link(supported_features_2, device_create_info);
       features_1_2.Link(supported_features_2, device_create_info);
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
@@ -383,6 +406,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_AMD_anti_lag) {
       features_AMD_anti_lag.Link(supported_features_2, device_create_info);
+    }
+    if (ext_EXT_mutable_descriptor_type) {
+      features_EXT_mutable_descriptor_type.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -763,6 +789,29 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_PROPERTY_2
 #undef XE_UI_VULKAN_ENUM_PROPERTY_2
 #undef XE_UI_VULKAN_FEATURE_2
+
+  {
+    const bool linked_1_2 = properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0);
+    const bool linked_1_3 = properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0);
+    VendorUpscalerFeatureTargets targets;
+    targets.core_enabled = &enabled_features;
+    targets.core_supported = &supported_features;
+    if (linked_1_2) {
+      targets.enabled_1_1 = &features_1_1.enabled;
+      targets.supported_1_1 = &features_1_1.supported;
+      targets.enabled_1_2 = &features_1_2.enabled;
+      targets.supported_1_2 = &features_1_2.supported;
+    }
+    if (linked_1_3) {
+      targets.enabled_1_3 = &features_1_3.enabled;
+      targets.supported_1_3 = &features_1_3.supported;
+    }
+    if (ext_EXT_mutable_descriptor_type && get_physical_device_properties2_supported) {
+      targets.enabled_mutable_descriptor_type = &features_EXT_mutable_descriptor_type.enabled;
+      targets.supported_mutable_descriptor_type = &features_EXT_mutable_descriptor_type.supported;
+    }
+    MergeVendorUpscalerFeatures(vulkan_instance->instance(), physical_device, targets);
+  }
 
   // Create the device.
 

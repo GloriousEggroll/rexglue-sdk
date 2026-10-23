@@ -46,9 +46,10 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
-                      "Guest output effect (spatial): bilinear, cas, fsr; temporal modes require the optional runtime")
+                      "Guest output effect: bilinear, cas, fsr (spatial); fsr3, dlss, xess (temporal, need "
+                      "scene inputs from the renderer; dlss and xess fall back to fsr3 when unavailable)")
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
+    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3", "dlss", "xess"})
 #else
     .allowed({"bilinear", "cas", "fsr"})
 #endif
@@ -110,7 +111,8 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   if (lowered == "fsr2") {
     return GuestOutputPaintConfig::Effect::kFsr2;
   }
-  if (lowered == "fsr3") {
+  // DLSS and XeSS share the temporal path; the presenter picks the backend.
+  if (lowered == "fsr3" || lowered == "dlss" || lowered == "xess") {
     return GuestOutputPaintConfig::Effect::kFsr3;
   }
 #endif

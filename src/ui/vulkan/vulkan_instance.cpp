@@ -18,10 +18,13 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <cstdlib>
 #include <rex/ui/vulkan/instance.h>
+#include <rex/ui/vulkan/vendor_upscalers.h>
 #include <rex/ui/vulkan/presenter.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
+REXCVAR_DECLARE(bool, present_anti_lag);
 
 namespace rex {
 namespace ui {
@@ -30,6 +33,15 @@ namespace vulkan {
 std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
                                                        const bool try_enable_validation) {
   std::unique_ptr<VulkanInstance> vulkan_instance(new VulkanInstance());
+
+#if REX_PLATFORM_LINUX
+  // Mesa implements VK_AMD_anti_lag in an implicit layer that the loader only
+  // enables on request. Ask before the loader reads the environment; an
+  // explicit user setting wins.
+  if (REXCVAR_GET(present_anti_lag)) {
+    setenv("ENABLE_LAYER_MESA_ANTI_LAG", "1", 0);
+  }
+#endif
 
   // Load the RenderDoc API if connected.
 
@@ -121,6 +133,15 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     requested_extensions.emplace("VK_KHR_win32_surface",
                                  &vulkan_instance->extensions_.ext_KHR_win32_surface);
 #endif
+  }
+
+  // Vendor upscalers (DLSS, XeSS) ask for their own extensions; enabled when
+  // available, otherwise only the upscaler is unavailable.
+  std::vector<std::unique_ptr<bool>> vendor_extensions_enabled;
+  for (const std::string& name : GetVendorUpscalerInstanceExtensions()) {
+    if (requested_extensions.count(name)) continue;
+    vendor_extensions_enabled.push_back(std::make_unique<bool>(false));
+    requested_extensions.emplace(name, vendor_extensions_enabled.back().get());
   }
 
   std::vector<const char*> enabled_extensions;
