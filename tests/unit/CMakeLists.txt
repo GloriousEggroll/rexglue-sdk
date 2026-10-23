@@ -1,6 +1,7 @@
 # Unit Tests for ReXGlue core components
 
 add_executable(unit_tests
+    audio/sdl_audio_test.cpp
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp
     core/cvar_test.cpp
@@ -9,6 +10,11 @@ add_executable(unit_tests
     core/stream_test.cpp
     core/byte_order_test.cpp
     core/chrono_test.cpp
+    core/filesystem_test.cpp
+    graphics/register_file_test.cpp
+    graphics/xsh_dump_test.cpp
+    graphics/texture_integer_scale_test.cpp
+    graphics/xenos_zpd_report_test.cpp
     codegen/config_test.cpp
     codegen/gapfill_test.cpp
     codegen/template_registry_test.cpp
@@ -16,6 +22,8 @@ add_executable(unit_tests
     ppc/stack_test.cpp
     system/guest_path_test.cpp
     system/function_dispatcher_test.cpp
+    system/socket_test.cpp
+    ui/renderdoc_test.cpp
     codegen/manifest_test.cpp
     rexglue/migration_scan_test.cpp
     rexglue/ui_test.cpp
@@ -33,9 +41,11 @@ target_include_directories(unit_tests PRIVATE
 )
 
 target_link_libraries(unit_tests PRIVATE
-    rexcore
     rexcodegen
     rexruntime
+    renderdoc
+    SDL3::Headers
+    xxHash::xxhash
     Catch2::Catch2WithMain
 )
 

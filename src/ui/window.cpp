@@ -264,6 +264,12 @@ bool Window::Open() {
   return true;
 }
 
+void Window::SetLogicalSize(uint32_t width, uint32_t height) {
+  if (!width || !height || width > 8192 || height > 8192) return;
+  OnDesiredLogicalSizeUpdate(width, height);
+  if (CanApplyState()) ApplyNewLogicalSize();
+}
+
 void Window::SetFullscreen(bool new_fullscreen) {
   if (fullscreen_ == new_fullscreen) {
     return;

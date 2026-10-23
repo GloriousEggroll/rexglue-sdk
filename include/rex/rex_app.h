@@ -35,6 +35,7 @@ struct ImFontAtlas;
 namespace rex {
 
 class LogCaptureSink;
+namespace graphics { class ShaderStorageProgress; }
 
 /// Content path configuration, passed to OnConfigurePaths().
 /// All paths start with sensible defaults derived from CLI args and cvars.
@@ -50,6 +51,7 @@ struct PathConfig {
 namespace ui {
 class ConsoleDialog;
 class SettingsDialog;
+class ShaderStorageDialog;
 }  // namespace ui
 
 /// Base class for recompiled Xbox 360 applications.
@@ -106,13 +108,26 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
 
   /// Called after ImGui drawer is created. Add custom dialogs here.
   virtual void OnCreateDialogs(ui::ImGuiDrawer* drawer) { (void)drawer; }
+  virtual std::unique_ptr<ui::ImGuiDialog> CreateSettingsOverlay(
+      ui::ImGuiDrawer* drawer, const std::filesystem::path& path);
+  void ToggleSettingsOverlay();
+  bool IsSettingsOverlayOpen() const { return settings_input_blocked_.load(std::memory_order_relaxed); }
 
   /// Called before cleanup begins. Release custom resources here.
   virtual void OnShutdown() {}
 
+  /// Called on window close before guest threads are forcibly terminated.
+  /// Release producer backpressure and detach guest callbacks while their
+  /// threads can still leave host critical sections normally.
+  virtual void OnBeforeTitleTermination() {}
+
   /// Called after path defaults are computed, before Runtime is constructed.
   /// Override to adjust game/user/update data paths programmatically.
   virtual void OnConfigurePaths(PathConfig& paths) { (void)paths; }
+
+  /// Load application settings before presentation/backend initialization.
+  /// Override to normalize and filter settings for the selected backend.
+  virtual void OnLoadConfig(const std::filesystem::path& path);
 
   /// Called after SetupPresentation returns (window and ImGui drawer are live)
   /// and before Runtime construction. Override to resolve paths from user
@@ -147,6 +162,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called immediately before the main guest thread is created.
   /// Everything is set up -- last chance to patch guest memory/code.
   virtual void OnPreLaunchModule() {}
+
+  /// UI-thread factory for optional owned startup work. The returned task runs
+  /// after shader storage on the existing loader thread, before guest Resume.
+  /// The task must honor its captured cancellation state and must not use UI
+  /// objects. The loader is joined before runtime/device destruction.
+  virtual std::function<void(graphics::ShaderStorageProgress&)> CreateGraphicsPreparationTask() { return {}; }
 
   /// Called after the main guest thread is created but before it starts
   /// executing. The thread is suspended -- attach debuggers/monitors here.
@@ -212,6 +233,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<Runtime> runtime_;
   std::unique_ptr<ui::Window> window_;
   std::thread module_thread_;
+  std::thread shader_storage_thread_;
+  std::unique_ptr<ui::ShaderStorageDialog> shader_storage_dialog_;
   std::atomic<bool> shutting_down_{false};
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
@@ -220,7 +243,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::shared_ptr<LogCaptureSink> log_sink_;
   std::unique_ptr<ui::DebugOverlayDialog> debug_overlay_;
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
-  std::unique_ptr<ui::SettingsDialog> settings_overlay_;
+  std::unique_ptr<ui::ImGuiDialog> settings_overlay_;
+  std::atomic<bool> settings_input_blocked_{false};
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
   std::filesystem::path config_path_;
 };

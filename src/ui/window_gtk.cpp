@@ -10,6 +10,9 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
+#include <string_view>
+#include <vector>
 #include <string>
 
 #include <rex/assert.h>
@@ -22,9 +25,11 @@
 #include <rex/ui/surface_gnulinux.h>
 #include <rex/ui/virtual_key.h>
 #include <rex/ui/window_gtk.h>
+#include "adaptive_sync_wayland.h"
 
 #include <X11/Xlib-xcb.h>
 #include <gdk/gdkx.h>
+#include <gdk/gdkwayland.h>
 #include <xcb/xcb.h>
 
 namespace {
@@ -311,11 +316,101 @@ std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
                                      desired_logical_height);
 }
 
+int GTKWindow::ResolveMonitorIndex() const {
+  if (!window_) return -1;
+  auto* display = gtk_widget_get_display(window_);
+  const int count = gdk_display_get_n_monitors(display);
+  if (const int requested = REXCVAR_GET(monitor); requested > 0) {
+    return requested <= count ? requested - 1 : -1;
+  }
+  if (!native_wayland_) {
+    // X11/XWayland publishes a primary output through RandR.
+    auto* primary = gdk_display_get_primary_monitor(display);
+    for (int i = 0; primary && i < count; ++i) {
+      if (gdk_display_get_monitor(display, i) == primary) return i;
+    }
+    return -1;
+  }
+  // Wayland has no protocol-level primary output. Follow the connector-name
+  // conventions desktops set for SDL, Wine and Proton games, first match wins.
+  std::vector<std::string> wanted;
+  for (const char* variable : {"SDL_VIDEO_DISPLAY_PRIORITY", "WAYLANDDRV_PRIMARY_MONITOR",
+                               "PROTON_WAYLAND_MONITOR"}) {
+    const char* value = std::getenv(variable);
+    if (!value) continue;
+    // SDL's variable is a comma-separated priority list.
+    std::string_view list(value);
+    while (!list.empty()) {
+      const size_t comma = list.find(',');
+      std::string_view name = list.substr(0, comma);
+      while (!name.empty() && name.front() == ' ') name.remove_prefix(1);
+      while (!name.empty() && name.back() == ' ') name.remove_suffix(1);
+      if (!name.empty()) wanted.emplace_back(name);
+      if (comma == std::string_view::npos) break;
+      list.remove_prefix(comma + 1);
+    }
+  }
+  if (wanted.empty()) return -1;
+  auto* wl_display = gdk_wayland_display_get_wl_display(display);
+  std::vector<std::string> names(count);
+  for (int i = 0; i < count; ++i) {
+    names[i] = WaylandDisplayOutputName(
+        wl_display, gdk_wayland_monitor_get_wl_output(gdk_display_get_monitor(display, i)));
+  }
+  for (const auto& name : wanted) {
+    for (int i = 0; i < count; ++i) {
+      if (names[i] == name) return i;
+    }
+  }
+  REXLOG_WARN("Primary output {} not found; compositor will choose", wanted.front());
+  return -1;
+}
+
+double GTKWindow::GetMonitorRefreshRateHz() const {
+  if (!window_) return 60.0;
+  auto* native = gtk_widget_get_window(window_);
+  if (!native) return 60.0;
+  // Resolve the target monitor before the window manager finishes moving.
+  auto* display = gtk_widget_get_display(window_);
+  const int target = ResolveMonitorIndex();
+  auto* monitor = target >= 0 ? gdk_display_get_monitor(display, target)
+                              : gdk_display_get_monitor_at_window(display, native);
+  int millihertz = monitor ? gdk_monitor_get_refresh_rate(monitor) : 0;
+  return millihertz > 0 ? double(millihertz) / 1000.0 : 60.0;
+}
+
+std::string GTKWindow::GetDisplayOutputName() const {
+  if (!window_ || !native_wayland_) return {};
+  auto* native = gtk_widget_get_window(window_);
+  if (!native) return {};
+  auto* display = gtk_widget_get_display(window_);
+  auto* monitor = gdk_display_get_monitor_at_window(display, native);
+  if (!monitor) return {};
+  if (output_name_monitor_ == monitor) return display_output_name_;
+  if (output_name_monitor_) {
+    g_object_remove_weak_pointer(G_OBJECT(output_name_monitor_),
+        reinterpret_cast<gpointer*>(&output_name_monitor_));
+  }
+  output_name_monitor_ = monitor;
+  g_object_add_weak_pointer(G_OBJECT(output_name_monitor_),
+      reinterpret_cast<gpointer*>(&output_name_monitor_));
+  display_output_name_ = WaylandDisplayOutputName(
+      gdk_wayland_display_get_wl_display(display),
+      gdk_wayland_monitor_get_wl_output(monitor));
+  return display_output_name_;
+}
+
 GTKWindow::GTKWindow(WindowedAppContext& app_context, const std::string_view title,
                      uint32_t desired_logical_width, uint32_t desired_logical_height)
     : Window(app_context, title, desired_logical_width, desired_logical_height) {}
 
 GTKWindow::~GTKWindow() {
+  if (output_name_monitor_) {
+    g_object_remove_weak_pointer(G_OBJECT(output_name_monitor_),
+        reinterpret_cast<gpointer*>(&output_name_monitor_));
+  }
+  if (native_paint_timer_) g_source_remove(native_paint_timer_);
+  if (size_update_source_) g_source_remove(size_update_source_);
   EnterDestructor();
   if (window_) {
     // Set window_ to null to ignore events from now on since this ui::GTKWindow
@@ -331,6 +426,15 @@ GTKWindow::~GTKWindow() {
 
 bool GTKWindow::OpenImpl() {
   window_ = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+  native_wayland_ = GDK_IS_WAYLAND_DISPLAY(gtk_widget_get_display(window_));
+  if (native_wayland_ && !native_paint_timer_) {
+    native_paint_timer_ = g_timeout_add(8, [](void* p) -> gboolean {
+      auto* self = static_cast<GTKWindow*>(p);
+      if (self->native_paint_pending_.exchange(false, std::memory_order_relaxed) &&
+          self->window_ && self->HasSurface()) self->OnPaint();
+      return G_SOURCE_CONTINUE;
+    }, this);
+  }
 
   gtk_window_set_title(GTK_WINDOW(window_), GetTitle().c_str());
 
@@ -370,6 +474,13 @@ bool GTKWindow::OpenImpl() {
                    reinterpret_cast<gpointer>(this));
   g_signal_connect(G_OBJECT(drawing_area_), "draw", G_CALLBACK(DrawHandler),
                    reinterpret_cast<gpointer>(this));
+  // GTK can reallocate the client area without sending GDK_CONFIGURE (notably
+  // when a Wayland window enters fullscreen). The Vulkan child surface has no
+  // independent window configure event, so its swapchain must follow this size.
+  g_signal_connect_after(drawing_area_, "size-allocate",
+      G_CALLBACK(+[](GtkWidget*, GtkAllocation*, gpointer data) {
+        static_cast<GTKWindow*>(data)->ScheduleSizeUpdate();
+      }), this);
 
   // Finally show all the widgets in the window, including the main menu.
   gtk_widget_show_all(window_);
@@ -379,13 +490,13 @@ bool GTKWindow::OpenImpl() {
   gtk_widget_set_size_request(drawing_area_, -1, -1);
 
   // Move the window to the requested monitor before entering fullscreen.
-  if (int32_t monitor_index = REXCVAR_GET(monitor); monitor_index > 0) {
+  if (const int monitor_index = ResolveMonitorIndex(); monitor_index >= 0) {
     GdkDisplay* display = gtk_widget_get_display(window_);
     GdkScreen* screen = gdk_display_get_default_screen(display);
     int n_monitors = gdk_screen_get_n_monitors(screen);
-    if (monitor_index <= n_monitors) {
+    if (monitor_index < n_monitors) {
       GdkRectangle geom;
-      gdk_screen_get_monitor_geometry(screen, monitor_index - 1, &geom);
+      gdk_screen_get_monitor_geometry(screen, monitor_index, &geom);
       gtk_window_move(GTK_WINDOW(window_), geom.x + (geom.width - GetDesiredLogicalWidth()) / 2,
                       geom.y + (geom.height - GetDesiredLogicalHeight()) / 2);
     }
@@ -397,7 +508,12 @@ bool GTKWindow::OpenImpl() {
     if (main_menu_widget) {
       gtk_container_remove(GTK_CONTAINER(box_), main_menu_widget);
     }
-    gtk_window_fullscreen(GTK_WINDOW(window_));
+    const int target_monitor = ResolveMonitorIndex();
+    auto* screen = gtk_widget_get_screen(window_);
+    if (target_monitor >= 0 && target_monitor < gdk_screen_get_n_monitors(screen))
+      gtk_window_fullscreen_on_monitor(GTK_WINDOW(window_), screen, target_monitor);
+    else
+      gtk_window_fullscreen(GTK_WINDOW(window_));
   }
 
   // Make sure the initial state after opening is reported to the common Window
@@ -455,7 +571,12 @@ void GTKWindow::ApplyNewFullscreen() {
         return;
       }
     }
-    gtk_window_fullscreen(GTK_WINDOW(window_));
+    const int target_monitor = ResolveMonitorIndex();
+    auto* screen = gtk_widget_get_screen(window_);
+    if (target_monitor >= 0 && target_monitor < gdk_screen_get_n_monitors(screen))
+      gtk_window_fullscreen_on_monitor(GTK_WINDOW(window_), screen, target_monitor);
+    else
+      gtk_window_fullscreen(GTK_WINDOW(window_));
     if (destruction_receiver.IsWindowDestroyedOrClosed()) {
       if (!destruction_receiver.IsWindowDestroyed()) {
         EndBatchedSizeUpdate(destruction_receiver);
@@ -463,6 +584,8 @@ void GTKWindow::ApplyNewFullscreen() {
       return;
     }
   } else {
+    restore_windowed_size_ = true;
+    gtk_window_unmaximize(GTK_WINDOW(window_));
     gtk_window_unfullscreen(GTK_WINDOW(window_));
     if (destruction_receiver.IsWindowDestroyedOrClosed()) {
       if (!destruction_receiver.IsWindowDestroyed()) {
@@ -495,6 +618,7 @@ void GTKWindow::ApplyNewFullscreen() {
   if (destruction_receiver.IsWindowDestroyedOrClosed()) {
     return;
   }
+  if (!IsFullscreen()) ApplyNewLogicalSize();
 }
 
 void GTKWindow::ApplyNewTitle() {
@@ -556,6 +680,29 @@ void GTKWindow::ApplyNewMainMenu(MenuItem* old_main_menu) {
   }
 }
 
+void GTKWindow::ApplyNewLogicalSize() {
+  if (!window_ || IsFullscreen()) return;
+  // Wayland acknowledges fullscreen asynchronously. Resizing before that
+  // acknowledgement can be discarded, leaving a desktop-sized normal window.
+  auto* gdk_window = gtk_widget_get_window(window_);
+  if (gdk_window && (gdk_window_get_state(gdk_window) &
+      (GDK_WINDOW_STATE_FULLSCREEN | GDK_WINDOW_STATE_MAXIMIZED))) {
+    restore_windowed_size_ = true;
+    gtk_window_unmaximize(GTK_WINDOW(window_));
+    return;
+  }
+  int menu_height = 0;
+  if (const auto* menu = static_cast<const GTKMenuItem*>(GetMainMenu())) {
+    int minimum = 0;
+    gtk_widget_get_preferred_height(menu->handle(), &minimum, &menu_height);
+  }
+  gtk_window_resize(GTK_WINDOW(window_), GetDesiredLogicalWidth(),
+                    GetDesiredLogicalHeight() + menu_height);
+  REXLOG_INFO("Windowed client size requested: {}x{} logical pixels",
+              GetDesiredLogicalWidth(), GetDesiredLogicalHeight());
+  ScheduleSizeUpdate();
+}
+
 void GTKWindow::FocusImpl() {
   gtk_window_activate_focus(GTK_WINDOW(window_));
 }
@@ -565,16 +712,26 @@ std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(Surface::TypeFlags allowed
   GdkWindow* drawing_area_window = gtk_widget_get_window(drawing_area_);
   bool type_known = false;
   bool type_supported_by_display = false;
+  if (allowed_types & Surface::kTypeFlag_WaylandWindow) {
+    type_known = true;
+    if (GDK_IS_WAYLAND_DISPLAY(display)) {
+      REXLOG_INFO("Presentation backend: native Wayland");
+      return WaylandWindowSurface::Create(drawing_area_, [this] {
+        if (presenter() && HasSurface()) presenter()->OnSurfaceResizeFromUIThread();
+      });
+    }
+  }
   if (allowed_types & Surface::kTypeFlag_XcbWindow) {
     type_known = true;
     if (GDK_IS_X11_DISPLAY(display)) {
       type_supported_by_display = true;
+      SetNativeHdrAvailable(false);
+      REXLOG_INFO("Presentation backend: X11/Xwayland (SDR only)");
       return std::make_unique<XcbWindowSurface>(
           XGetXCBConnection(gdk_x11_display_get_xdisplay(display)),
           gdk_x11_window_get_xid(drawing_area_window));
     }
   }
-  // TODO(Triang3l): Wayland surface.
   if (type_known && !type_supported_by_display) {
     REXLOG_ERROR(
         "GTKWindow: The window system of the GTK window is not supported by "
@@ -584,7 +741,32 @@ std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(Surface::TypeFlags allowed
 }
 
 void GTKWindow::RequestPaintImpl() {
-  gtk_widget_queue_draw(drawing_area_);
+  if (native_wayland_) native_paint_pending_.store(true, std::memory_order_relaxed);
+  else gtk_widget_queue_draw(drawing_area_);
+}
+
+void GTKWindow::ScheduleSizeUpdate() {
+  if (batched_size_update_depth_) {
+    batched_size_update_contained_configure_ = true;
+    return;
+  }
+  if (size_update_source_) return;
+  // Coalesce layout notifications and resize the presenter outside GTK layout
+  // or painting callbacks, where replacing the swapchain would be reentrant.
+  size_update_source_ = g_idle_add([](gpointer data) -> gboolean {
+    auto* window = static_cast<GTKWindow*>(data);
+    WindowDestructionReceiver destruction_receiver(window);
+    // The opaque Vulkan subsurface may occlude GTK's parent surface entirely,
+    // suppressing the frame callbacks that normally process queued layout.
+    // Complete the requested GTK resize without depending on those callbacks.
+    if (window->native_wayland_ && window->window_) {
+      gtk_container_check_resize(GTK_CONTAINER(window->window_));
+      if (destruction_receiver.IsWindowDestroyed()) return G_SOURCE_REMOVE;
+    }
+    window->size_update_source_ = 0;
+    window->HandleSizeUpdate(destruction_receiver);
+    return G_SOURCE_REMOVE;
+  }, this);
 }
 
 void GTKWindow::HandleSizeUpdate(WindowDestructionReceiver& destruction_receiver) {
@@ -602,6 +784,23 @@ void GTKWindow::HandleSizeUpdate(WindowDestructionReceiver& destruction_receiver
                      uint32_t(drawing_area_allocation.height), destruction_receiver);
   if (destruction_receiver.IsWindowDestroyedOrClosed()) {
     return;
+  }
+
+  // The compositor may first restore the old normal size on fullscreen exit,
+  // overwriting a resize requested during its window-state notification. Once
+  // GTK has allocated that configure, apply the configured size one more time.
+  // Clear the flag here so compositor tiling constraints cannot cause retries
+  // on every subsequent allocation.
+  if (restore_windowed_size_ && !IsFullscreen()) {
+    auto* native = gtk_widget_get_window(window_);
+    if (native && !(gdk_window_get_state(native) &
+        (GDK_WINDOW_STATE_FULLSCREEN | GDK_WINDOW_STATE_MAXIMIZED))) {
+      restore_windowed_size_ = false;
+      if (uint32_t(drawing_area_allocation.width) != GetDesiredLogicalWidth() ||
+          uint32_t(drawing_area_allocation.height) != GetDesiredLogicalHeight()) {
+        ApplyNewLogicalSize();
+      }
+    }
   }
 }
 
@@ -744,6 +943,16 @@ bool GTKWindow::HandleKeyboard(GdkEventKey* event,
 
 gboolean GTKWindow::WindowEventHandler(GdkEvent* event) {
   switch (event->type) {
+    case GDK_CONFIGURE:
+      ScheduleSizeUpdate();
+      break;
+    case GDK_WINDOW_STATE: {
+      const auto* state = reinterpret_cast<const GdkEventWindowState*>(event);
+      if (restore_windowed_size_ && !IsFullscreen() &&
+          !(state->new_window_state & (GDK_WINDOW_STATE_FULLSCREEN | GDK_WINDOW_STATE_MAXIMIZED))) {
+        ApplyNewLogicalSize();
+      }
+    } break;
     case GDK_DELETE:
     // In case the widget was somehow forcibly destroyed without GDK_DELETE.
     case GDK_DESTROY: {
@@ -819,15 +1028,7 @@ gboolean GTKWindow::DrawingAreaEventHandler(GdkEvent* event) {
     } break;
 
     case GDK_CONFIGURE: {
-      if (batched_size_update_depth_) {
-        batched_size_update_contained_configure_ = true;
-      } else {
-        WindowDestructionReceiver destruction_receiver(this);
-        HandleSizeUpdate(destruction_receiver);
-        if (destruction_receiver.IsWindowDestroyedOrClosed()) {
-          break;
-        }
-      }
+      ScheduleSizeUpdate();
     } break;
     default:
       break;

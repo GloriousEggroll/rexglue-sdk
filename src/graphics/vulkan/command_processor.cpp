@@ -11,10 +11,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <iterator>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -30,6 +33,7 @@
 #include <rex/math.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/native_draw_effects.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
@@ -46,6 +50,18 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DECLARE(bool, gpu_command_summary);
+REXCVAR_DECLARE(bool, gpu_native_submit_completion_markers);
+REXCVAR_DEFINE_BOOL(gpu_native_marker_operands, false, "GPU diagnostics",
+                    "Observe decoded native marker shapes; requires gpu_command_summary; never defers stores")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_async_occlusion_queries, true, "GPU/Vulkan",
+                    "Retire real occlusion results in batches after GPU completion")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_batch_occlusion_queries, true, "GPU/Vulkan",
+                    "Group asynchronous visibility queries until a normal submission boundary")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
@@ -55,7 +71,7 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, false, "GPU/Vulkan",
                     "When async shader compilation is enabled, skip presenting frames that "
                     "used placeholder pipelines to avoid visible flashing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -604,43 +620,12 @@ VulkanCommandProcessor::~VulkanCommandProcessor() = default;
 
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
-  InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
 }
 
 void VulkanCommandProcessor::InvalidateGpuMemory() {
   if (shared_memory_) {
     shared_memory_->InvalidateAllPages();
-  }
-}
-
-void VulkanCommandProcessor::InvalidateAllVertexBufferResidency() {
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
-  for (VertexBufferState& state : vertex_buffer_states_) {
-    state.address = UINT32_MAX;
-    state.size = UINT32_MAX;
-  }
-}
-
-void VulkanCommandProcessor::InvalidateVertexBufferResidency(uint32_t vfetch_index) {
-  if (vfetch_index >= vertex_buffer_states_.size()) {
-    return;
-  }
-  vertex_buffers_in_sync_[vfetch_index >> 6] &= ~(uint64_t(1) << (vfetch_index & 63));
-}
-
-void VulkanCommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_vfetch,
-                                                                  uint32_t last_vfetch) {
-  if (first_vfetch > last_vfetch) {
-    std::swap(first_vfetch, last_vfetch);
-  }
-  if (first_vfetch >= vertex_buffer_states_.size()) {
-    return;
-  }
-  last_vfetch = std::min(last_vfetch, uint32_t(vertex_buffer_states_.size() - 1));
-  for (uint32_t vfetch_index = first_vfetch; vfetch_index <= last_vfetch; ++vfetch_index) {
-    InvalidateVertexBufferResidency(vfetch_index);
   }
 }
 
@@ -655,7 +640,56 @@ void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_
   primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
 }
 
+bool VulkanCommandProcessor::InitializeNativeEdram(const std::function<void(VkBuffer)>& copy) {
+  if (!copy || !BeginSubmission(true) || !render_target_cache_->PrepareNativeStateTransfer(false)) return false;
+  SubmitBarriers(true);
+  if (!EndSubmission(false)) return false;
+  copy(render_target_cache_->edram_buffer());
+  if (!BeginSubmission(true)) throw std::runtime_error("Cannot resume GPU submission after native EDRAM initialization");
+  return true;
+}
+
+bool VulkanCommandProcessor::ImportNativeGpuState(
+    std::span<const std::pair<uint32_t,uint32_t>> physical,
+    std::span<const std::pair<uint32_t,uint32_t>> edram,
+    const std::function<void(VkBuffer,VkBuffer)>& copy) {
+  native_scene_authority_.Reference(NativeSceneAuthority::ReferenceOperation::StateImport,"Xenia state import requested");
+  const auto valid=[](auto ranges,uint32_t capacity) {
+    uint64_t previous=0;
+    for (auto [address,count]:ranges) {
+      if (!count || address<previous || uint64_t(address)+count>capacity) return false;
+      previous=uint64_t(address)+count;
+    }
+    return true;
+  };
+  if (!copy || !valid(physical,SharedMemory::kBufferSize) || !valid(edram,xenos::kEdramSizeBytes) ||
+      render_target_cache_->GetPath()!=RenderTargetCache::Path::kPixelShaderInterlock ||
+      render_target_cache_->IsDrawResolutionScaled() || !BeginSubmission(true)) return false;
+  // Seed untouched portions of partially covered pages from their current CPU
+  // or GPU owner before an external masked copy. RequestRange also allocates
+  // sparse backing and must succeed for every destination before copy begins.
+  for (auto [address,count]:physical) if (!shared_memory_->RequestRange(address,count)) return false;
+  if (!physical.empty()) {
+    const uint32_t first=physical.front().first;
+    const uint32_t last=physical.back().first+physical.back().second;
+    shared_memory_->Use(VulkanSharedMemory::Usage::kComputeWrite,{first,last-first});
+  }
+  if (!edram.empty() && !render_target_cache_->PrepareNativeStateTransfer(true)) return false;
+  SubmitBarriers(true);
+  if (!EndSubmission(false)) return false;
+  // Exceptions after this point are fatal to this transition: copying may
+  // already have modified destination state, so it is unsafe to retry a draw.
+  copy(shared_memory_->buffer(),render_target_cache_->edram_buffer());
+  if (!BeginSubmission(true)) throw std::runtime_error("Cannot resume GPU submission after native state handback");
+  for (auto [address,count]:physical) {
+    shared_memory_->RangeWrittenByGpu(address,count);
+    primitive_processor_->MemoryInvalidationCallback(address,count,true);
+  }
+  return true;
+}
+
 void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+  native_scene_authority_.Reference(NativeSceneAuthority::ReferenceOperation::StateRestore,"Xenia EDRAM restore requested");
   if (!BeginSubmission(true)) {
     return;
   }
@@ -664,16 +698,90 @@ void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
 
 bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                                 uint32_t packet, uint32_t count) {
+  if(native_rendering_shutdown_requested_) {reader->AdvanceRead(count*sizeof(uint32_t));return true;}
+  native_scene_authority_.Require(native_query_authority_ && native_query_boundary_provider_ &&
+      native_draw_boundary_provider_ && native_completion_provider_,"Native query authority/provider is missing");
+  const uint32_t report_address=register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+  const bool begin=xenos::XenosZPDReport::IsBeginRecord(report_address);
+  const bool end=xenos::XenosZPDReport::IsEndRecord(report_address);
+  const uint32_t end_address=xenos::XenosZPDReport::GetEndRecordBase(report_address);
+  const bool native=native_query_authority_;
+  bool result=true;
+  if(native) {
+    if(count!=1||(!begin&&!end)||!native_query_boundary_provider_)
+      throw std::runtime_error("Unsupported native query report packet");
+    // Reserve capacity before the provider seals this end. Draining from
+    // DeferNativeQueryResult would let completion consume its current end
+    // capability before deferral itself can reserve a ticket.
+    if(end&&native_query_deferral_enabled_&&native_query_tickets_.full())
+      CompleteNativeWork(NativeCompletionReason::QueryPressure,0x5b);
+    const uint32_t initiator=reader->ReadAndSwap<uint32_t>();
+    WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR,initiator&0x3f);
+    if(begin) {
+      if(active_native_query_boundary_||active_occlusion_query_.valid||resume_native_query_)
+        throw std::runtime_error("Overlapping native query reports");
+      native_query_tickets_.SupersedeAddress(end_address);
+      pending_occlusion_results_.InvalidateAddress(end_address);
+      auto* report=memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(end_address+32);
+      if(!report||uint64_t(end_address)+64>0x20000000ull)
+        throw std::runtime_error("Invalid native query begin report");
+      std::memset(report,0,sizeof(*report));
+    }
+  } else {
+    result=ExecutePacketType3_EVENT_WRITE_ZPD_Reference(reader,packet,count);
+  }
+  if(!result||!native_query_boundary_provider_)return result;
+  if(begin) {
+    active_native_query_boundary_=NativeQueryBoundary{end_address,++native_query_generation_,frame_current_,native};
+  } else if(end) {
+    // The callback completes or defers its exact native prefix. In shadow
+    // mode, preceding reference query writes are submitted first.
+    if(!EndSubmission(false))return false;
+    const auto provider = native_query_boundary_provider_.Snapshot();
+    try {
+      if(!active_native_query_boundary_||active_native_query_boundary_->end_address!=end_address)
+        throw std::runtime_error("Native query boundary has no matching begin generation");
+      const auto boundary=*active_native_query_boundary_;
+      active_native_query_boundary_.reset();
+      const NativeQueryBoundary published_boundary{end_address,boundary.generation,frame_current_,native};
+      const auto query_scope=native_query_tickets_.BeginEndCallback(published_boundary);
+      provider(published_boundary);
+      if(native_rendering_shutdown_requested_)return true;
+      if(native&&native_query_tickets_.end_status()==NativeQueryTickets::EndStatus::Outstanding)
+        throw std::runtime_error("Native query end returned without publishing or deferring its samples");
+    } catch(const std::exception& error) {
+      if(native_scene_authority_.strict())ReportNativeSceneFailure(error.what());
+      if(native_draw_boundary_provider_||native_query_authority_armed_)throw;
+      REXGPU_ERROR("Native query boundary failed: {}",error.what());
+      native_query_boundary_provider_.Reset();
+    }
+    // Native publication is a CPU write after its completion fence. Do not
+    // create an empty reference submission for the following native draw.
+    // Shadow queries and handback retain their reference resume behavior.
+    if(NativeBoundaryNeedsReferenceSubmission(frame_open_,!native_query_authority_,
+        bool(resume_native_query_))&&!BeginSubmission(true))return false;
+  }
+  return result;
+}
+
+bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD_Reference(memory::RingBuffer* reader,
+                                                                        uint32_t packet,uint32_t count) {
+  native_scene_authority_.Reference(NativeSceneAuthority::ReferenceOperation::Query,"Xenia query packet requested");
   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
+    if (!pending_occlusion_results_.empty()) {
+      CheckSubmissionFenceAndDeviceLoss(pending_occlusion_results_.last_submission());
+    }
     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
   }
 
-  const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
   assert_true(count == 1);
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
 
-  uint32_t sample_count_addr = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+  const uint32_t report_address =
+      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+  uint32_t sample_count_addr =
+      xenos::XenosZPDReport::GetRecordBase(report_address);
   auto* sample_counts =
       memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_addr);
   if (!sample_counts) {
@@ -681,44 +789,73 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
     return true;
   }
 
-  auto write_fallback_result = [sample_counts]() -> bool {
+  if (REXCVAR_GET(zpd_trace)) {
+    static uint32_t trace_count = 0;
+    if (trace_count < 512) {
+      const uint32_t slot_base =
+          xenos::XenosZPDReport::GetSlotBase(report_address);
+      const bool is_begin_address =
+          xenos::XenosZPDReport::IsBeginRecord(report_address);
+      const bool has_sentinel = xenos::XenosZPDReport::HasPendingSentinel(sample_counts);
+      REXGPU_INFO(
+          "ZPD[{}] raw={:08X} record={:08X} slot={:08X} role={} sentinel={} "
+          "host_active={} host_record={:08X}",
+          trace_count, report_address, sample_count_addr, slot_base,
+          is_begin_address ? "BEGIN" : "END", has_sentinel,
+          active_occlusion_query_.valid,
+          active_occlusion_query_.valid ? active_occlusion_query_.sample_count_address : 0);
+      ++trace_count;
+    }
+  }
+
+  auto write_fallback_result = [sample_counts, report_address]() -> bool {
     auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
     if (fake_sample_count < 0) {
       return true;
     }
-    bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
-    bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
-    std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
-    if (is_end_via_z_pass || is_end_via_z_fail) {
-      sample_counts->ZPass_A = fake_sample_count;
-      sample_counts->Total_A = fake_sample_count;
+    bool is_end = xenos::XenosZPDReport::IsEndRecord(report_address);
+    if (!xenos::XenosZPDReport::IsBeginRecord(report_address) && !is_end) {
+      is_end = xenos::XenosZPDReport::HasPendingSentinel(sample_counts);
+    }
+    if (is_end) {
+      xenos::XenosZPDReport::WriteSampleCount(
+          sample_counts, uint32_t(fake_sample_count));
+    } else {
+      std::memset(sample_counts, 0,
+                  sizeof(xenos::xe_gpu_depth_sample_counts));
     }
     return true;
   };
 
-  bool is_end_via_z_pass =
-      sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
-  bool is_end_via_z_fail =
-      sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
-  bool is_end = is_end_via_z_pass || is_end_via_z_fail;
+  const bool is_begin =
+      xenos::XenosZPDReport::IsBeginRecord(report_address);
+  const bool is_end = xenos::XenosZPDReport::IsEndRecord(report_address);
 
-  if (!is_end) {
+  if (is_begin) {
+    // An older asynchronous result must not overwrite this report's new use.
+    pending_occlusion_results_.InvalidateAddress(
+        xenos::XenosZPDReport::GetEndRecordBase(sample_count_addr));
     if (active_occlusion_query_.valid &&
-        active_occlusion_query_.sample_count_address != sample_count_addr) {
+        xenos::XenosZPDReport::GetSlotBase(active_occlusion_query_.sample_count_address) !=
+            xenos::XenosZPDReport::GetSlotBase(sample_count_addr)) {
       DisableHostOcclusionQueries();
       return write_fallback_result();
     }
+    std::memset(sample_counts, 0,
+                sizeof(xenos::xe_gpu_depth_sample_counts));
     if (!BeginGuestOcclusionQuery(sample_count_addr)) {
       return write_fallback_result();
     }
     return true;
   }
 
-  if (!active_occlusion_query_.valid ||
-      active_occlusion_query_.sample_count_address != sample_count_addr) {
-    DisableHostOcclusionQueries();
+  // A command-buffer boundary may have ended a residual reference segment.
+  // Resume it before closing the guest query, even if it contains no new draw.
+  if (resume_native_query_ && !BeginSubmission(true)) return false;
+  if (!is_end || !active_occlusion_query_.valid ||
+      xenos::XenosZPDReport::GetSlotBase(
+          active_occlusion_query_.sample_count_address) !=
+          xenos::XenosZPDReport::GetSlotBase(sample_count_addr)) {
     return write_fallback_result();
   }
 
@@ -790,7 +927,6 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
   }
-  InvalidateAllVertexBufferResidency();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1914,8 +2050,27 @@ bool VulkanCommandProcessor::SetupContext() {
 }
 
 void VulkanCommandProcessor::ShutdownContext() {
+  CompleteNativeWork(NativeCompletionReason::Shutdown);
+  if(!native_query_tickets_.empty())
+    throw std::runtime_error("Native shutdown retained deferred query tickets");
+  LogNativeQueryStatistics();
+  LogNativeSceneStatistics();
+  native_query_deferral_enabled_=false;
+  native_query_authority_=false;
   AwaitAllQueueOperationsCompletion();
-  InvalidateAllVertexBufferResidency();
+  native_swap_sources_in_flight_.clear();
+  native_swap_source_provider_ = {};
+  native_query_boundary_provider_.Reset();
+  native_draw_boundary_provider_.Reset();
+  native_completion_provider_.Reset();
+  native_coherence_provider_.Reset();
+  native_marker_following_.SetEnabled(false);
+  native_accepted_work_observer_={};
+  native_marker_query_cohorts_.SetEnabled(false);
+  native_marker_readiness_observer_={};
+  native_marker_operands_.SetEnabled(false);native_marker_allocation_observer_={};
+  native_immediate_marker_pairs_enabled_=false;native_immediate_marker_providers_={};
+  observe_decoded_event_write_shd_=false;
   ShutdownOcclusionQueryResources();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
@@ -2141,6 +2296,10 @@ void VulkanCommandProcessor::ShutdownContext() {
 }
 
 void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  // Type-0/type-1 and SET_CONSTANT variants may publish guest fence values
+  // through scratch registers without passing through a type-3 memory opcode.
+  if(NativeScratchWriteNeedsCompletion(index,register_file_->values[XE_GPU_REG_SCRATCH_UMSK]))
+    CompleteNativeWork(NativeCompletionReason::ScratchWrite);
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -2173,7 +2332,6 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
                                                   6);
     }
-    InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
   }
 }
 
@@ -2256,7 +2414,6 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
     }
-    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
     return;
   }
 
@@ -2286,28 +2443,759 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+void VulkanCommandProcessor::InstallStrictNativeRendering(StrictNativeProviders providers) {
+  if(system::XThread::IsInThread(worker_thread_.get()))
+    throw std::runtime_error("Exclusive native startup installation must run on the host startup thread");
+  auto result = std::make_shared<std::promise<void>>();
+  auto completed = result->get_future();
+  CallInThread([this,result,providers=std::move(providers)]() mutable {
+    try {
+      native_scene_authority_.SetFailureObserver(this,[](void* context,std::string_view reason) noexcept {
+        static_cast<VulkanCommandProcessor*>(context)->ReportNativeSceneFailure(reason);
+      });
+      native_scene_authority_.ProviderChange("Native renderer installation repeated");
+      if(native_rendering_shutdown_requested_ || native_swap_source_provider_ ||
+          native_query_boundary_provider_ || native_draw_boundary_provider_ ||
+          native_completion_provider_ || native_coherence_provider_ ||
+          native_completion_state_.pending() || !native_query_tickets_.empty() ||
+          active_native_query_boundary_ || active_occlusion_query_.valid || resume_native_query_ ||
+          native_query_authority_armed_ || native_query_authority_retired_)
+        throw std::runtime_error("Exclusive native startup requires fresh, idle scene ownership");
+      if(!providers.present || !providers.query || !providers.draw || !providers.complete)
+        throw std::runtime_error("Exclusive native startup requires every scene provider");
+      if(!CanUseNativeQueryAuthority())
+        throw std::runtime_error("Exclusive native startup requires 1x FSI storage and real query resources");
+      // Allocation may fail while installing immutable callback holders. No
+      // guest has launched, and rollback keeps no partially installed provider.
+      try {
+        native_swap_source_provider_ = std::move(providers.present);
+        native_query_boundary_provider_.Set(std::move(providers.query),providers.storage);
+        native_draw_boundary_provider_.Set(std::move(providers.draw),providers.storage);
+        native_completion_provider_.Set(std::move(providers.complete),providers.storage);
+        native_coherence_provider_.Set(std::move(providers.coherence),providers.storage);
+        native_accepted_work_observer_=std::move(providers.observe_accepted_work);
+        native_marker_readiness_observer_=std::move(providers.observe_marker_readiness);
+        native_marker_allocation_observer_=std::move(providers.observe_marker_allocation);
+        if(REXCVAR_GET(gpu_native_submit_completion_markers)) {
+          if(!providers.immediate_markers||!native_coherence_provider_)
+            throw std::runtime_error("Native immediate markers require exact target and coherence providers");
+          native_immediate_marker_providers_=std::move(providers.immediate_markers);
+          native_immediate_marker_pairs_enabled_=true;
+        }
+        native_marker_operands_.SetEnabled(REXCVAR_GET(gpu_native_marker_operands)&&
+            REXCVAR_GET(gpu_command_summary)&&bool(native_marker_readiness_observer_));
+        observe_decoded_event_write_shd_=native_marker_operands_.enabled();
+        native_scene_authority_.EnableStrict();
+      } catch(...) {
+        native_swap_source_provider_ = {};
+        native_query_boundary_provider_.Reset();
+        native_draw_boundary_provider_.Reset();
+        native_completion_provider_.Reset();
+        native_coherence_provider_.Reset();
+        native_accepted_work_observer_={};
+        native_marker_query_cohorts_.SetEnabled(false);
+        native_marker_readiness_observer_={};
+        native_marker_operands_.SetEnabled(false);native_marker_allocation_observer_={};
+        native_immediate_marker_pairs_enabled_=false;native_immediate_marker_providers_={};
+        observe_decoded_event_write_shd_=false;
+        native_marker_following_.SetEnabled(false);
+        throw;
+      }
+      capture_native_draw_packets_ = true;
+      native_query_authority_ = native_query_authority_armed_ = true;
+      native_query_deferral_enabled_ = providers.defer_queries;
+      REXGPU_INFO("Strict Native scene authority installed; automatic fallback disabled");
+      result->set_value();
+    } catch(...) { result->set_exception(std::current_exception()); }
+  });
+  completed.get();
+}
+
+void VulkanCommandProcessor::OnPacketExecutionFailure(const char* reason) {
+  if(!native_scene_authority_.strict())return;
+  // Fences accepted work, including work recorded before a callback could
+  // return NativePending. Failure never advances the consumed packet boundary.
+  ReportNativeSceneFailure(reason);
+  CompleteNativeWork(NativeCompletionReason::Shutdown);
+  native_scene_authority_.Reject(reason);
+}
+
+void VulkanCommandProcessor::ReportNativeSceneFailure(std::string_view reason) noexcept {
+  try {
+    REXGPU_ERROR("Native renderer fatal error: {}; automatic fallback disabled",reason);
+    // Emit even if terminal shutdown cannot run after this CP exception.
+    LogNativeSceneStatistics();
+  } catch(...) {} // Logging failure cannot authorize rendering or hide the error.
+}
+
+void VulkanCommandProcessor::LogNativeSceneStatistics() {
+  if(!native_scene_authority_.strict() || native_scene_statistics_logged_)return;
+  native_scene_statistics_logged_ = true;
+  if(native_immediate_marker_pairs_enabled_) {
+    const auto& m=native_immediate_marker_stats_;
+    REXGPU_INFO("Native immediate marker summary: candidates={}, selected={}, pending_selected={}, authority_refusals={}, query_refusals={}, provider_refusals={}, target_refusals={}",
+        m.candidates,m.selected,m.pending_selected,m.authority_refusals,m.query_refusals,m.provider_refusals,m.target_refusals);
+  }
+  const auto& c = native_scene_authority_.reference_counts();
+  REXGPU_INFO("Strict Native scene summary: xenia_draw={}, xenia_copy={}, xenia_query={}, xenia_swap_source={}, xenia_import={}, xenia_restore={}, rejected={}",
+      c[0],c[1],c[2],c[3],c[4],c[5],native_scene_authority_.rejected());
+}
+
+void VulkanCommandProcessor::SetNativeSwapSourceProvider(NativeSwapSourceProvider provider) {
+  CallInThread([this, provider = std::move(provider)]() mutable {
+    native_scene_authority_.ProviderChange("SetNativeSwapSourceProvider after exclusive native installation");
+    native_swap_source_provider_ = std::move(provider);
+    if (!native_swap_source_provider_) native_reference_query_results_.clear();
+  });
+}
+
+void VulkanCommandProcessor::SetNativeQueryBoundaryProvider(
+    NativeQueryBoundaryProvider provider, NativeCallbackStorage storage) {
+  CallInThread([this, provider = std::move(provider), storage]() mutable {
+    native_scene_authority_.ProviderChange("SetNativeQueryBoundaryProvider after exclusive native installation");
+    // Validate before altering either callback lifetime or query authority.
+    if(native_query_authority_armed_&&!native_query_authority_retired_)
+      throw std::runtime_error("Native query provider changed before state handback");
+    CompleteNativeWork(NativeCompletionReason::ProviderRemoval);
+    if(!native_query_tickets_.empty())
+      throw std::runtime_error("Native query provider changed with pending tickets");
+    native_coherence_provider_.Reset();
+    native_query_boundary_provider_.Set(std::move(provider), storage);
+    native_query_deferral_enabled_=false;
+    native_query_generation_=0;
+    active_native_query_boundary_.reset();
+    native_query_authority_=false;
+  });
+}
+
+void VulkanCommandProcessor::SetNativeDrawBoundaryProvider(
+    NativeDrawBoundaryProvider provider, NativeCallbackStorage storage) {
+  CallInThread([this, provider = std::move(provider), storage]() mutable {
+    native_scene_authority_.ProviderChange("SetNativeDrawBoundaryProvider after exclusive native installation");
+    CompleteNativeWork(NativeCompletionReason::ProviderRemoval);
+    if(!native_query_tickets_.empty())
+      throw std::runtime_error("Native draw provider changed with pending query tickets");
+    native_coherence_provider_.Reset();
+    native_draw_boundary_provider_.Set(std::move(provider), storage);
+    capture_native_draw_packets_=bool(native_draw_boundary_provider_);
+    if(!capture_native_draw_packets_)native_draw_packet_bytes_.clear();
+  });
+}
+
+void VulkanCommandProcessor::SetNativeCompletionProvider(
+    NativeCompletionProvider provider, NativeCallbackStorage storage) {
+  CallInThread([this, provider = std::move(provider), storage]() mutable {
+    native_scene_authority_.ProviderChange("SetNativeCompletionProvider after exclusive native installation");
+    CompleteNativeWork(NativeCompletionReason::ProviderRemoval);
+    native_coherence_provider_.Reset();
+    native_completion_provider_.Set(std::move(provider), storage);
+  });
+}
+
+void VulkanCommandProcessor::SetNativeCoherenceProvider(
+    NativeCoherenceProvider provider, NativeCallbackStorage storage) {
+  CallInThread([this, provider = std::move(provider), storage]() mutable {
+    native_scene_authority_.ProviderChange("SetNativeCoherenceProvider after exclusive native installation");
+    CompleteNativeWork(NativeCompletionReason::ProviderRemoval);
+    if (provider && (!native_query_authority_ || native_query_authority_retired_ ||
+        native_rendering_shutdown_requested_ || !native_draw_boundary_provider_ ||
+        !native_query_boundary_provider_ || !native_completion_provider_)) {
+      throw std::runtime_error("Native coherence opt-in requires healthy complete raster ownership");
+    }
+    native_coherence_provider_.Set(std::move(provider), storage);
+  });
+}
+
+gow3::diagnostic::MarkerFollowingCensus::Snapshot
+VulkanCommandProcessor::ObserveNativeAcceptedWork() noexcept {
+  // Direct pure invocation avoids NativeCallback CopyPerInvocation allocations.
+  // The installed callable holds the same Runtime owner through this CP call.
+  try {if(native_accepted_work_observer_)return native_accepted_work_observer_();}
+  catch(...) {} // Unavailable telemetry never changes original completion errors.
+  return {};
+}
+
+gow3::diagnostic::MarkerQueryCohortCensus::Readiness
+VulkanCommandProcessor::ObserveNativeMarkerReadiness() noexcept {
+  try {if(native_marker_readiness_observer_)return native_marker_readiness_observer_();}
+  catch(...) {} // Telemetry cannot change completion behavior.
+  return {};
+}
+void VulkanCommandProcessor::ObserveNativeMarkerBoundary(
+    gow3::diagnostic::MarkerQueryCohortCensus::Boundary reason) noexcept {
+  if(!REXCVAR_GET(gpu_command_summary)||!native_marker_readiness_observer_)return;
+  native_marker_query_cohorts_.SetEnabled(true);
+  if(native_marker_query_cohorts_.open_markers()||native_marker_operands_.enabled()) {
+    const auto snapshot=ObserveNativeAcceptedWork();
+    native_marker_query_cohorts_.End(snapshot,reason);
+    native_marker_operands_.End(snapshot,reason);
+  }
+}
+void VulkanCommandProcessor::ObserveNativeMarkerOperation(std::string_view operation) noexcept {
+  if(!REXCVAR_GET(gpu_command_summary)||!native_marker_readiness_observer_)return;
+  using B=gow3::diagnostic::MarkerQueryCohortCensus::Boundary;
+  if(operation=="draw"||operation=="resolve"||operation=="clearrect")return;
+  ObserveNativeMarkerBoundary(operation=="query_begin"?B::QueryBegin:operation=="query_end"?B::QueryEnd:
+      operation=="cpu_memory_write"?B::CpuWrite:operation=="memory_copy"?B::MemoryCopy:
+      operation=="present"?B::Presentation:B::UnknownOperation);
+}
+
+void VulkanCommandProcessor::ObserveDecodedEventWriteShd(uint32_t packet,uint32_t count,
+    uint32_t initiator,uint32_t address,uint32_t value,uintptr_t command_buffer,
+    uint32_t capacity,uint32_t end_offset) noexcept {
+  if(!native_marker_operands_.enabled())return;
+  gow3::diagnostic::MarkerOperandCensus::Allocation allocation;
+  try {if(native_marker_allocation_observer_)allocation=native_marker_allocation_observer_(address&~3u);}
+  catch(...) {native_marker_operands_.LookupFailed();}
+  native_marker_operands_.Decoded({command_buffer,capacity,end_offset,packet,count,initiator,address,value},
+      ObserveNativeAcceptedWork(),allocation);
+}
+
+std::shared_ptr<void> VulkanCommandProcessor::PrepareNativeImmediateMarkerPair(
+    const NativeCompletionMarkerPair& pair) {
+  auto& stats=native_immediate_marker_stats_;++stats.candidates;
+  if(!native_scene_authority_.strict()||native_scene_authority_.rejected()||
+      !native_query_authority_||native_query_authority_retired_||
+      native_rendering_shutdown_requested_||!native_draw_boundary_provider_||
+      !native_query_boundary_provider_||!native_completion_provider_||
+      !native_coherence_provider_||!native_immediate_marker_providers_) {
+    ++stats.authority_refusals;return {};
+  }
+  // Generic serials may release query-result memory. A real completed result
+  // and its original publication are mandatory: never speculate query values.
+  if(!native_query_tickets_.empty()||native_query_tickets_.current_end()||
+      active_native_query_boundary_||active_occlusion_query_.valid||resume_native_query_) {
+    ++stats.query_refusals;return {};
+  }
+  const bool pending=native_completion_state_.pending();
+  if(!native_immediate_marker_providers_.prepare()) {++stats.provider_refusals;return {};}
+  // No GPU call follows acquisition. A refusal retains the unchanged ordinary
+  // decoder/full fence, even if prepare already submitted immutable work.
+  auto guard=native_immediate_marker_providers_.acquire(pair);
+  if(!guard) {++stats.target_refusals;return {};}
+  ++stats.selected;stats.pending_selected+=pending;
+  // Deliberately do NOT clear or complete native_completion_state_. Every
+  // scratch, query-pressure, primary, idle and shutdown fence remains real.
+  return guard;
+}
+
+void VulkanCommandProcessor::CompleteNativeWork(NativeCompletionReason reason,uint32_t opcode) {
+  // A terminal drain also covers shadow work recorded inside an interrupted
+  // callback before a NativePending disposition could reach the SDK latch.
+  const bool terminal=reason==NativeCompletionReason::Shutdown;
+  const bool tickets_pending=!native_query_tickets_.empty();
+  const bool accepted_pending=native_completion_state_.pending()||tickets_pending;
+  using Census=gow3::diagnostic::MarkerFollowingCensus;
+  static_assert(static_cast<size_t>(NativeCompletionReason::CommandPacket)==static_cast<size_t>(Census::Boundary::CommandPacket));
+  static_assert(static_cast<size_t>(NativeCompletionReason::ScratchWrite)==static_cast<size_t>(Census::Boundary::ScratchWrite));
+  static_assert(static_cast<size_t>(NativeCompletionReason::Wait)==static_cast<size_t>(Census::Boundary::Wait));
+  static_assert(static_cast<size_t>(NativeCompletionReason::PrimaryBufferEnd)==static_cast<size_t>(Census::Boundary::PrimaryBufferEnd));
+  static_assert(static_cast<size_t>(NativeCompletionReason::Presentation)==static_cast<size_t>(Census::Boundary::Presentation));
+  static_assert(static_cast<size_t>(NativeCompletionReason::ReferenceDraw)==static_cast<size_t>(Census::Boundary::ReferenceDraw));
+  static_assert(static_cast<size_t>(NativeCompletionReason::ProviderRemoval)==static_cast<size_t>(Census::Boundary::ProviderRemoval));
+  static_assert(static_cast<size_t>(NativeCompletionReason::QueryPressure)==static_cast<size_t>(Census::Boundary::QueryPressure));
+  static_assert(static_cast<size_t>(NativeCompletionReason::Shutdown)==static_cast<size_t>(Census::Boundary::Shutdown));
+  const bool observe_marker=REXCVAR_GET(gpu_command_summary)&&bool(native_accepted_work_observer_);
+  native_marker_following_.SetEnabled(observe_marker);
+  const bool marker=reason==NativeCompletionReason::CommandPacket&&opcode==0x58;
+  using CohortBoundary=gow3::diagnostic::MarkerQueryCohortCensus::Boundary;
+  static_assert(size_t(NativeCompletionReason::CommandPacket)==size_t(CohortBoundary::CommandPacket));
+  static_assert(size_t(NativeCompletionReason::ScratchWrite)==size_t(CohortBoundary::ScratchWrite));
+  static_assert(size_t(NativeCompletionReason::Wait)==size_t(CohortBoundary::Wait));
+  static_assert(size_t(NativeCompletionReason::PrimaryBufferEnd)==size_t(CohortBoundary::PrimaryBufferEnd));
+  static_assert(size_t(NativeCompletionReason::Presentation)==size_t(CohortBoundary::Presentation));
+  static_assert(size_t(NativeCompletionReason::ReferenceDraw)==size_t(CohortBoundary::ReferenceDraw));
+  static_assert(size_t(NativeCompletionReason::ProviderRemoval)==size_t(CohortBoundary::ProviderRemoval));
+  static_assert(size_t(NativeCompletionReason::QueryPressure)==size_t(CohortBoundary::QueryPressure));
+  static_assert(size_t(NativeCompletionReason::Shutdown)==size_t(CohortBoundary::Shutdown));
+  const bool observe_cohort=REXCVAR_GET(gpu_command_summary)&&bool(native_marker_readiness_observer_);
+  native_marker_query_cohorts_.SetEnabled(observe_cohort);
+  // Capture query population before original completion consumes its tickets.
+  const auto cohort_before=observe_cohort&&marker&&accepted_pending?ObserveNativeMarkerReadiness():
+      gow3::diagnostic::MarkerQueryCohortCensus::Readiness{};
+  const auto cohort_closed=observe_cohort?uint32_t(native_query_tickets_.size()):0;
+  if(observe_cohort&&!marker)ObserveNativeMarkerBoundary(
+      static_cast<gow3::diagnostic::MarkerQueryCohortCensus::Boundary>(reason));
+  // Before the original early return: no-pending primary/idle attempts still
+  // delimit a window. Repeated58 seeds may overlap; never sum as saved work.
+  if(observe_marker&&!marker&&native_marker_following_.open_markers()) {
+    const auto before=native_marker_following_.summary().finalized;
+    native_marker_following_.MandatoryBoundary(ObserveNativeAcceptedWork(),
+        static_cast<Census::Boundary>(reason));
+    if(!accepted_pending&&static_cast<size_t>(reason)<native_marker_no_pending_finalized_.size())
+      native_marker_no_pending_finalized_[static_cast<size_t>(reason)]+=
+          native_marker_following_.summary().finalized-before;
+  }
+  if(!accepted_pending&&(!terminal||!native_completion_provider_))return;
+  const bool count_completion=accepted_pending&&REXCVAR_GET(gpu_command_summary);
+  const bool time_packet=count_completion&&reason==NativeCompletionReason::CommandPacket&&
+      opcode<native_completion_opcode_wall_ms_.size();
+  // Existing diagnostic guard only. Exclude following-work observer costs;
+  // measure the original full completion, including its CPU/provider work.
+  const auto completion_began=time_packet?std::chrono::steady_clock::now():
+      std::chrono::steady_clock::time_point{};
+  try {
+  native_completion_state_.Complete([&] {
+    if(!native_completion_provider_)
+      throw std::runtime_error("Pending native ownership has no completion provider");
+    const auto provider = native_completion_provider_.Snapshot();
+    provider(reason);
+    if(!native_query_tickets_.empty())
+      throw std::runtime_error("Native completion returned with unpublished query tickets");
+  },terminal||tickets_pending);
+  } catch(const std::exception& error) {
+    native_marker_following_.FailedCompletion();
+    native_marker_query_cohorts_.FailedCompletion();native_marker_operands_.FailedCompletion();
+    if(native_scene_authority_.strict())ReportNativeSceneFailure(error.what());
+    throw;
+  } catch(...) {native_marker_following_.FailedCompletion();native_marker_query_cohorts_.FailedCompletion();native_marker_operands_.FailedCompletion();throw;}
+  const double completion_ms=time_packet?std::chrono::duration<double,std::milli>(
+      std::chrono::steady_clock::now()-completion_began).count():0.0;
+  if(observe_marker&&marker&&accepted_pending)
+    native_marker_following_.SuccessfulFull58(ObserveNativeAcceptedWork());
+  if(observe_cohort&&marker&&accepted_pending) {
+    const auto after=ObserveNativeAcceptedWork();
+    native_marker_query_cohorts_.AfterOriginalFull58(cohort_before,cohort_closed,after);
+    native_marker_operands_.OriginalFull58(cohort_before,cohort_closed,after);
+  }
+  if(count_completion) {
+    ++native_completion_reason_counts_[static_cast<size_t>(reason)];
+    if(reason==NativeCompletionReason::CommandPacket&&opcode<native_completion_opcode_counts_.size()) {
+      ++native_completion_opcode_counts_[opcode];
+      native_completion_opcode_wall_ms_[opcode]+=completion_ms;
+    }
+  }
+}
+
+void VulkanCommandProcessor::LogNativeCompletionSummary(bool force) {
+  if(!REXCVAR_GET(gpu_command_summary))return;
+  if(!force&&++native_completion_summary_frames_<120)return;
+  const auto count=[&](NativeCompletionReason reason) {
+    return native_completion_reason_counts_[static_cast<size_t>(reason)];
+  };
+  const bool any=std::any_of(native_completion_reason_counts_.begin(),native_completion_reason_counts_.end(),
+      [](uint64_t value){return value!=0;});
+  if(any) {
+    REXGPU_INFO("Native completion reason summary at reference frame {}: frames={}, command_packet={}, scratch_write={}, wait={}, primary_buffer_end={}, presentation={}, reference_draw={}, provider_removal={}, query_pressure={}, shutdown={}",
+        frame_current_,native_completion_summary_frames_,count(NativeCompletionReason::CommandPacket),
+        count(NativeCompletionReason::ScratchWrite),count(NativeCompletionReason::Wait),
+        count(NativeCompletionReason::PrimaryBufferEnd),count(NativeCompletionReason::Presentation),
+        count(NativeCompletionReason::ReferenceDraw),count(NativeCompletionReason::ProviderRemoval),
+        count(NativeCompletionReason::QueryPressure),count(NativeCompletionReason::Shutdown));
+    for(size_t opcode=0;opcode<native_completion_opcode_counts_.size();++opcode) {
+      const auto value=native_completion_opcode_counts_[opcode];
+      if(value)REXGPU_INFO("Native completion packet summary at reference frame {}: opcode=0x{:02X}, drains={}, completion_ms={:.6f}",
+          frame_current_,opcode,value,native_completion_opcode_wall_ms_[opcode]);
+    }
+  }
+  if(native_accepted_work_observer_) {
+    const auto& m=native_marker_following_.summary();
+    const auto& b=m.finalized_by_boundary;
+    const auto& n=native_marker_no_pending_finalized_;
+    const auto& c=m.censored;
+    REXGPU_INFO("Native marker following summary at reference frame {}: sdk_segment_only=1, owner_authenticated=0, overlapping_windows=1, seen={}, admitted={}, rejected={}, overflow_dropped={}, finalized={}, open={}, no_later_work={}, draw_only={}, transfer_only={}, mixed={}, maximum_draw_distance={}, maximum_transfer_distance={}, maximum_work_distance={}, counter_overflow={}",
+        frame_current_,m.successful_full_58_seen,m.admitted,m.rejected_marker_snapshots,
+        m.overflow_dropped,m.finalized,native_marker_following_.open_markers(),m.no_later_work,
+        m.draw_only,m.transfer_only,m.mixed,m.maximum_draw_distance,m.maximum_transfer_distance,
+        m.maximum_work_distance,m.counter_overflow);
+    // Histograms: zero,one,2..3,4..15,16..63,64..255,256+. Fixed cumulative
+    // data only; periodic logging never ends/reset open marker windows.
+    const auto histogram=[&](const char* kind,const auto& h) {
+      REXGPU_INFO("Native marker following histogram at reference frame {}: kind={}, bins={},{},{},{},{},{},{}",
+          frame_current_,kind,h[0],h[1],h[2],h[3],h[4],h[5],h[6]);
+    };
+    histogram("draws",m.draw_distance);histogram("transfers",m.transfer_distance);histogram("work",m.work_distance);
+    REXGPU_INFO("Native marker following boundaries at reference frame {}: command_packet={}, scratch_write={}, wait={}, primary_buffer_end={}, presentation={}, reference_draw={}, provider_removal={}, query_pressure={}, shutdown={}",
+        frame_current_,b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8]);
+    REXGPU_INFO("Native marker following no-pending finalized at reference frame {}: command_packet={}, scratch_write={}, wait={}, primary_buffer_end={}, presentation={}, reference_draw={}, provider_removal={}, query_pressure={}, shutdown={}",
+        frame_current_,n[0],n[1],n[2],n[3],n[4],n[5],n[6],n[7],n[8]);
+    REXGPU_INFO("Native marker following censored at reference frame {}: disabled={}, generation_changed={}, unavailable={}, invalid_snapshot={}, frontier_regression={}, failed_completion={}, invalid_boundary={}",
+        frame_current_,c[0],c[1],c[2],c[3],c[4],c[5],c[6]);
+  }
+  if(native_marker_readiness_observer_) {
+    const auto& s=native_marker_query_cohorts_.summary();
+    REXGPU_INFO("Native marker query cohort summary at reference frame {}: owner_authenticated=0, producer_snapshot_coverage=0, overlapping_windows=1, attempts={}, unknown_readiness={}, unknown_ticket_frontier={}, ticket_mismatch={}, changed_frontier={}, capacity_refused={}, pre_gpu_pending={}, active_query={}, all_ready_publisher_blocked={}, canonical_no_pending={}, canonical_submitted={}, canonical_fallback={}, noncanonical={}, counter_overflow={}",
+        frame_current_,s.attempts,s.unknown_readiness,s.unknown_ticket_frontier,s.ticket_mismatch,s.changed_frontier,s.capacity_refused,
+        s.pre_gpu_pending,s.active_query,s.all_ready_publisher_blocked,s.canonical_no_pending,s.canonical_submitted,s.canonical_fallback,s.noncanonical,s.counter_overflow);
+    static constexpr const char* bands[]={"zero","all_ready","some_pending"};
+    static constexpr const char* boundaries[]={"command_packet","scratch_write","wait","primary_buffer_end",
+      "presentation","reference_draw","provider_removal","query_pressure","shutdown","query_begin","query_end",
+      "cpu_write","memory_copy","canonical_wait","noncanonical_wait","unknown_operation"};
+    for(size_t i=0;i<3;++i) {
+      const auto& c=native_marker_query_cohorts_.band(i);const auto& m=c.summary();
+      uint64_t censored=0;for(const auto n:m.censored)censored+=n;
+      REXGPU_INFO("Native marker query cohort band at reference frame {}: tickets={}, admitted={}, rejected={}, finalized={}, open={}, censored={}, no_later_work={}, draw_only={}, transfer_only={}, mixed={}, counter_overflow={}",
+          frame_current_,bands[i],m.admitted,m.rejected_marker_snapshots,m.finalized,c.open_markers(),censored,
+          m.no_later_work,m.draw_only,m.transfer_only,m.mixed,m.counter_overflow);
+      const auto& d=m.draw_distance;const auto& t=m.transfer_distance;const auto& w=m.work_distance;
+      REXGPU_INFO("Native marker query cohort histogram at reference frame {}: tickets={}, kind=work, zero={}, one={}, two_three={}, four_fifteen={}, sixteen_sixtythree={}, sixtyfour_255={}, atleast256={}",frame_current_,bands[i],w[0],w[1],w[2],w[3],w[4],w[5],w[6]);
+      REXGPU_INFO("Native marker query cohort histogram at reference frame {}: tickets={}, kind=draws, zero={}, one={}, two_three={}, four_fifteen={}, sixteen_sixtythree={}, sixtyfour_255={}, atleast256={}",frame_current_,bands[i],d[0],d[1],d[2],d[3],d[4],d[5],d[6]);
+      REXGPU_INFO("Native marker query cohort histogram at reference frame {}: tickets={}, kind=transfers, zero={}, one={}, two_three={}, four_fifteen={}, sixteen_sixtythree={}, sixtyfour_255={}, atleast256={}",frame_current_,bands[i],t[0],t[1],t[2],t[3],t[4],t[5],t[6]);
+      for(size_t b=0;b<size_t(gow3::diagnostic::MarkerQueryCohortCensus::Boundary::Count);++b)
+        if(s.boundaries[i][b])REXGPU_INFO("Native marker query cohort boundary at reference frame {}: tickets={}, reason={}, finalized={}",frame_current_,bands[i],boundaries[b],s.boundaries[i][b]);
+    }
+  }
+  if(native_marker_operands_.enabled()) {
+    const auto& s=native_marker_operands_.summary();
+    REXGPU_INFO("Native marker operand summary at reference frame {}: owner_authenticated=0, producer_snapshot_coverage=0, allocation_lookup={}, decoded={}, immediate3={}, timestamp3={}, other={}, noncanonical_header={}, wrong_endian={}, nonphysical_target={}, wrapped_command={}, successful_full={}, unknown_completion={}, zero_seeds={}, shape_pairs={}, pair_without_full_seed={}, pair_without_zero_seed={}, pair_frontier_changed={}, allocation_unavailable={}, allocation_mismatch={}, allocation_matched={}, lookup_failures={}, example_capacity={}, counter_overflow={}",
+        frame_current_,bool(native_marker_allocation_observer_),s.decoded,s.immediate3,s.timestamp3,s.other,
+        s.noncanonical_header,s.wrong_endian,s.nonphysical_target,s.wrapped_command,s.successful_full,s.unknown_completion,
+        s.zero_seeds,s.shape_pairs,s.pair_without_full_seed,s.pair_without_zero_seed,s.pair_frontier_changed,s.allocation_unavailable,
+        s.allocation_mismatch,s.allocation_matched,s.lookup_failures,s.example_capacity,s.counter_overflow);
+    static constexpr const char* names[]={"zero_immediate3","zero_timestamp3","zero_other","all_pair","zero_pair",
+      "zero_inactive_pair","all_observed_allocation_pair","zero_observed_allocation_pair","zero_inactive_observed_allocation_pair"};
+    for(size_t i=0;i<size_t(gow3::diagnostic::MarkerOperandCensus::Band::Count);++i) {
+      const auto& c=native_marker_operands_.band(i);const auto& m=c.summary();
+      uint64_t censored=0;for(const auto value:m.censored)censored+=value;
+      REXGPU_INFO("Native marker operand band at reference frame {}: kind={}, admitted={}, rejected={}, overflow_dropped={}, finalized={}, open={}, censored={}, no_later_work={}, draw_only={}, transfer_only={}, mixed={}, counter_overflow={}",
+          frame_current_,names[i],m.admitted,m.rejected_marker_snapshots,m.overflow_dropped,m.finalized,c.open_markers(),censored,
+          m.no_later_work,m.draw_only,m.transfer_only,m.mixed,m.counter_overflow);
+    }
+    for(size_t i=0;i<native_marker_operands_.example_count();++i) {
+      const auto& e=native_marker_operands_.example(i);
+      REXGPU_INFO("Native marker operand example at reference frame {}: target=0x{:08X}, position=0x{:08X}, serial=0x{:08X}, command_begin={}, command_bytes=32, target_bytes=8, observed_registration_generation={}, command_epoch={}, allocation_matched={}, zero_seed={}, inactive={}, owner_authenticated=0",
+          frame_current_,e.target,e.position,e.serial,e.command_begin,e.registration_generation,e.command_epoch,
+          e.allocation_matched,e.zero_seed,e.inactive);
+    }
+  }
+  native_completion_reason_counts_.fill(0);
+  native_completion_opcode_counts_.fill(0);
+  native_completion_opcode_wall_ms_.fill(0.0);
+  native_completion_summary_frames_=0;
+}
+
+void VulkanCommandProcessor::PrepareForRegisterWait(uint32_t count, uint32_t info,
+    uint32_t address, uint32_t reference, uint32_t mask, uint32_t delay) {
+  const NativeCoherenceWait wait{count, info, address, reference, mask, delay,
+      register_file_->values[XE_GPU_REG_COHER_STATUS_HOST]};
+  const NativeCoherenceOwnership state{
+      native_completion_state_.pending() || !native_query_tickets_.empty(),
+      native_query_authority_, native_query_authority_retired_,
+      active_occlusion_query_.valid || bool(resume_native_query_),
+      native_rendering_shutdown_requested_.load(),
+      bool(native_draw_boundary_provider_), bool(native_query_boundary_provider_),
+      bool(native_completion_provider_), bool(native_coherence_provider_)};
+  using B=gow3::diagnostic::MarkerQueryCohortCensus::Boundary;
+  const bool observe_cohort=REXCVAR_GET(gpu_command_summary)&&bool(native_marker_readiness_observer_);
+  const bool canonical=observe_cohort&&IsNativeCacheOnlyWait(wait)&&state.native_authority&&!state.authority_retired&&
+      !state.foreign_query&&!state.shutdown&&state.draw_provider&&state.query_provider&&
+      state.completion_provider&&state.coherence_provider;
+  // Classification for measurement precedes the original NoPending decision.
+  // Original disposition, callback order, stores and completion are unchanged.
+  if(observe_cohort&&!canonical)ObserveNativeMarkerBoundary(B::NoncanonicalWait);
+  const auto disposition = PrepareNativeCoherenceWait(wait, state, [this] {
+    const auto provider = native_coherence_provider_.Snapshot();
+    return provider();
+  }, [this,observe_cohort,canonical] {
+    if(observe_cohort&&canonical)ObserveNativeMarkerBoundary(B::CanonicalWait);
+    CompleteNativeWork(NativeCompletionReason::CommandPacket, 0x3c);
+  });
+  if(observe_cohort)native_marker_query_cohorts_.Wait(canonical,
+      disposition==NativeCoherenceDisposition::Submitted,disposition==NativeCoherenceDisposition::NoPending);
+  if (disposition == NativeCoherenceDisposition::Submitted) ++native_coherence_submissions_;
+  if (disposition == NativeCoherenceDisposition::Completed) ++native_coherence_fallbacks_;
+}
+
+void VulkanCommandProcessor::PrepareForPacket(uint32_t opcode,uint32_t count) {
+  if(native_marker_operands_.enabled())native_marker_operands_.BeginPacket();
+  if(REXCVAR_GET(gpu_command_summary)&&native_marker_readiness_observer_&&opcode==0x5b) {
+    using B=gow3::diagnostic::MarkerQueryCohortCensus::Boundary;
+    const auto address=register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+    ObserveNativeMarkerBoundary(count!=1?B::UnknownOperation:
+        xenos::XenosZPDReport::IsBeginRecord(address)?B::QueryBegin:
+        xenos::XenosZPDReport::IsEndRecord(address)?B::QueryEnd:B::UnknownOperation);
+  }
+  // Only a complete five-operand wait can use the decoded pre-effect hook.
+  // That hook retains full completion for every noncanonical/unowned wait.
+  if (opcode == 0x3c && count == 5 && native_coherence_provider_ &&
+      native_query_authority_ && !native_query_authority_retired_ &&
+      !active_occlusion_query_.valid && !resume_native_query_ &&
+      !native_rendering_shutdown_requested_ && native_draw_boundary_provider_ &&
+      native_query_boundary_provider_ && native_completion_provider_) return;
+  if(opcode==0x5b&&count==1&&native_query_authority_&&native_query_deferral_enabled_&&
+      native_query_boundary_provider_&&native_draw_boundary_provider_&&native_completion_provider_) {
+    const uint32_t address=register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+    const uint32_t end_address=xenos::XenosZPDReport::GetEndRecordBase(address);
+    // The decoder has already checked payload extent and packet predication.
+    // Bypass only a physical report with a valid begin/end ownership transition;
+    // malformed layouts retain the completion barrier before decoder effects.
+    const bool begin=xenos::XenosZPDReport::IsBeginRecord(address)&&!active_native_query_boundary_;
+    const bool end=xenos::XenosZPDReport::IsEndRecord(address)&&active_native_query_boundary_&&
+        active_native_query_boundary_->end_address==end_address;
+    if((begin||end)&&uint64_t(end_address)+64<=0x20000000ull&&
+        !active_occlusion_query_.valid&&!resume_native_query_)return;
+  }
+  if(NativePacketNeedsCompletion(opcode,count))
+    CompleteNativeWork(NativeCompletionReason::CommandPacket,opcode);
+}
+
+bool VulkanCommandProcessor::PrepareNativeDrawSubmission() {
+  if(!in_native_draw_boundary_&&!native_query_tickets_.current_end()&&!in_native_swap_boundary_)
+    throw std::runtime_error("Native submission requested outside its ownership callback");
+  if(active_occlusion_query_.valid)return false;
+  if(!native_draw_submission_prepared_) {
+    if(!EndSubmission(false))throw std::runtime_error("Cannot submit prior reference work for native draw");
+    native_draw_submission_prepared_=true;
+  }
+  return true;
+}
+
+bool VulkanCommandProcessor::CanUseNativeQueryAuthority() {
+  if(!system::XThread::IsInThread(worker_thread_.get())) {
+    auto result=std::make_shared<std::promise<bool>>();
+    auto complete=result->get_future();
+    CallInThread([this,result] {result->set_value(CanUseNativeQueryAuthority());});
+    return complete.get();
+  }
+  return REXCVAR_GET(occlusion_query_enable)&&occlusion_query_resources_available_&&
+      occlusion_query_pool_!=VK_NULL_HANDLE&&occlusion_query_readback_mapping_&&
+      render_target_cache_&&render_target_cache_->GetPath()==RenderTargetCache::Path::kPixelShaderInterlock&&
+      !render_target_cache_->IsDrawResolutionScaled();
+}
+
+void VulkanCommandProcessor::SetNativeQueryAuthority(bool enabled) {
+  CallInThread([this,enabled] {
+    native_scene_authority_.ProviderChange("SetNativeQueryAuthority after exclusive native installation");
+    if(active_native_query_boundary_||active_occlusion_query_.valid||resume_native_query_||
+        native_query_tickets_.current_end())
+      throw std::runtime_error("Query authority changed during an active query");
+    if(enabled&&(!native_query_boundary_provider_||!native_draw_boundary_provider_||native_query_authority_retired_))
+      throw std::runtime_error("Native query authority requires fresh complete ownership providers");
+    if(enabled&&!CanUseNativeQueryAuthority())
+      throw std::runtime_error("Native query authority requires compatible FSI storage and real query resources");
+    if(!enabled) {
+      CompleteNativeWork(NativeCompletionReason::ProviderRemoval);
+      if(!native_query_tickets_.empty())
+        throw std::runtime_error("Native query authority retired with pending tickets");
+      native_query_deferral_enabled_=false;
+    }
+    native_query_authority_=enabled;
+    native_query_authority_armed_|=enabled;
+    if(!enabled&&native_query_authority_armed_)native_query_authority_retired_=true;
+  });
+}
+
+void VulkanCommandProcessor::LogNativeQueryStatistics() {
+  LogNativeCompletionSummary(true);
+  if(native_query_statistics_logged_)return;
+  native_query_statistics_logged_=true;
+  if (native_coherence_submissions_ || native_coherence_fallbacks_) {
+    REXGPU_INFO("Native cache coherence wait summary: submitted={}, full_completion={}",
+                native_coherence_submissions_, native_coherence_fallbacks_);
+  }
+  const auto stats=native_query_tickets_.statistics();
+  REXGPU_INFO("Native query deferral summary: deferred={}, retired={}, guest_written={}, superseded={}, pending={}, peak={}",
+              stats.deferred,stats.retired,stats.guest_written,stats.superseded,stats.pending,stats.peak);
+}
+
+void VulkanCommandProcessor::SetNativeQueryDeferralEnabled(bool enabled) {
+  CallInThread([this,enabled] {
+    native_scene_authority_.ProviderChange("SetNativeQueryDeferralEnabled after exclusive native installation");
+    if(active_native_query_boundary_||active_occlusion_query_.valid||resume_native_query_||
+        native_query_tickets_.current_end())
+      throw std::runtime_error("Native query deferral changed during an active query");
+    if(enabled&&(!native_query_authority_||!native_query_boundary_provider_||
+        !native_draw_boundary_provider_||!native_completion_provider_))
+      throw std::runtime_error("Native query deferral requires complete native ownership providers");
+    if(!enabled)CompleteNativeWork(NativeCompletionReason::ProviderRemoval);
+    if(!native_query_tickets_.empty())
+      throw std::runtime_error("Native query deferral changed with pending tickets");
+    native_query_deferral_enabled_=enabled;
+  });
+}
+
+void VulkanCommandProcessor::DeferNativeQueryResult(const NativeQueryBoundary& boundary) {
+  if(!native_query_deferral_enabled_||!native_query_authority_||!native_completion_provider_)
+    throw std::runtime_error("Native query deferral is not enabled");
+  if(boundary.end_address%64||uint64_t(boundary.end_address)+32>0x20000000ull)
+    throw std::runtime_error("Native query deferral has an invalid physical report");
+  native_query_tickets_.Defer(boundary);
+  // Zero-draw queries still own a publication ordered behind earlier work.
+  native_completion_state_.AcceptPending();
+}
+
+void VulkanCommandProcessor::ShutdownNativeRendering() {
+  if(native_rendering_shutdown_requested_.exchange(true))return;
+  CallInThread([this] {
+    if(native_rendering_shutdown_)return;
+    native_rendering_shutdown_=true;
+    CompleteNativeWork(NativeCompletionReason::Shutdown);
+    if(!native_query_tickets_.empty())
+      throw std::runtime_error("Native rendering shutdown retained deferred query tickets");
+    LogNativeQueryStatistics();
+    LogNativeSceneStatistics();
+    EndSubmission(false);
+    AwaitAllQueueOperationsCompletion();
+    // Any retained presentation image must outlive its last GPU consumer.
+    native_swap_sources_in_flight_.clear();
+    native_swap_source_provider_={};
+    native_query_boundary_provider_.Reset();
+    native_draw_boundary_provider_.Reset();
+    native_completion_provider_.Reset();
+    native_coherence_provider_.Reset();
+    // Shutdown attempted its mandatory observation and logged before releasing
+    // the pure observer's shared Runtime owner.
+    native_marker_following_.SetEnabled(false);
+    native_accepted_work_observer_={};
+    native_marker_query_cohorts_.SetEnabled(false);
+    native_marker_readiness_observer_={};
+    native_marker_operands_.SetEnabled(false);native_marker_allocation_observer_={};
+    native_immediate_marker_pairs_enabled_=false;native_immediate_marker_providers_={};
+    observe_decoded_event_write_shd_=false;
+    native_draw_packet_bytes_.clear();
+    capture_native_draw_packets_=false;
+    active_native_query_boundary_.reset();
+    native_query_deferral_enabled_=false;
+    native_query_authority_=false;
+    native_query_authority_retired_=true;
+  });
+}
+
+void VulkanCommandProcessor::HandBackNativeQuery(uint32_t end_address,uint64_t native_samples) {
+  native_scene_authority_.ProviderChange("Native query handback requested");
+  if(!native_query_authority_||(!in_native_draw_boundary_&&!native_query_tickets_.current_end()&&!in_native_swap_boundary_))
+    throw std::runtime_error("Native query handback is outside its ownership callback");
+  // Publish every previously ended query before retiring authority. This may
+  // also publish the current end if its provider already deferred it.
+  CompleteNativeWork(NativeCompletionReason::ReferenceDraw);
+  if(!native_query_tickets_.empty())
+    throw std::runtime_error("Native query handback retained deferred tickets");
+  if(native_query_tickets_.current_end()) {
+    const auto boundary=*native_query_tickets_.current_end();
+    if(boundary.end_address!=end_address)
+      throw std::runtime_error("Native completed query handback address mismatch");
+    REXGPU_INFO("Native query handback at completed end: generation {}, report 0x{:08X}, native samples {}, residual samples 0",
+                boundary.generation,end_address,native_samples);
+    if(native_query_tickets_.end_status()==NativeQueryTickets::EndStatus::Outstanding)
+      PublishNativeQueryResult(boundary,native_samples);
+    else if(native_query_tickets_.end_status()!=NativeQueryTickets::EndStatus::Published)
+      throw std::runtime_error("Native completed query handback was not published");
+    // The ZPD end was already consumed, including after deferral/publication.
+    // Never resurrect it as an active residual reference query.
+  } else if(active_native_query_boundary_) {
+    if(active_native_query_boundary_->end_address!=end_address||(!native_draw_submission_prepared_&&!in_native_swap_boundary_))
+      throw std::runtime_error("Native active query handback address/order mismatch");
+    auto residual=std::make_shared<NativeQueryAccumulator>();
+    residual->begin_address=end_address+32;
+    residual->generation=active_native_query_boundary_->generation;
+    residual->native_samples=native_samples;
+    if(!BeginGuestOcclusionQuery(residual->begin_address))
+      throw std::runtime_error("Cannot begin residual reference occlusion query");
+    active_occlusion_query_.native_prefix=std::move(residual);
+    REXGPU_INFO("Native query handback begins residual reference query: generation {}, report 0x{:08X}, native subtotal {}",
+                active_native_query_boundary_->generation,end_address,native_samples);
+    active_native_query_boundary_->native_authority=false;
+  } else if(end_address||native_samples) {
+    throw std::runtime_error("Native query handback supplied samples without an active query");
+  }
+  native_query_deferral_enabled_=false;
+  native_query_authority_=false;
+  native_query_authority_retired_=true;
+}
+
+void VulkanCommandProcessor::PublishNativeQueryResult(const NativeQueryBoundary& boundary,uint64_t samples) {
+  if(boundary.end_address%64||uint64_t(boundary.end_address)+32>0x20000000ull)
+    throw std::runtime_error("Native query publication has an invalid physical report");
+  native_query_tickets_.Publish(boundary,[&] {
+    auto* report=memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(boundary.end_address);
+    if(!report)throw std::runtime_error("Native query publication has no physical report");
+    pending_occlusion_results_.InvalidateAddress(boundary.end_address);
+    xenos::XenosZPDReport::WriteSampleCount(report,uint32_t(std::min<uint64_t>(samples,UINT32_MAX)));
+    // Query tickets are much more frequent than frames. All ticket counters
+    // remain exact; successful publication only needs sparse progress logging.
+    if(boundary.generation<=3||boundary.generation%10000==0)
+      REXGPU_INFO("Native query published: generation {}, report 0x{:08X}, samples {}, reference frame {}",
+                  boundary.generation,boundary.end_address,samples,boundary.reference_frame);
+  });
+}
+
+void VulkanCommandProcessor::PollNativeComparisonResults() {
+  CheckSubmissionFenceAndDeviceLoss(0);
+  // Only this frame is compared. Retain neither stale addresses nor historical
+  // query allocations as the game streams through the campaign.
+  for (auto it = native_reference_query_results_.begin();
+       it != native_reference_query_results_.end();) {
+    if (it->second.frame != frame_current_) {
+      it = native_reference_query_results_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+std::optional<VulkanCommandProcessor::NativeReferenceQueryResult>
+VulkanCommandProcessor::ReadNativeComparisonResult(uint32_t address) const {
+  const auto it=native_reference_query_results_.find(address);
+  if(it==native_reference_query_results_.end() || it->second.frame!=frame_current_)return std::nullopt;
+  return it->second;
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
 
-  if (!graphics_system_)
+  if(native_rendering_shutdown_requested_)return;
+  native_scene_authority_.Require(bool(native_swap_source_provider_) && native_query_authority_,
+      "Native presentation authority/provider is missing");
+  CompleteNativeWork(NativeCompletionReason::Presentation);
+
+  if (!graphics_system_) {
+    native_scene_authority_.Require(false,"Native presentation has no host graphics system");
     return;
+  }
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
+    native_scene_authority_.Require(false,"Native presentation has no host presenter");
     REXGPU_ERROR("XELOG_GPU PRESENT: NO PRESENTER");
     return;
   }
 
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
+    native_scene_authority_.Require(false,"Initial host submission failed for native presentation");
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
   }
 
-  bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
-                                            REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+  std::optional<NativeSwapSource> native_source;
+  if (native_swap_source_provider_) {
+    // A failing provider may clear the installed callback from the GPU thread.
+    // Retain its callable/state until this invocation has returned.
+    const auto provider = native_swap_source_provider_;
+    // Put preceding reference commands into queue order before invoking the
+    // native producer. Both paths share the host queue's synchronization lock.
+    if (!EndSubmission(false)) {
+      native_scene_authority_.Require(false,"Host submission failed before native presentation");
+      return;
+    }
+    in_native_swap_boundary_=true;
+    try {
+      native_source = provider(external_frame_number_, frontbuffer_ptr,
+                                                   frontbuffer_width, frontbuffer_height);
+    } catch (const std::exception& error) {
+      in_native_swap_boundary_=false;
+      if(native_scene_authority_.strict())ReportNativeSceneFailure(error.what());
+      if(native_query_authority_armed_)throw;
+      REXGPU_ERROR("Native swap source failed: {}", error.what());
+    }
+    in_native_swap_boundary_=false;
+    if(native_rendering_shutdown_requested_)return;
+    if (native_source &&
+        (native_source->device != GetVulkanDevice()->device() || !native_source->image ||
+         !native_source->view || !native_source->width || !native_source->height ||
+         !native_source->keep_alive)) {
+      native_scene_authority_.Require(false,"Native swap image has invalid device, dimensions or ownership");
+      REXGPU_ERROR("Native swap source has invalid device, dimensions or ownership");
+      native_source.reset();
+    }
+    native_scene_authority_.Require(bool(native_source),"Native presentation provider declined the frame");
+    if (!BeginSubmission(true)) {
+      native_scene_authority_.Require(false,"Host submission failed after native presentation");
+      return;
+    }
+  }
+
+  bool skip_present_due_async_placeholder = !native_source && REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
   if (skip_present_due_async_placeholder) {
     static bool skipped_incomplete_frame_logged = false;
@@ -2329,9 +3217,18 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
   xenos::TextureFormat frontbuffer_format;
   bool swap_source_needs_rb_swap = false;
-  VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
-      frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
-      &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
+  VkImageView swap_texture_view;
+  if (native_source) {
+    swap_texture_view = native_source->view;
+    frontbuffer_width_scaled = frontbuffer_width_unscaled = native_source->width;
+    frontbuffer_height_scaled = frontbuffer_height_unscaled = native_source->height;
+    frontbuffer_format = native_source->format;
+  } else {
+    native_scene_authority_.Reference(NativeSceneAuthority::ReferenceOperation::SwapSource,"Xenia swap-source lookup requested");
+    swap_texture_view = texture_cache_->RequestSwapTexture(
+        frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
+        &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
+  }
   if (swap_texture_view == VK_NULL_HANDLE) {
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     return;
@@ -2413,11 +3310,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     }
   }
   REXGPU_DEBUG(
-      "XELOG_GPU PRESENT: swap_texture_view={:p} packet_size={}x{} src_size={}x{} "
-      "src_unscaled={}x{} guest_output_size={}x{} format={}",
-      static_cast<void*>(swap_texture_view), frontbuffer_width, frontbuffer_height,
-      frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_width_unscaled,
-      frontbuffer_height_unscaled, guest_output_width, guest_output_height,
+      "XELOG_GPU PRESENT: frame={} swap_texture_view={:p} packet_size={}x{} "
+      "src_size={}x{} src_unscaled={}x{} guest_output_size={}x{} format={}",
+      counter_, static_cast<void*>(swap_texture_view), frontbuffer_width,
+      frontbuffer_height, frontbuffer_width_scaled, frontbuffer_height_scaled,
+      frontbuffer_width_unscaled, frontbuffer_height_unscaled,
+      guest_output_width, guest_output_height,
       static_cast<uint32_t>(frontbuffer_format));
 
   system::X_VIDEO_MODE video_mode;
@@ -2427,12 +3325,24 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
-      [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
+      [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view, native_source,
        swap_post_effect,
        swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
+        }
+
+        if (native_source) {
+          // Retain before recording any use, including barriers, so early
+          // failures in the presenter callback cannot retire the source early.
+          native_swap_sources_in_flight_.emplace_back(GetCurrentSubmission(), native_source->keep_alive);
+          const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+          PushImageMemoryBarrier(native_source->image, range, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                                 VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+                                 VK_QUEUE_FAMILY_IGNORED, false);
         }
 
         auto& vulkan_context =
@@ -2937,8 +3847,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue, and also need to submit the release barrier.
-        EndSubmission(true);
-        return true;
+        return EndSubmission(true);
       });
 
   // End the frame even if did not present for any reason (the image refresher
@@ -3593,9 +4502,21 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
 }
 
 void VulkanCommandProcessor::OnPrimaryBufferEnd() {
+  CompleteNativeWork(NativeCompletionReason::PrimaryBufferEnd);
   if (REXCVAR_GET(vulkan_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {
     EndSubmission(false);
+  }
+}
+
+void VulkanCommandProcessor::PrepareForWait() {
+  CompleteNativeWork(NativeCompletionReason::Wait);
+  CommandProcessor::PrepareForWait();
+  // The guest may be polling a query while no more command packets arrive.
+  // Submit and drain the pending batch before sleeping, including WAIT_REG_MEM.
+  // Otherwise result publication would depend on a future draw and could hang.
+  if (!pending_occlusion_results_.empty()) {
+    CheckSubmissionFenceAndDeviceLoss(pending_occlusion_results_.last_submission());
   }
 }
 
@@ -3617,7 +4538,105 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  if(native_rendering_shutdown_requested_)return true;
+
+  native_scene_authority_.Require(native_draw_boundary_provider_ && native_query_authority_ &&
+      native_query_boundary_provider_ && native_completion_provider_,"Native draw authority/provider is missing");
   const RegisterFile& regs = *register_file_;
+  if(native_draw_boundary_provider_) {
+    if(native_draw_packet_bytes_.empty())throw std::runtime_error("Native draw has no PM4 packet identity");
+    NativeDrawBoundary boundary;
+    boundary.command_address=native_draw_packet_address_;boundary.packet_bytes=native_draw_packet_bytes_;
+    boundary.primitive=uint32_t(prim_type);boundary.index_count=index_count;
+    boundary.edram_mode=uint32_t(regs.Get<reg::RB_MODECONTROL>().edram_mode);
+    boundary.copy_destination=regs.values[XE_GPU_REG_RB_COPY_DEST_BASE];
+    boundary.copy_destination_info=regs.values[XE_GPU_REG_RB_COPY_DEST_INFO];
+    if(const auto* vertex=active_vertex_shader())
+      boundary.vertex_shader_words={vertex->ucode_dwords(),vertex->ucode_dword_count()};
+    for(unsigned i=0;i<2;++i)boundary.vertex_fetch95[i]=regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0+95*2+i];
+    for(unsigned i=0;i<8;++i)boundary.export_constants[i]=regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X+6*4+i];
+    boundary.clip_control=regs.values[XE_GPU_REG_PA_CL_CLIP_CNTL];
+    boundary.vte_control=regs.values[XE_GPU_REG_PA_CL_VTE_CNTL];
+    boundary.index_offset=regs.values[XE_GPU_REG_VGT_INDX_OFFSET];
+    boundary.color_mask=regs.values[XE_GPU_REG_RB_COLOR_MASK];
+    boundary.depth_control=regs.values[XE_GPU_REG_RB_DEPTHCONTROL];
+    boundary.surface_info=regs.values[XE_GPU_REG_RB_SURFACE_INFO];
+    boundary.bin_mask=bin_mask_;boundary.bin_select=bin_select_;
+    boundary.packet_predicated=(native_draw_packet_bytes_[3]&1)!=0;
+    boundary.predicate_passed=!boundary.packet_predicated||(bin_mask_&bin_select_)!=0;
+    if(index_buffer_info) {
+      boundary.index_address=index_buffer_info->guest_base;
+      boundary.index_endian=uint32_t(index_buffer_info->endianness);
+      boundary.index_format=uint32_t(index_buffer_info->format);
+    }
+    if(regs.Get<reg::RB_MODECONTROL>().edram_mode!=xenos::EdramMode::kCopy) {
+      if(!index_count)boundary.proven_no_effect=1;
+      else if(auto* vertex=active_vertex_shader()) {
+        pipeline_cache_->AnalyzeShaderUcode(*vertex);
+        if(!vertex->memexport_eM_written()&&
+           !draw_util::IsRasterizationPotentiallyDone(regs,draw_util::IsPrimitivePolygonal(regs)))
+          boundary.proven_no_effect=2;
+        else if(!boundary.color_mask&&!boundary.depth_control) {
+          auto* pixel=active_pixel_shader();
+          if(pixel)pipeline_cache_->AnalyzeShaderUcode(*pixel);
+          if(IsNativeDrawWithoutOutputs({boundary.edram_mode,boundary.color_mask,boundary.depth_control,
+              true,vertex->memexport_eM_written()!=0,pixel&&pixel->memexport_eM_written()!=0,
+              active_occlusion_query_.valid,active_native_query_boundary_.has_value(),
+              bool(resume_native_query_),native_query_tickets_.current_end().has_value()}))
+            boundary.proven_no_effect=3;
+        }
+      }
+    }
+    const auto provider = native_draw_boundary_provider_.Snapshot();
+    in_native_draw_boundary_=true;native_draw_submission_prepared_=false;
+    NativeDrawDisposition disposition;
+    try {disposition=provider(boundary);}
+    catch(...) {
+      in_native_draw_boundary_=false;
+      if(native_scene_authority_.strict())ReportNativeSceneFailure("Native draw callback failed");
+      throw;
+    }
+    in_native_draw_boundary_=false;
+    // Closing may race with this provider call. Admission has stopped, but a
+    // just-accepted batch still needs the terminal callback's completion fence.
+    if(native_rendering_shutdown_requested_) {
+      if(disposition==NativeDrawDisposition::NativePending) {
+        if(!native_completion_provider_)
+          throw std::runtime_error("Closing accepted pending native work without completion provider");
+        native_completion_state_.AcceptPending();
+      }
+      return true;
+    }
+    if(disposition==NativeDrawDisposition::ProvenNoEffect) {
+      if(!boundary.proven_no_effect)throw std::runtime_error("Draw skipped without a no-effect proof");
+      if(native_draw_submission_prepared_&&NativeBoundaryNeedsReferenceSubmission(
+          frame_open_,false,bool(resume_native_query_))&&!BeginSubmission(true))return false;
+      return true;
+    }
+    native_scene_authority_.Require(disposition != NativeDrawDisposition::ReferenceCoherent,
+        "Native draw provider requested Xenia raster continuation");
+    if(disposition==NativeDrawDisposition::ReferenceCoherent&&native_query_authority_)
+      throw std::runtime_error("Reference raster resumed before native query/state handback");
+    const bool native_owned=disposition==NativeDrawDisposition::NativeCompleted||
+                            disposition==NativeDrawDisposition::NativePending;
+    if(native_owned&&!native_draw_submission_prepared_)
+      throw std::runtime_error("Native draw accepted without an ordered submission boundary");
+    if(disposition==NativeDrawDisposition::NativePending) {
+      if(!native_completion_provider_)
+        throw std::runtime_error("Pending native draw accepted without a completion provider");
+      native_completion_state_.AcceptPending();
+    } else if(disposition==NativeDrawDisposition::ReferenceCoherent) {
+      CompleteNativeWork(NativeCompletionReason::ReferenceDraw);
+    }
+    // PrepareNativeDrawSubmission has submitted all earlier reference work.
+    // Native draws use their own command lists, so leave that submission closed
+    // until an actual reference draw/copy/query or presentation requests one.
+    // BeginSubmission still opens/reclaims the guest frame once when needed.
+    if(native_draw_submission_prepared_&&NativeBoundaryNeedsReferenceSubmission(
+        frame_open_,!native_owned,bool(resume_native_query_))&&!BeginSubmission(true))return false;
+    if(native_owned)return true;
+  }
+  native_scene_authority_.Reference(NativeSceneAuthority::ReferenceOperation::Draw,"Xenia raster draw requested");
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
@@ -3636,6 +4655,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
+    RecordCopyAttempt();
     return IssueCopy();
   }
 
@@ -3669,6 +4689,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (surface_pitch_is_zero && is_rasterization_done) {
     // Doesn't actually draw.
     // Unlikely that zero would even really be legal though.
+    RecordDrawSkippedSurfacePitchZero();
     return true;
   }
   VulkanShader* pixel_shader = nullptr;
@@ -3689,6 +4710,49 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
+      const auto sq_program_cntl = regs.Get<reg::SQ_PROGRAM_CNTL>();
+      const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      const auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+      const bool invalid_edram_mode =
+          edram_mode != xenos::EdramMode::kColorDepth &&
+          edram_mode != xenos::EdramMode::kDepthOnly;
+      const bool vertex_multipass =
+          sq_program_cntl.vs_export_mode ==
+          xenos::VertexShaderExportMode::kMultipass;
+      const bool surface_pitch_zero = !rb_surface_info.surface_pitch;
+      const bool cull_both =
+          primitive_polygonal && pa_su_sc_mode_cntl.cull_front &&
+          pa_su_sc_mode_cntl.cull_back;
+      RecordDrawSkippedNoRasterizationOrMemexport(
+          invalid_edram_mode, vertex_multipass, surface_pitch_zero, cull_both);
+      if (REXCVAR_GET(gpu_no_effect_trace)) {
+        const Shader* active_pixel_shader = this->active_pixel_shader();
+        const uint64_t vertex_shader_hash = vertex_shader->ucode_data_hash();
+        const uint64_t pixel_shader_hash =
+            active_pixel_shader ? active_pixel_shader->ucode_data_hash() : 0;
+        auto trace_key =
+            std::make_tuple(uint32_t(prim_type), index_count,
+                            vertex_shader_hash, pixel_shader_hash,
+                            uint32_t(edram_mode), rb_surface_info.value,
+                            sq_program_cntl.value, pa_su_sc_mode_cntl.value);
+        static std::vector<decltype(trace_key)> traced_states;
+        if (traced_states.size() < 256 &&
+            std::find(traced_states.begin(), traced_states.end(), trace_key) ==
+                traced_states.end()) {
+          const size_t trace_index = traced_states.size();
+          traced_states.push_back(trace_key);
+          REXGPU_INFO(
+              "GPU no-effect draw[{}]: prim={} indices={} vs={:016X} ps={:016X} "
+              "edram={} surface={:08X} program={:08X} sc_mode={:08X} "
+              "reasons=edram:{},multipass:{},pitch:{},cull:{}",
+              trace_index, uint32_t(prim_type), index_count,
+              vertex_shader_hash, pixel_shader_hash,
+              uint32_t(edram_mode), rb_surface_info.value,
+              sq_program_cntl.value, pa_su_sc_mode_cntl.value,
+              invalid_edram_mode, vertex_multipass, surface_pitch_zero,
+              cull_both);
+        }
+      }
       return true;
     }
   }
@@ -3736,6 +4800,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     if (!primitive_processing_result.host_draw_vertex_count) {
       // Nothing to draw.
+      RecordDrawSkippedZeroVertices();
       return true;
     }
     if (primitive_processing_result.host_primitive_type == xenos::PrimitiveType::kTriangleFan) {
@@ -3776,8 +4841,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
                            pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
                      : nullptr;
+    bool translation_pending = false;
     if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
-                                                  pixel_shader_translation)) {
+                                                  pixel_shader_translation,
+                                                  &translation_pending,
+                                                  !memexport_writes_possible&&!active_occlusion_query_.native_prefix)) {
+      if (translation_pending) {
+        frame_used_async_placeholder_pipeline_ = true;
+        if (active_occlusion_query_.valid) ++active_occlusion_query_.skipped_async_draws;
+        RecordDrawSkippedAsync();
+        return true;
+      }
       return draw_fail("shader_translation");
     }
 
@@ -3884,8 +4958,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // may happen between pipeline configuration and binding.
   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
                                                 &pipeline_is_placeholder);
-  if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
+  // Existing background work may still be pending after async compilation is
+  // disabled at runtime. Never bind a pending (possibly null) pipeline.
+  if(pipeline_is_placeholder&&active_occlusion_query_.native_prefix) {
+    if(!pipeline_cache_->WaitForPipeline(pipeline_handle,pipeline,pipeline_layout_provider))
+      throw std::runtime_error("Residual reference query pipeline creation failed");
+    pipeline_is_placeholder=false;
+  }
+  if (pipeline_is_placeholder) {
     frame_used_async_placeholder_pipeline_ = true;
+    if (active_occlusion_query_.valid) ++active_occlusion_query_.skipped_async_draws;
+    RecordDrawSkippedAsync();
     return true;
   }
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
@@ -3917,6 +5000,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         descriptor_sets_kept = std::min(
             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
       }
+      current_graphics_descriptor_sets_bound_up_to_date_ &=
+          (UINT32_C(1) << descriptor_sets_kept) - 1;
     } else {
       // No or unknown pipeline layout previously bound - all bindings are in an
       // indeterminate state.
@@ -3994,10 +5079,287 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
                              normalized_depth_control, normalized_color_mask);
 
+  if (REXCVAR_GET(gpu_draw_trace_resources)) {
+    const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    const auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+    const auto color_info_0 =
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+    const auto color_info_1 =
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[1]);
+    const auto color_info_2 =
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[2]);
+    const auto color_info_3 =
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[3]);
+    const uint64_t pixel_shader_hash =
+        pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+    auto trace_key =
+        std::make_tuple(vertex_shader->ucode_data_hash(), pixel_shader_hash,
+                        uint32_t(edram_mode), rb_surface_info.value,
+                        rb_depth_info.value, color_info_0.value,
+                        color_info_1.value, color_info_2.value,
+                        color_info_3.value, normalized_color_mask);
+    static std::vector<decltype(trace_key)> traced_render_target_states;
+    if (traced_render_target_states.size() < 256 &&
+        std::find(traced_render_target_states.begin(),
+                  traced_render_target_states.end(),
+                  trace_key) == traced_render_target_states.end()) {
+      const size_t trace_index = traced_render_target_states.size();
+      traced_render_target_states.push_back(trace_key);
+      REXGPU_INFO(
+          "GPU RT state[{}]: vs={:016X} ps={:016X} edram={} "
+          "surface={:08X} depth={:08X} color={:08X},{:08X},{:08X},{:08X} "
+          "mask={:08X}",
+          trace_index, vertex_shader->ucode_data_hash(), pixel_shader_hash,
+          uint32_t(edram_mode), rb_surface_info.value, rb_depth_info.value,
+          color_info_0.value, color_info_1.value, color_info_2.value,
+          color_info_3.value, normalized_color_mask);
+    }
+  }
+
+  if (REXCVAR_GET(gpu_draw_trace_resources) &&
+      vertex_shader->ucode_data_hash() == UINT64_C(0xF9EBE3D4293EC775) &&
+      pixel_shader &&
+      pixel_shader->ucode_data_hash() == UINT64_C(0x19055C4D86C6C08C)) {
+    static uint32_t gow3_title_system_trace_count = 0;
+    if (gow3_title_system_trace_count < 32) {
+      const uint32_t gow3_title_sample = gow3_title_system_trace_count++;
+      REXGPU_INFO(
+          "GPU GOW3 title system: sample={} flags={:08X} "
+          "signs0={:08X} swizzles0={:08X} integer_scale0={:08X} "
+          "color_exp={:g},{:g},{:g},{:g}",
+          gow3_title_sample, system_constants_.flags,
+          system_constants_.texture_swizzled_signs[0],
+          system_constants_.texture_swizzles[0],
+          system_constants_.texture_integer_scale_bits[0],
+          system_constants_.color_exp_bias[0],
+          system_constants_.color_exp_bias[1],
+          system_constants_.color_exp_bias[2],
+          system_constants_.color_exp_bias[3]);
+      const auto blend_control = regs.Get<reg::RB_BLENDCONTROL>(
+          reg::RB_BLENDCONTROL::rt_register_indices[0]);
+      REXGPU_INFO(
+          "GPU GOW3 exact title blend: sample={} value={:08X} color_src={} "
+          "color_op={} color_dst={} alpha_src={} alpha_op={} alpha_dst={}",
+          gow3_title_sample, blend_control.value,
+          uint32_t(blend_control.color_srcblend),
+          uint32_t(blend_control.color_comb_fcn),
+          uint32_t(blend_control.color_destblend),
+          uint32_t(blend_control.alpha_srcblend),
+          uint32_t(blend_control.alpha_comb_fcn),
+          uint32_t(blend_control.alpha_destblend));
+
+      const Shader::ConstantRegisterMap& constant_map =
+          vertex_shader->constant_register_map();
+      for (uint32_t i = 0;
+           i < rex::countof(constant_map.vertex_fetch_bitmap); ++i) {
+        uint32_t vfetch_bits_remaining = constant_map.vertex_fetch_bitmap[i];
+        uint32_t j;
+        while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+          vfetch_bits_remaining &= ~(uint32_t(1) << j);
+          const uint32_t vfetch_index = i * 32 + j;
+          const xenos::xe_gpu_vertex_fetch_t vertex_fetch =
+              regs.GetVertexFetch(vfetch_index);
+          const uint32_t vertex_base = vertex_fetch.address << 2;
+          const size_t vertex_size = size_t(vertex_fetch.size) << 2;
+          const uint8_t* vertex_bytes =
+              memory_->TranslatePhysical(vertex_base);
+          const size_t vertex_hash_size =
+              std::min<size_t>(vertex_size, 4096);
+          uint64_t vertex_hash = UINT64_C(14695981039346656037);
+          uint32_t vertex_nonzero = 0;
+          for (size_t byte_index = 0; byte_index < vertex_hash_size;
+               ++byte_index) {
+            const uint8_t value = vertex_bytes[byte_index];
+            vertex_hash =
+                (vertex_hash ^ value) * UINT64_C(1099511628211);
+            vertex_nonzero += value != 0;
+          }
+          REXGPU_INFO(
+              "GPU GOW3 exact title vertex fetch: sample={} fetch={} "
+              "words={:08X},{:08X} type={} base={:08X} bytes={} "
+              "hashed_bytes={} hash={:016X} nonzero={}",
+              gow3_title_sample, vfetch_index, vertex_fetch.dword_0,
+              vertex_fetch.dword_1, uint32_t(vertex_fetch.type),
+              vertex_base, vertex_size, vertex_hash_size, vertex_hash,
+              vertex_nonzero);
+          const size_t vertex_count =
+              std::min<size_t>(size_t(vertex_fetch.size) / 3, 8);
+          for (size_t vertex_index = 0; vertex_index < vertex_count;
+               ++vertex_index) {
+            uint32_t words[3];
+            std::memcpy(words,
+                        vertex_bytes + vertex_index * sizeof(words),
+                        sizeof(words));
+            REXGPU_INFO(
+                "GPU GOW3 exact title vertex: sample={} vertex={} "
+                "words={:08X},{:08X},{:08X}",
+                gow3_title_sample, vertex_index, words[0], words[1],
+                words[2]);
+          }
+        }
+      }
+    }
+  }
+
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
   if (!UpdateBindings(vertex_shader, pixel_shader)) {
     return draw_fail("update_bindings");
+  }
+
+  if (REXCVAR_GET(gpu_draw_trace_resources) &&
+      vertex_shader->ucode_data_hash() == UINT64_C(0xF9EBE3D4293EC775) &&
+      pixel_shader &&
+      pixel_shader->ucode_data_hash() == UINT64_C(0x19055C4D86C6C08C)) {
+    static uint64_t gow3_title_texture_trace_frame = UINT64_MAX;
+    static uint32_t gow3_title_texture_trace_count = 0;
+    if (gow3_title_texture_trace_frame != frame_current_ &&
+        gow3_title_texture_trace_count < 4096) {
+      gow3_title_texture_trace_frame = frame_current_;
+      ++gow3_title_texture_trace_count;
+      const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      const auto rb_color_info = regs.Get<reg::RB_COLOR_INFO>(
+          reg::RB_COLOR_INFO::rt_register_indices[0]);
+      const auto blend_control = regs.Get<reg::RB_BLENDCONTROL>(
+          reg::RB_BLENDCONTROL::rt_register_indices[0]);
+      uint64_t constants_hash = UINT64_C(14695981039346656037);
+      auto hash_dword = [&constants_hash](uint32_t value) {
+        for (uint32_t byte_index = 0; byte_index < sizeof(value);
+             ++byte_index) {
+          constants_hash =
+              (constants_hash ^ uint8_t(value >> (byte_index * 8))) *
+              UINT64_C(1099511628211);
+        }
+      };
+      const Shader::ConstantRegisterMap& vertex_constant_map =
+          vertex_shader->constant_register_map();
+      const Shader::ConstantRegisterMap& pixel_constant_map =
+          pixel_shader->constant_register_map();
+      for (uint32_t map_index = 0; map_index < 4; ++map_index) {
+        uint64_t constant_bits =
+            vertex_constant_map.float_bitmap[map_index];
+        uint32_t constant_index;
+        while (rex::bit_scan_forward(constant_bits, &constant_index)) {
+          constant_bits &= ~(UINT64_C(1) << constant_index);
+          const uint32_t register_base =
+              XE_GPU_REG_SHADER_CONSTANT_000_X +
+              (map_index << 8) + (constant_index << 2);
+          for (uint32_t component = 0; component < 4; ++component) {
+            hash_dword(regs[register_base + component]);
+          }
+        }
+        constant_bits = pixel_constant_map.float_bitmap[map_index];
+        while (rex::bit_scan_forward(constant_bits, &constant_index)) {
+          constant_bits &= ~(UINT64_C(1) << constant_index);
+          const uint32_t register_base =
+              XE_GPU_REG_SHADER_CONSTANT_256_X +
+              (map_index << 8) + (constant_index << 2);
+          for (uint32_t component = 0; component < 4; ++component) {
+            hash_dword(regs[register_base + component]);
+          }
+        }
+      }
+      REXGPU_INFO(
+          "GPU GOW3 title frame: host_frame={} packet={} surface={:08X} "
+          "color={:08X} blend={:08X} constants={:016X}",
+          frame_current_, counter_, rb_surface_info.value,
+          rb_color_info.value, blend_control.value, constants_hash);
+      const std::vector<VulkanShader::TextureBinding>& texture_bindings =
+          pixel_shader->GetTextureBindingsAfterTranslation();
+      for (uint32_t binding_index = 0;
+           binding_index < uint32_t(texture_bindings.size());
+           ++binding_index) {
+        const VulkanShader::TextureBinding& texture_binding =
+            texture_bindings[binding_index];
+        const xenos::xe_gpu_texture_fetch_t fetch =
+            regs.GetTextureFetch(texture_binding.fetch_constant);
+        const uint32_t base =
+            fetch.base_address
+            << xenos::kTextureSubresourceAlignmentBytesLog2;
+        const uint8_t* bytes = memory_->TranslatePhysical(base);
+        uint64_t hash = UINT64_C(14695981039346656037);
+        uint32_t nonzero = 0;
+        for (size_t byte_index = 0; byte_index < 4096; ++byte_index) {
+          const uint8_t value = bytes[byte_index];
+          hash = (hash ^ value) * UINT64_C(1099511628211);
+          nonzero += value != 0;
+        }
+        REXGPU_INFO(
+            "GPU GOW3 title texture fetch: host_frame={} packet={} "
+            "binding={} fetch={} "
+            "dimension={} signed={} base={:08X} "
+            "words={:08X},{:08X},{:08X},{:08X},{:08X},{:08X} "
+            "hash4k={:016X} nonzero4k={}",
+            frame_current_, counter_, binding_index,
+            texture_binding.fetch_constant,
+            uint32_t(texture_binding.dimension),
+            uint32_t(texture_binding.is_signed), base, fetch.dword_0,
+            fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+            fetch.dword_5, hash, nonzero);
+        texture_cache_->TraceActiveBinding(
+            texture_binding.fetch_constant, texture_binding.dimension,
+            bool(texture_binding.is_signed), frame_current_, binding_index,
+            *memory_);
+      }
+    }
+  }
+
+  // Identify the game's Bink YUV presentation pass for timing diagnostics.
+  // This does not change movie playback or the in-engine cinematic renderer.
+  if (pixel_shader && pixel_shader->ucode_data_hash() == UINT64_C(0xF6AFAEAD7D170F51)) {
+    command_summary_.movie_yuv = true;
+  }
+  if (REXCVAR_GET(gpu_draw_trace_resources)) {
+    if (pixel_shader &&
+        pixel_shader->ucode_data_hash() ==
+            UINT64_C(0xF6AFAEAD7D170F51)) {
+      static uint64_t gow3_yuv_texture_trace_frame = UINT64_MAX;
+      static uint32_t gow3_yuv_texture_trace_count = 0;
+      if (gow3_yuv_texture_trace_frame != counter_ &&
+          gow3_yuv_texture_trace_count < 4096) {
+        gow3_yuv_texture_trace_frame = counter_;
+        ++gow3_yuv_texture_trace_count;
+        const std::vector<VulkanShader::TextureBinding>& texture_bindings =
+            pixel_shader->GetTextureBindingsAfterTranslation();
+        for (uint32_t binding_index = 0;
+             binding_index < uint32_t(texture_bindings.size());
+             ++binding_index) {
+          const VulkanShader::TextureBinding& texture_binding =
+              texture_bindings[binding_index];
+          const xenos::xe_gpu_texture_fetch_t fetch =
+              regs.GetTextureFetch(texture_binding.fetch_constant);
+          const uint32_t base =
+              fetch.base_address
+              << xenos::kTextureSubresourceAlignmentBytesLog2;
+          const uint8_t* bytes = memory_->TranslatePhysical(base);
+          uint64_t hash = UINT64_C(14695981039346656037);
+          uint32_t nonzero = 0;
+          uint8_t min_value = UINT8_MAX;
+          uint8_t max_value = 0;
+          for (size_t byte_index = 0; byte_index < 4096; ++byte_index) {
+            const uint8_t value = bytes[byte_index];
+            hash = (hash ^ value) * UINT64_C(1099511628211);
+            nonzero += value != 0;
+            min_value = std::min(min_value, value);
+            max_value = std::max(max_value, value);
+        }
+        REXGPU_INFO(
+            "GPU GOW3 menu YUV fetch: frame={} binding={} fetch={} "
+              "dimension={} signed={} base={:08X} "
+              "words={:08X},{:08X},{:08X},{:08X},{:08X},{:08X} "
+              "hash4k={:016X} nonzero4k={} min={:02X} max={:02X}",
+              counter_, binding_index, texture_binding.fetch_constant,
+              uint32_t(texture_binding.dimension),
+              uint32_t(texture_binding.is_signed), base, fetch.dword_0,
+              fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+              fetch.dword_5, hash, nonzero, min_value, max_value);
+          texture_cache_->TraceActiveBinding(
+              texture_binding.fetch_constant, texture_binding.dimension,
+              bool(texture_binding.is_signed), frame_current_, binding_index,
+              *memory_);
+        }
+      }
+    }
   }
 
   // Ensure vertex buffers are resident.
@@ -4008,10 +5370,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
       vfetch_bits_remaining &= ~(uint32_t(1) << j);
       uint32_t vfetch_index = i * 32 + j;
-      uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
-      if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
-        continue;
-      }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
       switch (vfetch_constant.type) {
         case xenos::FetchConstantType::kVertex:
@@ -4032,11 +5390,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
       }
-      VertexBufferState& state = vertex_buffer_states_[vfetch_index];
-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
-        continue;
-      }
+      // Fetch constants may stay unchanged while the CPU updates the buffer.
+      // Always check dirty pages; RequestRange only uploads invalidated data.
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
@@ -4044,9 +5399,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             vfetch_constant.address << 2, vfetch_constant.size << 2);
         return false;
       }
-      state.address = vfetch_constant.address;
-      state.size = vfetch_constant.size;
-      vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
     }
   }
 
@@ -4176,6 +5528,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
+  RecordDrawSubmitted();
 
   // Invalidate textures in memexported memory and watch for changes.
   if (!memexport_ranges_.empty()) {
@@ -4211,6 +5564,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   if (!total_size || memexport_ranges_.empty()) {
     return true;
   }
+  ++command_summary_.memexport_full_readbacks;
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -4405,6 +5759,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
 }
 
 bool VulkanCommandProcessor::IssueCopy() {
+  native_scene_authority_.Reference(NativeSceneAuthority::ReferenceOperation::Copy,"Xenia resolve/copy requested");
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -4756,6 +6111,9 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
 bool VulkanCommandProcessor::InitializeOcclusionQueryResources() {
   active_occlusion_query_ = {};
   occlusion_query_cursor_ = 0;
+  occlusion_query_last_submission_.fill(0);
+  occlusion_query_skipped_async_draws_.fill(0);
+  pending_occlusion_results_.Clear();
   occlusion_query_resources_available_ = false;
   occlusion_query_pool_ = VK_NULL_HANDLE;
   occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
@@ -4778,8 +6136,12 @@ bool VulkanCommandProcessor::InitializeOcclusionQueryResources() {
     return false;
   }
 
+  // Give each result its own non-coherent atom, so reading a completed result
+  // never shares a cache atom with another query still being written by the GPU.
+  occlusion_query_readback_stride_ = std::max(
+      VkDeviceSize(sizeof(uint64_t)), vulkan_device->properties().nonCoherentAtomSize);
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          vulkan_device, sizeof(uint64_t) * kMaxOcclusionQueries, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          vulkan_device, occlusion_query_readback_stride_ * kMaxOcclusionQueries, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
           ui::vulkan::util::MemoryPurpose::kReadback, occlusion_query_readback_buffer_,
           occlusion_query_readback_memory_, &occlusion_query_readback_memory_type_,
           &occlusion_query_readback_memory_size_)) {
@@ -4835,11 +6197,20 @@ bool VulkanCommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out
   if (occlusion_query_cursor_ >= kMaxOcclusionQueries) {
     occlusion_query_cursor_ = 0;
   }
+  // Resetting a query still in flight is invalid. This also protects queries
+  // that were ended by a submission boundary without producing a report.
+  uint64_t previous_submission = occlusion_query_last_submission_[occlusion_query_cursor_];
+  if (previous_submission > submission_completed_) {
+    CheckSubmissionFenceAndDeviceLoss(previous_submission);
+    if (device_lost_ || submission_completed_ < previous_submission) return false;
+  }
   host_index_out = occlusion_query_cursor_++;
   return true;
 }
 
 void VulkanCommandProcessor::DisableHostOcclusionQueries() {
+  if(active_occlusion_query_.native_prefix||resume_native_query_)
+    throw std::runtime_error("Cannot discard an authoritative residual occlusion query");
   if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
     if (BeginSubmission(true)) {
       deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
@@ -4848,11 +6219,15 @@ void VulkanCommandProcessor::DisableHostOcclusionQueries() {
     }
   }
   active_occlusion_query_ = {};
+  if (!pending_occlusion_results_.empty()) {
+    CheckSubmissionFenceAndDeviceLoss(pending_occlusion_results_.last_submission());
+  }
   occlusion_query_cursor_ = 0;
   occlusion_query_resources_available_ = false;
 }
 
 bool VulkanCommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_address) {
+  native_scene_authority_.Reference(NativeSceneAuthority::ReferenceOperation::Query,"Xenia GPU occlusion query requested");
   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
       occlusion_query_pool_ == VK_NULL_HANDLE || occlusion_query_readback_mapping_ == nullptr) {
     return false;
@@ -4863,6 +6238,7 @@ bool VulkanCommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addr
     DisableHostOcclusionQueries();
     return false;
   }
+  native_reference_query_results_.erase(xenos::XenosZPDReport::GetEndRecordBase(sample_count_address));
 
   uint32_t host_index = 0;
   if (!AcquireOcclusionQueryIndex(host_index)) {
@@ -4877,25 +6253,48 @@ bool VulkanCommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addr
   DeferredCommandBuffer& command_buffer = deferred_command_buffer();
   command_buffer.CmdVkResetQueryPool(occlusion_query_pool_, host_index, 1);
   command_buffer.CmdVkBeginQuery(occlusion_query_pool_, host_index, 0);
+  occlusion_query_last_submission_[host_index] = GetCurrentSubmission();
   active_occlusion_query_.sample_count_address = sample_count_address;
   active_occlusion_query_.host_index = host_index;
+  active_occlusion_query_.skipped_async_draws = 0;
+  active_occlusion_query_.native_prefix.reset();
   active_occlusion_query_.valid = true;
   return true;
 }
 
 bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_address) {
+  native_scene_authority_.Reference(NativeSceneAuthority::ReferenceOperation::Query,"Xenia GPU occlusion query requested");
   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
       !active_occlusion_query_.valid || occlusion_query_pool_ == VK_NULL_HANDLE ||
       occlusion_query_readback_mapping_ == nullptr) {
     return false;
   }
 
-  uint32_t host_index = active_occlusion_query_.host_index;
-  active_occlusion_query_ = {};
+  if (!BeginSubmission(true)) return false;
+  ++command_summary_.occlusion_queries;
+  const uint64_t query_submission=GetCurrentSubmission();
+  RecordOcclusionQueryEnd(sample_count_address,true);
 
-  if (!BeginSubmission(true)) {
+  // Keep asynchronous queries in the current submission. Frame swaps, primary
+  // buffer boundaries, guest memory waits and command-thread idle all flush it.
+  // Query-index reuse also waits for the owning submission before resetting it.
+  const bool async_queries = REXCVAR_GET(vulkan_async_occlusion_queries);
+  if ((!async_queries || !REXCVAR_GET(vulkan_batch_occlusion_queries)) &&
+      !EndSubmission(false)) {
     return false;
   }
+  CheckSubmissionFenceAndDeviceLoss(async_queries ? 0 : query_submission);
+  return !device_lost_;
+}
+
+void VulkanCommandProcessor::RecordOcclusionQueryEnd(uint32_t sample_count_address,bool final_segment) {
+  uint32_t host_index = active_occlusion_query_.host_index;
+  occlusion_query_skipped_async_draws_[host_index] = active_occlusion_query_.skipped_async_draws;
+  occlusion_query_native_prefix_[host_index]=active_occlusion_query_.native_prefix;
+  occlusion_query_final_segment_[host_index]=final_segment;
+  if(final_segment&&active_occlusion_query_.native_prefix)
+    active_occlusion_query_.native_prefix->final_recorded=true;
+  active_occlusion_query_ = {};
 
   EndRenderPass();
 
@@ -4903,36 +6302,77 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
   command_buffer.CmdVkEndQuery(occlusion_query_pool_, host_index);
   command_buffer.CmdVkCopyQueryPoolResults(occlusion_query_pool_, host_index, 1,
                                            occlusion_query_readback_buffer_,
-                                           sizeof(uint64_t) * host_index, sizeof(uint64_t),
+                                           occlusion_query_readback_stride_ * host_index, sizeof(uint64_t),
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+  PushBufferMemoryBarrier(occlusion_query_readback_buffer_, occlusion_query_readback_stride_ * host_index,
+                          sizeof(uint64_t), VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT);
 
-  if (!EndSubmission(false)) {
-    return false;
-  }
-  if (!AwaitAllQueueOperationsCompletion()) {
-    return false;
+  const uint64_t query_submission = GetCurrentSubmission();
+  occlusion_query_last_submission_[host_index] = query_submission;
+  occlusion_query_frame_[host_index] = frame_current_;
+
+  pending_occlusion_results_.Push(query_submission,host_index,
+      xenos::XenosZPDReport::GetRecordBase(sample_count_address));
+}
+
+void VulkanCommandProcessor::RetireOcclusionQueries() {
+  if (pending_occlusion_results_.empty() ||
+      pending_occlusion_results_.first_submission() > submission_completed_ ||
+      !occlusion_query_readback_mapping_) {
+    return;
   }
 
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  if (!(vulkan_device->memory_types().host_coherent &
-        (uint32_t(1) << occlusion_query_readback_memory_type_))) {
-    VkMappedMemoryRange memory_range = {};
-    memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    memory_range.memory = occlusion_query_readback_memory_;
-    memory_range.offset = 0;
-    memory_range.size =
-        std::min(rex::round_up(VkDeviceSize(sizeof(uint64_t) * kMaxOcclusionQueries),
-                               vulkan_device->properties().nonCoherentAtomSize),
-                 occlusion_query_readback_memory_size_);
-    dfn.vkInvalidateMappedMemoryRanges(device, 1, &memory_range);
-  }
-
-  const uint64_t* results = reinterpret_cast<const uint64_t*>(occlusion_query_readback_mapping_);
-  uint64_t samples = NormalizeOcclusionSamples(results[host_index]);
-  WriteGuestOcclusionResult(sample_count_address, samples);
-  return true;
+  const bool coherent = vulkan_device->memory_types().host_coherent &
+                        (uint32_t(1) << occlusion_query_readback_memory_type_);
+  pending_occlusion_results_.Drain(submission_completed_,
+      [&](const PendingQueryResults::Entry& entry) {
+        VkDeviceSize offset = occlusion_query_readback_stride_ * entry.host_index;
+        if (!coherent) {
+          VkMappedMemoryRange range = {};
+          range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+          range.memory = occlusion_query_readback_memory_;
+          range.offset = offset;
+          range.size = occlusion_query_readback_stride_;
+          if (dfn.vkInvalidateMappedMemoryRanges(device, 1, &range) != VK_SUCCESS) {
+            REXGPU_ERROR("Failed to invalidate occlusion query readback memory");
+            return;
+          }
+        }
+        uint64_t samples;
+        std::memcpy(&samples, occlusion_query_readback_mapping_ + offset, sizeof(samples));
+        auto native_prefix=std::move(occlusion_query_native_prefix_[entry.host_index]);
+        uint64_t normalized;
+        if(native_prefix) {
+          native_prefix->RetireSegment(samples,occlusion_query_final_segment_[entry.host_index]);
+          if(native_prefix->reference_segments<=3||native_prefix->published)
+            REXGPU_INFO("Native query residual segment: generation {}, report 0x{:08X}, segment {}, samples {}, cumulative raw reference {}, final {}, submission {}",
+                        native_prefix->generation,entry.guest_address,native_prefix->reference_segments,
+                        samples,native_prefix->reference_samples,native_prefix->published,entry.submission);
+          if(!native_prefix->published)return;
+          normalized=native_prefix->Total(NormalizeOcclusionSamples(native_prefix->reference_samples));
+        } else normalized=NormalizeOcclusionSamples(samples);
+        if (native_swap_source_provider_) {
+          const uint64_t guest_samples = !native_prefix&&!normalized && REXCVAR_GET(occlusion_query_zero_is_visible) ? 1 : normalized;
+          native_reference_query_results_[entry.guest_address] = {
+              normalized, entry.submission, occlusion_query_frame_[entry.host_index],
+              uint32_t(std::min<uint64_t>(guest_samples, UINT32_MAX)),
+              occlusion_query_skipped_async_draws_[entry.host_index]};
+        }
+        if(native_prefix) {
+          auto* report=memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(entry.guest_address);
+          xenos::XenosZPDReport::WriteSampleCount(report,uint32_t(std::min<uint64_t>(normalized,UINT32_MAX)));
+          REXGPU_INFO("Native query residual published: generation {}, report 0x{:08X}, native subtotal {}, reference raw {}, reference normalized {}, total {}, segments {}, guest ZPass {}, sentinel {}",
+                      native_prefix->generation,entry.guest_address,native_prefix->native_samples,
+                      native_prefix->reference_samples,NormalizeOcclusionSamples(native_prefix->reference_samples),
+                      normalized,native_prefix->reference_segments,
+                      uint64_t(uint32_t(report->ZPass_A))+uint32_t(report->ZPass_B),xenos::XenosZPDReport::HasPendingSentinel(report));
+        } else WriteGuestOcclusionResult(entry.guest_address, normalized);
+      });
 }
 
 uint64_t VulkanCommandProcessor::NormalizeOcclusionSamples(uint64_t samples) const {
@@ -4945,11 +6385,12 @@ uint64_t VulkanCommandProcessor::NormalizeOcclusionSamples(uint64_t samples) con
   if (scale <= 1) {
     return samples;
   }
-  return (samples + (scale >> 1)) / scale;
+  return samples / scale + ((samples % scale) + (scale >> 1)) / scale;
 }
 
 void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_address,
                                                        uint64_t samples) {
+  sample_count_address = xenos::XenosZPDReport::GetRecordBase(sample_count_address);
   auto* sample_counts =
       memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_address);
   if (!sample_counts) {
@@ -5011,6 +6452,9 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   size_t fences_total = submissions_in_flight_fences_.size();
   size_t fences_awaited = 0;
   if (await_submission > submission_completed_) {
+    const bool timing_enabled = REXCVAR_GET(gpu_command_summary);
+    const auto wait_start = timing_enabled ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
     // Await in a blocking way if requested.
     // TODO(Triang3l): Await only one fence. "Fence signal operations that are
     // defined by vkQueueSubmit additionally include in the first
@@ -5019,6 +6463,11 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    ++command_summary_.fence_waits;
+    if (timing_enabled) {
+      command_summary_.fence_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - wait_start).count();
+    }
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5049,6 +6498,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     return;
   }
   if (!fences_awaited) {
+    RetireOcclusionQueries();
     // Not updated - no need to reclaim or download things.
     return;
   }
@@ -5061,6 +6511,11 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
                                       submissions_in_flight_fences_awaited_end);
   submission_completed_ += fences_awaited;
+  while (!native_swap_sources_in_flight_.empty() &&
+         native_swap_sources_in_flight_.front().first <= submission_completed_) {
+    native_swap_sources_in_flight_.pop_front();
+  }
+  RetireOcclusionQueries();
 
   // Reclaim semaphores.
   while (!submissions_in_flight_semaphores_.empty()) {
@@ -5272,6 +6727,12 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     texture_cache_->BeginFrame();
   }
 
+  if(resume_native_query_) {
+    auto residual=std::move(resume_native_query_);
+    if(!BeginGuestOcclusionQuery(residual->begin_address))
+      throw std::runtime_error("Cannot resume residual reference occlusion query");
+    active_occlusion_query_.native_prefix=std::move(residual);
+  }
   return true;
 }
 
@@ -5347,11 +6808,18 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
   if (submission_open_) {
     assert_false(scratch_buffer_used_);
+    const bool timing_enabled = REXCVAR_GET(gpu_command_summary);
+    const auto submit_start = timing_enabled ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
 
     if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
-      deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
-                                             active_occlusion_query_.host_index);
-      active_occlusion_query_ = {};
+      if(active_occlusion_query_.native_prefix) {
+        resume_native_query_=active_occlusion_query_.native_prefix;
+        RecordOcclusionQueryEnd(resume_native_query_->begin_address-32,false);
+      } else {
+        deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,active_occlusion_query_.host_index);
+        active_occlusion_query_ = {};
+      }
     }
 
     EndRenderPass();
@@ -5431,10 +6899,16 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
       return false;
     }
+    const auto replay_start = timing_enabled ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
     deferred_command_buffer_.Execute(command_buffer.buffer);
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to end a Vulkan command buffer");
       return false;
+    }
+    if (timing_enabled) {
+      command_summary_.submission_replay_us += std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - replay_start).count();
     }
 
     VkSubmitInfo submit_info;
@@ -5460,10 +6934,19 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       return false;
     }
     VkResult submit_result;
+    const auto queue_start = timing_enabled ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
     {
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+    }
+    ++command_summary_.submissions;
+    if (timing_enabled) {
+      command_summary_.submission_queue_us += std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - queue_start).count();
+      command_summary_.submission_us += std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - submit_start).count();
     }
     if (submit_result != VK_SUCCESS) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
@@ -5491,6 +6974,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   }
 
   if (is_closing_frame) {
+    LogNativeCompletionSummary();
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
     }
@@ -6225,6 +7709,12 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       uint32_t texture_signs_mask = ((UINT32_C(1) << 8) - 1) << texture_signs_shift;
       dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
       texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
+      uint32_t texture_integer_scale_bits =
+          texture_cache_->GetActiveIntegerScaleBits(texture_index);
+      dirty |= system_constants_.texture_integer_scale_bits[texture_index] !=
+               texture_integer_scale_bits;
+      system_constants_.texture_integer_scale_bits[texture_index] =
+          texture_integer_scale_bits;
       textures_resolution_scaled |=
           uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
     }

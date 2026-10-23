@@ -132,6 +132,9 @@ endif()
 
 # Platform-specific dependencies
 if(WIN32)
+    add_library(rex_adaptive_sync STATIC adaptive_sync_stub.cpp)
+    target_include_directories(rex_adaptive_sync PUBLIC ${REXGLUE_ROOT}/include)
+    target_link_libraries(rexui PUBLIC rex_adaptive_sync)
     target_link_libraries(rexui PUBLIC
         dwmapi
         dxgi
@@ -139,8 +142,36 @@ if(WIN32)
     )
 else()
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+    pkg_check_modules(GTK3 REQUIRED gtk+-3.0>=3.24.25)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+    pkg_check_modules(WAYLAND REQUIRED IMPORTED_TARGET wayland-client)
+    find_program(REX_WAYLAND_SCANNER wayland-scanner REQUIRED)
+    set(REX_ADAPTIVE_SYNC_PROTOCOL_SOURCES)
+    foreach(protocol wlr-output-management-unstable-v1 xdg-output-unstable-v1)
+        set(protocol_xml ${CMAKE_CURRENT_SOURCE_DIR}/wayland/${protocol}.xml)
+        set(protocol_header ${CMAKE_CURRENT_BINARY_DIR}/wayland/${protocol}-client.h)
+        set(protocol_code ${CMAKE_CURRENT_BINARY_DIR}/wayland/${protocol}-protocol.c)
+        add_custom_command(OUTPUT ${protocol_header} ${protocol_code}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/wayland
+            COMMAND ${REX_WAYLAND_SCANNER} client-header ${protocol_xml} ${protocol_header}
+            COMMAND ${REX_WAYLAND_SCANNER} private-code ${protocol_xml} ${protocol_code}
+            DEPENDS ${protocol_xml}
+            VERBATIM)
+        list(APPEND REX_ADAPTIVE_SYNC_PROTOCOL_SOURCES ${protocol_header} ${protocol_code})
+    endforeach()
+    add_library(rex_adaptive_sync STATIC adaptive_sync_wayland.cpp
+        ${REX_ADAPTIVE_SYNC_PROTOCOL_SOURCES})
+    set_target_properties(rex_adaptive_sync PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(rex_adaptive_sync PUBLIC ${REXGLUE_ROOT}/include)
+    target_include_directories(rex_adaptive_sync PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(rex_adaptive_sync PUBLIC PkgConfig::WAYLAND)
+    target_link_libraries(rexui PUBLIC rex_adaptive_sync)
+    add_library(rex_hdr_detection STATIC hdr_display.cpp wayland/color-management-protocol.c
+        wayland/viewporter-protocol.c wayland/fractional-scale-protocol.c)
+    set_target_properties(rex_hdr_detection PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(rex_hdr_detection PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_link_libraries(rex_hdr_detection PUBLIC PkgConfig::WAYLAND)
+    target_link_libraries(rexui PUBLIC rex_hdr_detection)
 
     target_include_directories(rexui PRIVATE
         ${GTK3_INCLUDE_DIRS}

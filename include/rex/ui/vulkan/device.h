@@ -108,6 +108,10 @@ class VulkanDevice {
     bool fragmentStoresAndAtomics = false;
     bool shaderClipDistance = false;
     bool shaderCullDistance = false;
+    // Native game shaders address their constant/vertex buffers directly.
+    // These are optional; their absence only disables the native renderer.
+    bool shaderInt64 = false;
+    bool shaderSampledImageArrayDynamicIndexing = false;
     bool sparseBinding = false;
     bool sparseResidencyBuffer = false;
 
@@ -122,6 +126,15 @@ class VulkanDevice {
     // VK_EXT_scalar_block_layout (#222, promoted to 1.2)
 
     bool scalarBlockLayout = false;
+
+    // Vulkan 1.2 features used by the native renderer on the shared device.
+    bool hostQueryReset = false;
+    bool bufferDeviceAddress = false;
+    bool runtimeDescriptorArray = false;
+    bool descriptorBindingPartiallyBound = false;
+    bool descriptorBindingVariableDescriptorCount = false;
+    bool descriptorBindingSampledImageUpdateAfterBind = false;
+    bool shaderSampledImageArrayNonUniformIndexing = false;
 
     // VK_KHR_portability_subset (#164)
 
@@ -182,6 +195,7 @@ class VulkanDevice {
   // `ext_major_minor_` prefix rather than `ext_`).
   struct Extensions {
     bool ext_KHR_swapchain = false;                     // #2
+    bool ext_EXT_hdr_metadata = false;
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147

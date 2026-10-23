@@ -14,6 +14,7 @@ project(ReXGlue
 # Build Options
 #==========================================================
 option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
+option(REXGLUE_BUILD_TOOLS       "Build optional SDK diagnostic tools" OFF)
 option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
@@ -189,10 +190,17 @@ configure_file(
     @ONLY
 )
 
-# Output directories (multi-config appends /<Config>/ automatically)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+# Output directories (multi-config appends /<Config>/ automatically).
+# Preserve caller-provided paths so standalone tools can use isolated outputs.
+if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+endif()
+if(NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+endif()
+if(NOT CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+endif()
 
 # Sanitizer support for debugging memory corruption and undefined behavior
 if(REXGLUE_ENABLE_SANITIZERS)
@@ -234,6 +242,30 @@ add_subdirectory(src/kernel)
 add_subdirectory(src/codegen)
 add_subdirectory(src/rexglue)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rexglue_helpers.cmake)
+
+if(REXGLUE_BUILD_TOOLS AND REXGLUE_USE_VULKAN)
+    if(WIN32)
+        add_executable(rex-gpu-vulkan-trace-viewer WIN32
+            src/graphics/vulkan/trace_viewer_main.cpp
+            src/ui/windowed_app_main_win.cpp
+        )
+    else()
+        add_executable(rex-gpu-vulkan-trace-viewer
+            src/graphics/vulkan/trace_viewer_main.cpp
+            src/ui/windowed_app_main_posix.cpp
+        )
+    endif()
+    target_link_libraries(rex-gpu-vulkan-trace-viewer PRIVATE rexruntime)
+    rexglue_apply_target_settings(rex-gpu-vulkan-trace-viewer)
+    if(UNIX AND NOT APPLE)
+        set_target_properties(rex-gpu-vulkan-trace-viewer PROPERTIES
+            INSTALL_RPATH "$ORIGIN"
+            BUILD_WITH_INSTALL_RPATH ON
+        )
+    endif()
+endif()
+
 # Add tests subdirectory if tests are enabled
 if(REXGLUE_BUILD_TESTS)
     enable_testing()
@@ -264,5 +296,4 @@ else()
     # This sets REXGLUE_SHARE_DIR and makes rexglue_configure_target() available.
     set(REXGLUE_SHARE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/ui" PARENT_SCOPE)
     set(REXGLUE_SHARE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/ui")
-    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rexglue_helpers.cmake)
 endif()

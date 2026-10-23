@@ -88,9 +88,9 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
     bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
     bool prefer_vertex_stores = REXCVAR_GET(vulkan_prefer_vertex_pipeline_stores_and_atomics);
     bool prefer_fill_mode_non_solid = REXCVAR_GET(vulkan_prefer_fill_mode_non_solid);
-    if (with_gpu_emulation && physical_devices.size() > 1 &&
-        (prefer_geometry_shader || prefer_fragment_stores || prefer_vertex_stores ||
-         prefer_fill_mode_non_solid)) {
+    // Device type ranks above features: an integrated GPU enumerated first
+    // must not win over a discrete one with the same feature set.
+    if (physical_devices.size() > 1) {
       struct PhysicalDeviceScore {
         VkPhysicalDevice physical_device;
         uint32_t score;
@@ -100,7 +100,21 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
       for (const VkPhysicalDevice physical_device : physical_devices) {
         VkPhysicalDeviceFeatures supported_features = {};
         ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
-        uint32_t score = 0;
+        VkPhysicalDeviceProperties properties;
+        ifn.vkGetPhysicalDeviceProperties(physical_device, &properties);
+        uint32_t type_rank = 0;
+        switch (properties.deviceType) {
+          case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: type_rank = 4; break;
+          case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: type_rank = 3; break;
+          case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: type_rank = 2; break;
+          case VK_PHYSICAL_DEVICE_TYPE_CPU: type_rank = 1; break;
+          default: break;
+        }
+        uint32_t score = type_rank * 16;
+        if (!with_gpu_emulation) {
+          scored_devices.push_back({physical_device, score});
+          continue;
+        }
         if (prefer_geometry_shader && supported_features.geometryShader) {
           ++score;
         }

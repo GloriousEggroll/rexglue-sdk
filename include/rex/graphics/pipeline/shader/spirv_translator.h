@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -33,7 +34,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 12;
+    static constexpr uint32_t kVersion = 19;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -88,6 +89,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // Debug-only, included in the modification key to avoid shader cache
+      // aliasing with the normal shaders.
+      uint32_t debug_gow3_yuv_samples : 1;
+      uint32_t debug_gow3_yuv_constant : 1;
+      uint32_t debug_gow3_scene_composite_constant : 1;
+      uint32_t debug_gow3_scene_composite_input : 1;
+      uint32_t debug_gow3_title_texture : 1;
+      uint32_t debug_gow3_title_opaque : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -223,6 +232,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t vertex_index_reset;
     // Number of guest vertices processed by the memexport compute dispatch.
     uint32_t compute_memexport_vertex_count;
+    // Align the float4 array for std140.
+    uint32_t padding_user_clip_planes;
     float user_clip_planes[6][4];
 
     float ndc_scale[3];
@@ -238,6 +249,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // One bit per texture fetch constant indicating that it references a
     // draw-resolution-scaled texture.
     uint32_t textures_resolution_scaled;
+    // Align the uint4 array for std140.
+    uint32_t padding_texture_swizzled_signs[3];
 
     // Each byte contains post-swizzle TextureSign values for each of the needed
     // components of each of the 32 used texture fetch constants.
@@ -302,12 +315,32 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
 
+    // Integer num_format on fixed textures. Each dword packs the scale needed
+    // to turn normalized host samples back into guest integer values.
+    // Bits 0:3 = component_bits - 1, bit 4 = signed. Zero means no scale.
+    uint32_t texture_integer_scale_bits[32];
+
     // Tessellation helper shader constants.
     uint32_t vertex_index_min;
     uint32_t vertex_index_max;
     float tessellation_factor_range_min;
     float tessellation_factor_range_max;
   };
+  static_assert(offsetof(SystemConstants, user_clip_planes) % 16 == 0);
+  static_assert(offsetof(SystemConstants, ndc_scale) % 16 == 0);
+  static_assert(offsetof(SystemConstants, ndc_offset) % 16 == 0);
+  static_assert(offsetof(SystemConstants, point_constant_diameter) % 8 == 0);
+  static_assert(offsetof(SystemConstants, point_screen_diameter_to_ndc_radius) % 8 == 0);
+  static_assert(offsetof(SystemConstants, texture_swizzled_signs) % 16 == 0);
+  static_assert(offsetof(SystemConstants, texture_swizzles) % 16 == 0);
+  static_assert(offsetof(SystemConstants, color_exp_bias) % 16 == 0);
+  static_assert(offsetof(SystemConstants, edram_rt_base_dwords_scaled) % 16 == 0);
+  static_assert(offsetof(SystemConstants, edram_rt_format_flags) % 16 == 0);
+  static_assert(offsetof(SystemConstants, edram_rt_blend_factors_ops) % 16 == 0);
+  static_assert(offsetof(SystemConstants, edram_rt_keep_mask) % 16 == 0);
+  static_assert(offsetof(SystemConstants, edram_rt_clamp) % 16 == 0);
+  static_assert(offsetof(SystemConstants, edram_blend_constant) % 16 == 0);
+  static_assert(offsetof(SystemConstants, texture_integer_scale_bits) % 16 == 0);
 
   enum ConstantBuffer : uint32_t {
     kConstantBufferSystem,
@@ -879,6 +912,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantTextureIntegerScaleBits,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
@@ -943,9 +977,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id type_output_per_vertex_;
   spv::Id output_per_vertex_;
 
-  // With fragment shader interlock, variables in the main function.
-  // Otherwise, framebuffer color attachment outputs.
+  // Function-scoped fragment color variables. For the framebuffer path, these
+  // are copied to output_fragment_data_ after alpha test and coverage handling.
   std::array<spv::Id, xenos::kMaxColorRenderTargets> output_or_var_fragment_data_;
+  // Framebuffer path color attachment outputs.
+  std::array<spv::Id, xenos::kMaxColorRenderTargets> output_fragment_data_;
   // For host render targets and only when needed - float.
   spv::Id output_fragment_depth_;
   // For host render targets and only when needed - int[1].
@@ -1001,8 +1037,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id var_main_kill_pixel_;
   // PS, with fragment shader interlock and depth export - float.
   spv::Id var_main_fragment_depth_;
-  // PS, only when writing to color render targets with fragment shader
-  // interlock - uint.
+  // PS, when writing to color render targets - uint.
   // Whether color buffers have been written to, if not written on the taken
   // execution path, don't export according to Direct3D 9 register documentation
   // (some games rely on this behavior).

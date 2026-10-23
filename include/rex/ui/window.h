@@ -259,6 +259,9 @@ class Window {
   // user resizes a non-maximized window.
   uint32_t GetDesiredLogicalWidth() const { return desired_logical_width_; }
   uint32_t GetDesiredLogicalHeight() const { return desired_logical_height_; }
+  // UI thread only. Store the normal client size even while fullscreen; the
+  // platform restores it when the compositor confirms the windowed state.
+  void SetLogicalSize(uint32_t width, uint32_t height);
 
   // 0 width or height may be returned even in case of an open window with a
   // valid non-zero-area surface depending on the platform.
@@ -271,6 +274,13 @@ class Window {
 
   // Desired state stored by the common Window, modifiable both externally and
   // by the implementation (including from SetFullscreen itself).
+  // Query on the UI thread after opening the window.
+  virtual double GetMonitorRefreshRateHz() const { return 60.0; }
+
+  // UI thread only. Exact compositor output name for the active monitor, or
+  // empty if this backend cannot identify it. Never a display model name.
+  virtual std::string GetDisplayOutputName() const { return {}; }
+
   bool IsFullscreen() const { return fullscreen_; }
   void SetFullscreen(bool new_fullscreen);
 
@@ -315,15 +325,6 @@ class Window {
   // May be applied in a delayed way or dropped at all, HasFocus will not
   // necessarily be true immediately.
   void Focus();
-
-  // TODO(Triang3l): A resize function, primarily for snapping externally to
-  // 1280x720, 1920x1080, and other 1:1 resolutions. It will need to resize the
-  // window (to a desired logical size - the actual physical size is entirely
-  // the feedback of the implementation) in the normal state, and possibly also
-  // un-maximize (and possibly un-fullscreen) it (but this choice will possibly
-  // need to be exposed to the caller). Because it's currently not needed, it's
-  // not implemented to avoid platform-specific complexities regarding
-  // maximization, DPI, etc.
 
   void SetPresenter(Presenter* presenter);
 
@@ -488,6 +489,7 @@ class Window {
   // ApplyNew* means that the value has actually been changed to something
   // different than it was previously.
   virtual void ApplyNewFullscreen() {}
+  virtual void ApplyNewLogicalSize() {}
   virtual void ApplyNewTitle() {}
   // can_apply_state_in_current_phase whether the window is in a life cycle
   // phase that would normally accept Apply calls (the native window surely

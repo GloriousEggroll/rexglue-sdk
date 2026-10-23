@@ -55,6 +55,9 @@ class VulkanInstance {
 #include <rex/ui/vulkan/functions/instance_1_0.inc>
     // VK_KHR_surface (#1)
 #include <rex/ui/vulkan/functions/instance_khr_surface.inc>
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+    PFN_vkCreateWaylandSurfaceKHR vkCreateWaylandSurfaceKHR = nullptr;
+#endif
     // VK_KHR_xcb_surface (#6)
 #ifdef VK_USE_PLATFORM_XCB_KHR
 #include <rex/ui/vulkan/functions/instance_khr_xcb_surface.inc>
@@ -94,6 +97,8 @@ class VulkanInstance {
 #endif
     bool ext_1_1_KHR_get_physical_device_properties2 = false;  // #60
     bool ext_EXT_debug_utils = false;                          // #129
+    bool ext_KHR_wayland_surface = false;
+    bool ext_EXT_swapchain_colorspace = false;
     bool ext_KHR_portability_enumeration = false;              // #395
   };
 

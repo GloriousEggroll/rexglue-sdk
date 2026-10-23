@@ -41,6 +41,8 @@ class TraceViewer : public rex::ui::WindowedApp {
 
   virtual std::unique_ptr<GraphicsSystem> CreateGraphicsSystem() = 0;
   GraphicsSystem* graphics_system() const { return graphics_system_; }
+  virtual void BeginHostCapture() {}
+  virtual void EndHostCapture() {}
 
   void DrawMultilineString(const std::string_view str);
 

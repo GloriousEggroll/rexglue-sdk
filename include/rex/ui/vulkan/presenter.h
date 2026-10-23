@@ -23,6 +23,7 @@
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/instance.h>
+#include <rex/ui/vulkan/presenter_gpu_timing.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 
@@ -266,6 +267,8 @@ class VulkanPresenter final : public Presenter {
   }
 
   struct PaintContext {
+    // Log real draw passes when their effect or dimensions change, not per frame.
+    std::array<std::array<uint32_t, 6>, kMaxGuestOutputPaintEffects> logged_output_passes{};
     class Submission {
      public:
       static std::unique_ptr<Submission> Create(const VulkanDevice* const vulkan_device) {
@@ -308,6 +311,7 @@ class VulkanPresenter final : public Presenter {
       // image format.
       VkPipeline swapchain_pipeline = VK_NULL_HANDLE;
       VkFormat swapchain_format = VK_FORMAT_UNDEFINED;
+      bool hdr_scene = false;
     };
 
     enum GuestOutputDescriptorSet : uint32_t {
@@ -316,8 +320,9 @@ class VulkanPresenter final : public Presenter {
       kGuestOutputDescriptorSetIntermediate0Sampled =
           kGuestOutputDescriptorSetGuestOutput0Sampled + kGuestOutputMailboxSize,
 
-      kGuestOutputDescriptorSetCount =
+      kGuestOutputDescriptorSetHdrScene0Sampled =
           kGuestOutputDescriptorSetIntermediate0Sampled + kMaxGuestOutputPaintEffects - 1,
+      kGuestOutputDescriptorSetCount = kGuestOutputDescriptorSetHdrScene0Sampled + kSubmissionCount,
     };
 
     struct UISetupCommandBuffer {
@@ -353,7 +358,7 @@ class VulkanPresenter final : public Presenter {
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
-        bool& ui_surface_unusable_out);
+        bool& ui_surface_unusable_out, bool display_hdr, bool& hdr_active_out);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -368,6 +373,7 @@ class VulkanPresenter final : public Presenter {
 
     std::array<std::unique_ptr<PaintContext::Submission>, kSubmissionCount> submissions;
     VulkanSubmissionTracker submission_tracker;
+    std::unique_ptr<PresenterGpuTiming> gpu_timing;
 
     std::array<GuestOutputPaintPipeline, size_t(GuestOutputPaintEffect::kCount)>
         guest_output_paint_pipelines;
@@ -414,6 +420,11 @@ class VulkanPresenter final : public Presenter {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D swapchain_extent = {};
     bool swapchain_is_fifo = false;
+    bool hdr_active = false;
+    float display_peak_nits = 0;
+    std::array<std::unique_ptr<GuestOutputImage>, kSubmissionCount> hdr_scene_images;
+    std::array<VkFramebuffer, kSubmissionCount> hdr_scene_framebuffers = {};
+    VkPipeline hdr_pipeline = VK_NULL_HANDLE;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
   };
@@ -433,7 +444,7 @@ class VulkanPresenter final : public Presenter {
   bool InitializeSurfaceIndependent();
 
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(GuestOutputPaintEffect effect,
-                                                          VkRenderPass render_pass);
+                                                          VkRenderPass render_pass, bool hdr_conversion = false);
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
@@ -455,6 +466,8 @@ class VulkanPresenter final : public Presenter {
   std::array<VkPipelineLayout, kGuestOutputPaintPipelineLayoutCount>
       guest_output_paint_pipeline_layouts_ = {};
   VkShaderModule guest_output_paint_vs_ = VK_NULL_HANDLE;
+  VkShaderModule hdr_output_fs_ = VK_NULL_HANDLE;
+  VkPipelineLayout hdr_output_layout_ = VK_NULL_HANDLE;
   std::array<VkShaderModule, size_t(GuestOutputPaintEffect::kCount)> guest_output_paint_fs_ = {};
   // Not compatible with the swapchain render pass even if the format is the
   // same due to different dependencies (this is shader read > color

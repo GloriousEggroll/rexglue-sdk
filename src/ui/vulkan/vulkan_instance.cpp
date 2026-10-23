@@ -100,6 +100,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   requested_extensions.emplace("VK_KHR_portability_enumeration",
                                &vulkan_instance->extensions_.ext_KHR_portability_enumeration);
   if (with_surface) {
+    requested_extensions.emplace("VK_EXT_swapchain_colorspace", &vulkan_instance->extensions_.ext_EXT_swapchain_colorspace);
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+    requested_extensions.emplace("VK_KHR_wayland_surface", &vulkan_instance->extensions_.ext_KHR_wayland_surface);
+#endif
     // #1.
     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
 #ifdef VK_USE_PLATFORM_XCB_KHR
@@ -368,6 +372,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 #ifdef VK_USE_PLATFORM_XCB_KHR
   if (vulkan_instance->extensions_.ext_KHR_xcb_surface) {
 #include <rex/ui/vulkan/functions/instance_khr_xcb_surface.inc>
+  }
+#endif
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+  if (vulkan_instance->extensions_.ext_KHR_wayland_surface) {
+    functions_loaded &= (ifn.vkCreateWaylandSurfaceKHR = reinterpret_cast<PFN_vkCreateWaylandSurfaceKHR>(
+        ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, "vkCreateWaylandSurfaceKHR"))) != nullptr;
   }
 #endif
 #ifdef VK_USE_PLATFORM_ANDROID_KHR

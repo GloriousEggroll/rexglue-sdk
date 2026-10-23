@@ -10,6 +10,7 @@
  */
 
 #include <cstring>
+#include <cerrno>
 
 #include <rex/kernel/xam/module.h>
 #include <rex/platform.h>
@@ -18,6 +19,7 @@
 // #include <rex/system/xnet.h>
 
 #include <rex/net/socket.h>
+#include <rex/memory/utils.h>
 
 // Standard socket types used by Xbox API emulation
 #if REX_PLATFORM_WIN32
@@ -28,10 +30,39 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #endif
 
 namespace rex::system {
+
+namespace {
+// Xbox uses Winsock option numbers and big-endian scalar values.
+bool TranslateScalarOption(uint32_t level, uint32_t option, int& host_level,
+                           int& host_option) {
+  if (level == 0xffff) {
+    host_level = SOL_SOCKET;
+    switch (option) {
+      case 0x0004: host_option = SO_REUSEADDR; return true;
+      case 0x0008: host_option = SO_KEEPALIVE; return true;
+      case 0x0010: host_option = SO_DONTROUTE; return true;
+      case 0x0020: host_option = SO_BROADCAST; return true;
+      case 0x1001: host_option = SO_SNDBUF; return true;
+      case 0x1002: host_option = SO_RCVBUF; return true;
+      case 0x1008: host_option = SO_TYPE; return true;
+      default: return false;
+    }
+  }
+  if (level == 6 && option == 1) {
+    host_level = IPPROTO_TCP;
+    host_option = TCP_NODELAY;
+    return true;
+  }
+  // Structured options (linger/timeouts) need their own layout conversion.
+  return false;
+}
+}  // namespace
 
 XSocket::XSocket(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
 
@@ -76,7 +107,16 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, 
     return X_STATUS_SUCCESS;
   }
 
-  int ret = setsockopt(native_handle_, level, optname, (char*)optval_ptr, optlen);
+  int host_level, host_option;
+  if (!TranslateScalarOption(level, optname, host_level, host_option)) {
+    return X_STATUS_NOT_SUPPORTED;
+  }
+  if (!optval_ptr || optlen != sizeof(uint32_t)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  int value = memory::load_and_swap<int32_t>(optval_ptr);
+  int ret = setsockopt(native_handle_, host_level, host_option,
+                      reinterpret_cast<const char*>(&value), sizeof(value));
   if (ret < 0) {
     // TODO: WSAGetLastError()
     return X_STATUS_UNSUCCESSFUL;
@@ -84,19 +124,55 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, 
 
   // SO_BROADCAST
   if (level == 0xFFFF && optname == 0x0020) {
-    broadcast_socket_ = true;
+    broadcast_socket_ = value != 0;
   }
 
   return X_STATUS_SUCCESS;
 }
 
+X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, void* optval_ptr,
+                           uint32_t* optlen) {
+  int host_level, host_option;
+  if (!TranslateScalarOption(level, optname, host_level, host_option)) {
+    return X_STATUS_NOT_SUPPORTED;
+  }
+  if (!optval_ptr || !optlen || *optlen < sizeof(uint32_t)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  int value = 0;
+#if REX_PLATFORM_WIN32
+  int size = sizeof(value);
+#else
+  socklen_t size = sizeof(value);
+#endif
+  if (getsockopt(native_handle_, host_level, host_option,
+                 reinterpret_cast<char*>(&value), &size) < 0) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  memory::store_and_swap<int32_t>(optval_ptr, value);
+  *optlen = sizeof(uint32_t);
+  return X_STATUS_SUCCESS;
+}
+
 X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
-  int ret = rex::net::socket_ioctl(native_handle_, cmd, arg_ptr);
+  if (!arg_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  uint32_t native_cmd;
+  switch (cmd) {
+    case 0x8004667e: native_cmd = FIONBIO; break;
+    case 0x4004667f: native_cmd = FIONREAD; break;
+    default: return X_STATUS_NOT_SUPPORTED;
+  }
+  uint32_t value = memory::load_and_swap<uint32_t>(arg_ptr);
+  int ret = rex::net::socket_ioctl(native_handle_, native_cmd,
+                                 reinterpret_cast<uint8_t*>(&value));
   if (ret < 0) {
     // TODO: Get last error
     return X_STATUS_UNSUCCESSFUL;
   }
 
+  memory::store_and_swap<uint32_t>(arg_ptr, value);
   return X_STATUS_SUCCESS;
 }
 
@@ -110,13 +186,26 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
-  int ret = bind(native_handle_, (sockaddr*)name, name_len);
+  if (!name || name_len != sizeof(N_XSOCKADDR_IN)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  auto host_name = *name;
+  const uint16_t guest_port = name->sin_port;
+#if !REX_PLATFORM_WIN32
+  // Match the local Xenia build's low-port mapping. Single-player titles can
+  // create local sessions on ports such as 1000, which require privileges on
+  // Linux. Preserve zero so the OS can still choose an ephemeral port.
+  if (guest_port != 0 && guest_port < 1024) {
+    host_name.sin_port = guest_port + 10000;
+  }
+#endif
+  int ret = bind(native_handle_, reinterpret_cast<sockaddr*>(&host_name), name_len);
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }
 
   bound_ = true;
-  bound_port_ = name->sin_port;
+  bound_port_ = guest_port;
 
   return X_STATUS_SUCCESS;
 }
@@ -158,6 +247,15 @@ int XSocket::Shutdown(int how) {
 }
 
 int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
+  auto byte_writer=memory()->BeginExternalHostWrite(buf,buf_len);
+  if(!byte_writer){
+#if REX_PLATFORM_WIN32
+    WSASetLastError(WSAEFAULT);
+#else
+    errno=EFAULT;
+#endif
+    return -1;
+  }
   return recv(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags);
 }
 
@@ -186,6 +284,15 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
   }
   */
 
+  auto byte_writer=memory()->BeginExternalHostWrite(buf,buf_len);
+  if(!byte_writer){
+#if REX_PLATFORM_WIN32
+    WSASetLastError(WSAEFAULT);
+#else
+    errno=EFAULT;
+#endif
+    return -1;
+  }
   sockaddr_in nfrom;
   socklen_t nfromlen = sizeof(sockaddr_in);
   int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,

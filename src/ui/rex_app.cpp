@@ -21,6 +21,7 @@
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/command_processor.h>
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
 #endif
@@ -44,6 +45,58 @@
 #include <algorithm>
 #include <filesystem>
 #include <string_view>
+
+namespace rex::ui {
+
+class ShaderStorageDialog final : public ImGuiDialog {
+ public:
+  ShaderStorageDialog(ImGuiDrawer* drawer, graphics::ShaderStorageProgress& progress)
+      : ImGuiDialog(drawer), progress_(progress) {}
+
+ private:
+  void OnDraw(ImGuiIO& io) override {
+    using Phase = graphics::ShaderStorageProgress::Phase;
+    auto status = progress_.Read();
+    const float width = std::max(120.0f, std::min(560.0f, io.DisplaySize.x - 48.0f));
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.72f),
+                           ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(width, status.failed && status.skipped ? 92 : 70));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.04f, 0.04f, 0.04f, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.72f, 0.035f, 0.055f, 1));
+    constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
+                           ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                           ImGuiWindowFlags_NoInputs;
+    if (ImGui::Begin("##shader_preparation", nullptr, flags)) {
+      const char* phase = status.phase == Phase::kShaders ? "PREPARING SHADERS" :
+                          status.phase == Phase::kPipelines ? "PREPARING PIPELINES" :
+                          status.phase == Phase::kComplete ? "READY" : "READING SHADER CACHE";
+      ImGui::TextUnformatted(phase);
+      if (status.total) {
+        auto count = fmt::format("{} / {}", status.completed, status.total);
+        ImGui::SameLine(width - ImGui::CalcTextSize(count.c_str()).x);
+        ImGui::TextUnformatted(count.c_str());
+      }
+      const float fraction = status.total ? float(status.completed) / float(status.total) : 0.0f;
+      ImGui::ProgressBar(fraction, ImVec2(-1, 8), "");
+      const char* items = status.phase == Phase::kPipelines ? "pipelines" :
+                          status.phase == Phase::kShaders ? "shaders" : "items";
+      if (status.skipped) ImGui::Text("Optional %s skipped: %zu", items, status.skipped);
+      if (status.failed) ImGui::Text("Failed %s: %zu", items, status.failed);
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar(4);
+  }
+
+  graphics::ShaderStorageProgress& progress_;
+};
+
+}  // namespace rex::ui
 
 namespace rex {
 
@@ -72,6 +125,10 @@ bool ReXApp::OnInitialize() {
     return false;
   LaunchModule();
   return true;
+}
+
+void ReXApp::OnLoadConfig(const std::filesystem::path& path) {
+  rex::cvar::LoadConfig(path);
 }
 
 bool ReXApp::SetupEnvironment() {
@@ -119,8 +176,8 @@ bool ReXApp::SetupEnvironment() {
   resolved_defaults_ = std::move(path_config);
 
   // Load config FIRST so log cvars have final values
-  if (std::filesystem::exists(config_path_))
-    rex::cvar::LoadConfig(config_path_);
+  // Applications also need to configure backend defaults when no file exists.
+  OnLoadConfig(config_path_);
 
   // Late-phase logging
   std::string log_file_cvar = REXCVAR_GET(log_file);
@@ -207,7 +264,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
-        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_)
+        if (settings_input_blocked_.load(std::memory_order_relaxed)) return false;
+        if (!debug_overlay_ && !console_overlay_)
           return true;
         return !imgui_drawer_->GetIO().WantCaptureMouse;
       });
@@ -326,12 +384,7 @@ bool ReXApp::SetupPresentation() {
           }
         });
         rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
-          if (settings_overlay_) {
-            settings_overlay_.reset();
-          } else {
-            settings_overlay_ =
-                std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
-          }
+          ToggleSettingsOverlay();
         });
         rex::ui::RegisterBind("bind_gpu_frame_trace", "F5", "Capture next GPU frame",
                               [graphics_system] { graphics_system->RequestFrameTrace(); });
@@ -347,36 +400,71 @@ bool ReXApp::SetupPresentation() {
 
 void ReXApp::LaunchModule() {
   app_context().CallInUIThreadDeferred([this]() {
-    OnPreLaunchModule();
-
-    auto main_thread = runtime_->PrepareModuleLaunch();
-    if (!main_thread) {
-      REXLOG_ERROR("Failed to launch module");
-      app_context().QuitFromUIThread();
+    if (shutting_down_.load(std::memory_order_acquire)) {
       return;
     }
+    OnPreLaunchModule();
+    auto prepare_graphics=CreateGraphicsPreparationTask();
+
+    // Create and resume the guest only after graphics preparation succeeds or
+    // finishes its optional fallback. A suspended guest thread created before
+    // loading would not be considered running by TerminateTitle(), leaving it
+    // waiting on its start condition if the window closes during preparation.
+    // The executable/title state is already initialized by Runtime::LoadXexImage.
+    // This callback runs on the UI thread, so close cannot interleave between
+    // the shutdown check, thread creation and resume below.
+    auto launch = [this]() {
+      if (shutting_down_.load(std::memory_order_acquire)) {
+        return;
+      }
+      auto main_thread = runtime_->PrepareModuleLaunch();
+      if (!main_thread) {
+        REXLOG_ERROR("Failed to launch module");
+        app_context().QuitFromUIThread();
+        return;
+      }
+      shader_storage_dialog_.reset();
+      OnPostLaunchModule(main_thread.get());
+      main_thread->Resume();
+      module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
+        main_thread->Wait(0, 0, 0, nullptr);
+        OnGuestThreadExit(main_thread.get());
+        REXLOG_INFO("Execution complete");
+        if (!shutting_down_.load(std::memory_order_acquire)) {
+          app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
+        }
+      });
+    };
 
     auto* graphics_system =
         static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
-    if (graphics_system && !runtime_->cache_root().empty()) {
-      uint32_t title_id = runtime_->kernel_state()->title_id();
-      if (title_id != 0) {
-        REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
-        graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
+    uint32_t title_id = runtime_->kernel_state()->title_id();
+    if (graphics_system && ((!runtime_->cache_root().empty() && title_id) || prepare_graphics)) {
+      REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
+      if (imgui_drawer_) {
+        shader_storage_dialog_ = std::make_unique<ui::ShaderStorageDialog>(
+            imgui_drawer_.get(), graphics_system->command_processor()->shader_storage_progress());
       }
+      // Waiting for the GPU preload on the UI thread would freeze the window
+      // and prevent the progress bar (or the close button) from responding.
+      shader_storage_thread_ = std::thread(
+          [this, graphics_system, title_id, launch = std::move(launch), prepare_graphics = std::move(prepare_graphics)]() mutable {
+            if (!runtime_->cache_root().empty() && title_id)
+              graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
+            if (prepare_graphics && !shutting_down_.load(std::memory_order_acquire)) {
+              auto& progress=graphics_system->command_processor()->shader_storage_progress();
+              try { prepare_graphics(progress); }
+              catch (const std::exception& error) { REXLOG_WARN("Optional graphics preparation failed: {}",error.what()); }
+              catch (...) { REXLOG_WARN("Optional graphics preparation failed"); }
+              progress.Finish();
+            }
+            if (!shutting_down_.load(std::memory_order_acquire)) {
+              app_context().CallInUIThreadDeferred(std::move(launch));
+            }
+          });
+    } else {
+      launch();
     }
-
-    OnPostLaunchModule(main_thread.get());
-    main_thread->Resume();
-
-    module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
-      main_thread->Wait(0, 0, 0, nullptr);
-      OnGuestThreadExit(main_thread.get());
-      REXLOG_INFO("Execution complete");
-      if (!shutting_down_.load(std::memory_order_acquire)) {
-        app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
-      }
-    });
   });
 }
 
@@ -400,6 +488,7 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
   shutting_down_.store(true, std::memory_order_release);
+  OnBeforeTitleTermination();
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
   }
@@ -407,6 +496,13 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
 }
 
 void ReXApp::OnDestroy() {
+  shutting_down_.store(true, std::memory_order_release);
+  // The loader still owns GPU/runtime pointers until it finishes. Join before
+  // destroying the dialog, presenter, or runtime, including close during load.
+  if (shader_storage_thread_.joinable()) {
+    shader_storage_thread_.join();
+  }
+  shader_storage_dialog_.reset();
   // Notify subclass before cleanup
   OnShutdown();
 
@@ -444,6 +540,19 @@ void ReXApp::OnDestroy() {
   }
   window_.reset();
   runtime_.reset();
+}
+
+std::unique_ptr<ui::ImGuiDialog> ReXApp::CreateSettingsOverlay(
+    ui::ImGuiDrawer* drawer, const std::filesystem::path& path) {
+  return std::make_unique<ui::SettingsDialog>(drawer, path);
+}
+
+void ReXApp::ToggleSettingsOverlay() {
+  if (!imgui_drawer_ || shutting_down_.load(std::memory_order_acquire)) return;
+  if (settings_overlay_) settings_overlay_.reset();
+  else settings_overlay_ = CreateSettingsOverlay(imgui_drawer_.get(), config_path_);
+  settings_input_blocked_.store(bool(settings_overlay_), std::memory_order_relaxed);
+  REXLOG_INFO("Settings menu {}", settings_overlay_ ? "opened" : "closed");
 }
 
 void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider) {

@@ -196,6 +196,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 
   if (with_swapchain) {
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_hdr_metadata)
     // #2.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
   }
@@ -637,6 +638,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(fragmentStoresAndAtomics)
     XE_UI_VULKAN_FEATURE(shaderClipDistance)
     XE_UI_VULKAN_FEATURE(shaderCullDistance)
+    XE_UI_VULKAN_FEATURE(shaderInt64)
+    XE_UI_VULKAN_FEATURE(shaderSampledImageArrayDynamicIndexing)
     XE_UI_VULKAN_FEATURE(sparseBinding)
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
   }
@@ -646,6 +649,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, hostQueryReset);
+      // Enable only supported optional features. The reference backend does
+      // not depend on these, so older devices retain their existing fallback.
+      XE_UI_VULKAN_FEATURE_2(features_1_2, bufferDeviceAddress);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, runtimeDescriptorArray);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingPartiallyBound);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingVariableDescriptorCount);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingSampledImageUpdateAfterBind);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, shaderSampledImageArrayNonUniformIndexing);
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {

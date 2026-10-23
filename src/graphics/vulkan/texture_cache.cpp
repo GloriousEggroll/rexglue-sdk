@@ -667,6 +667,71 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
   }
 }
 
+void VulkanTextureCache::TraceActiveBinding(
+    uint32_t fetch_constant_index, xenos::FetchOpDimension dimension,
+    bool is_signed, uint64_t frame, uint32_t binding_index,
+    const memory::Memory& memory) const {
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    REXGPU_INFO(
+        "GPU GOW3 texture cache: frame={} binding={} fetch={} "
+        "valid=0 dimension={}",
+        frame, binding_index, fetch_constant_index, uint32_t(dimension));
+    return;
+  }
+
+  const bool dimension_compatible =
+      AreDimensionsCompatible(dimension, binding->key.dimension);
+  const bool use_signed =
+      is_signed && texture_util::IsAnySignSigned(binding->swizzled_signs);
+  const Texture* selected_texture =
+      use_signed && IsSignedVersionSeparateForFormat(binding->key)
+          ? binding->texture_signed
+          : binding->texture;
+  const VkImage selected_image =
+      selected_texture
+          ? static_cast<const VulkanTexture*>(selected_texture)->image()
+          : VK_NULL_HANDLE;
+  const VulkanTextureBinding& vulkan_binding =
+      vulkan_texture_bindings_[fetch_constant_index];
+  const VkImageView selected_view =
+      is_signed ? vulkan_binding.image_view_signed
+                : vulkan_binding.image_view_unsigned;
+  uint32_t guest_base_size = 0;
+  uint64_t guest_base_hash = UINT64_C(14695981039346656037);
+  uint32_t guest_base_nonzero = 0;
+  if (selected_texture && binding->key.base_page) {
+    guest_base_size = selected_texture->GetGuestBaseSize();
+    const uint8_t* guest_base =
+        memory.TranslatePhysical(binding->key.base_page << 12);
+    for (uint32_t i = 0; i < guest_base_size; ++i) {
+      const uint8_t value = guest_base[i];
+      guest_base_hash =
+          (guest_base_hash ^ value) * UINT64_C(1099511628211);
+      guest_base_nonzero += value != 0;
+    }
+  }
+  REXGPU_INFO(
+      "GPU GOW3 texture cache: frame={} binding={} fetch={} valid=1 "
+      "dimension={} compatible={} signed={} key_base={:05X} key_mip={:05X} "
+      "size={}x{}x{} pitch={} format={} tiled={} packed_mips={} max_mip={} "
+      "scaled={} texture={:p} image={:p} view={:p} view_u={:p} view_s={:p} "
+      "outdated={:08X} guest_base_bytes={} guest_base_hash={:016X} "
+      "guest_base_nonzero={}",
+      frame, binding_index, fetch_constant_index, uint32_t(dimension),
+      dimension_compatible, is_signed, binding->key.base_page,
+      binding->key.mip_page, binding->key.GetWidth(), binding->key.GetHeight(),
+      binding->key.GetDepthOrArraySize(), binding->key.pitch,
+      uint32_t(binding->key.format), binding->key.tiled,
+      binding->key.packed_mips, binding->key.mip_max_level,
+      binding->key.scaled_resolve, static_cast<const void*>(selected_texture),
+      static_cast<void*>(selected_image), static_cast<void*>(selected_view),
+      static_cast<void*>(vulkan_binding.image_view_unsigned),
+      static_cast<void*>(vulkan_binding.image_view_signed),
+      selected_texture ? selected_texture->outdated_mask() : UINT32_MAX,
+      guest_base_size, guest_base_hash, guest_base_nonzero);
+}
+
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     const VulkanShader::SamplerBinding& binding) const {
   const auto& regs = register_file();

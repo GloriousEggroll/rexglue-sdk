@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <rex/cvar.h>
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -31,6 +32,9 @@
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
+
+REXCVAR_DEFINE_BOOL(trace_file_opens, false, "Kernel",
+                    "Log NtCreateFile paths, results, and guest callers");
 
 struct CreateOptions {
   // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
@@ -172,6 +176,16 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
+  }
+  if (REXCVAR_GET(trace_file_opens)) {
+    auto* current_thread = XThread::GetCurrentThread();
+    const auto* context =
+        current_thread ? current_thread->thread_state()->context() : nullptr;
+    REXKRNL_INFO(
+        "[NtCreateFile trace] lr={:#010x} path='{}' result={:#010x} "
+        "handle={:#010x}",
+        context ? uint32_t(context->lr) : 0, target_path, uint32_t(result),
+        uint32_t(handle));
   }
   return result;
 }

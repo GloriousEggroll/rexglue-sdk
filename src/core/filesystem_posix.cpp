@@ -169,25 +169,15 @@ class PosixFileHandle : public FileHandle {
 
 std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path& path,
                                                      uint32_t desired_access) {
-  int open_access = 0;
-  if (desired_access & FileAccess::kGenericRead) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericWrite) {
-    open_access |= O_WRONLY;
-  }
-  if (desired_access & FileAccess::kGenericExecute) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericAll) {
-    open_access |= O_RDWR;
-  }
-  if (desired_access & FileAccess::kFileReadData) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kFileWriteData) {
-    open_access |= O_WRONLY;
-  }
+  // POSIX access modes are alternatives, not independent flags. O_RDONLY is
+  // zero, so OR-ing it with O_WRONLY silently loses requested read access.
+  const bool readable =
+      desired_access & (FileAccess::kGenericRead | FileAccess::kGenericExecute |
+                        FileAccess::kGenericAll | FileAccess::kFileReadData);
+  const bool writable =
+      desired_access & (FileAccess::kGenericWrite | FileAccess::kGenericAll |
+                        FileAccess::kFileWriteData | FileAccess::kFileAppendData);
+  int open_access = writable ? (readable ? O_RDWR : O_WRONLY) : O_RDONLY;
   if (desired_access & FileAccess::kFileAppendData) {
     open_access |= O_APPEND;
   }

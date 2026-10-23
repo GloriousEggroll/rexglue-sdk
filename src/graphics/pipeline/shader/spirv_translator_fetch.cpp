@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 
@@ -1408,9 +1409,23 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         spv::Id is_any_unsigned =
             builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, is_all_signed);
 
+        // Load the fetch constant word 3, needed for result exponent biasing.
+        // exp_adjust is in word 3, bits 13:18 (6-bit signed).
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
+        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createLoad(
+                builder_->createAccessChain(spv::StorageClassUniform, uniform_fetch_constants_,
+                                            id_vector_temp_),
+                spv::NoPrecision));
+
         // Load the fetch constant word 4, needed unconditionally for LOD
-        // biasing, for result exponent biasing, and conditionally for stacked
-        // texture filtering.
+        // biasing, and conditionally for stacked texture filtering.
         id_vector_temp_.clear();
         id_vector_temp_.push_back(const_int_0_);
         id_vector_temp_.push_back(
@@ -2029,11 +2044,70 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
 
+        // num_format is applied after signs and gamma. Fixed textures sample as
+        // normalized host values, so integer num_format scales them back to
+        // guest integer units here.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(kSystemConstantTextureIntegerScaleBits));
+        id_vector_temp_.push_back(builder_->makeIntConstant(int32_t(fetch_constant_index >> 2)));
+        id_vector_temp_.push_back(builder_->makeIntConstant(int32_t(fetch_constant_index & 3)));
+        spv::Id integer_scale_bits_packed = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+        {
+          spv::Id integer_scale_active =
+              builder_->createBinOp(spv::OpINotEqual, type_bool_, integer_scale_bits_packed,
+                                    builder_->makeUintConstant(0));
+          SpirvBuilder::IfBuilder if_integer_scale(integer_scale_active,
+                                                   spv::SelectionControlMaskNone, *builder_);
+          spv::Id scaled_result[4] = {};
+          {
+            spv::Id const_uint_1 = builder_->makeUintConstant(1);
+            uint32_t result_remaining_components = used_result_nonzero_components;
+            uint32_t result_component_index;
+            while (rex::bit_scan_forward(result_remaining_components, &result_component_index)) {
+              result_remaining_components &= ~(UINT32_C(1) << result_component_index);
+              spv::Id scale_bits = builder_->createTriOp(
+                  spv::OpBitFieldUExtract, type_uint_, integer_scale_bits_packed,
+                  builder_->makeUintConstant(result_component_index * 5),
+                  builder_->makeUintConstant(5));
+              spv::Id scale_shift = builder_->createBinOp(
+                  spv::OpIAdd, type_uint_,
+                  builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, scale_bits,
+                                        builder_->makeUintConstant(0xF)),
+                  const_uint_1);
+              scale_shift = builder_->createBinOp(
+                  spv::OpISub, type_uint_, scale_shift,
+                  builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_, scale_bits,
+                                        builder_->makeUintConstant(4),
+                                        builder_->makeUintConstant(1)));
+              spv::Id scale_uint = builder_->createBinOp(
+                  spv::OpISub, type_uint_,
+                  builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, const_uint_1,
+                                        scale_shift),
+                  const_uint_1);
+              scaled_result[result_component_index] = builder_->createNoContractionBinOp(
+                  spv::OpFMul, type_float_, result[result_component_index],
+                  builder_->createUnaryOp(spv::OpConvertUToF, type_float_, scale_uint));
+            }
+          }
+          if_integer_scale.makeEndIf();
+          uint32_t result_remaining_components = used_result_nonzero_components;
+          uint32_t result_component_index;
+          while (rex::bit_scan_forward(result_remaining_components, &result_component_index)) {
+            result_remaining_components &= ~(UINT32_C(1) << result_component_index);
+            result[result_component_index] = if_integer_scale.createMergePhi(
+                scaled_result[result_component_index], result[result_component_index]);
+          }
+        }
+
         // Apply the exponent bias from the bits 13:18 of the fetch constant
-        // word 4.
+        // word 3.
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
+            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
         {
           uint32_t result_remaining_components = used_result_nonzero_components;
@@ -2043,6 +2117,60 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             result[result_component_index] = builder_->createNoContractionBinOp(
                 spv::OpFMul, type_float_, result[result_component_index], result_exponent_bias);
           }
+        }
+
+        if (GetSpirvShaderModification().pixel.debug_gow3_title_texture &&
+            fetch_constant_index == 0) {
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(result[0]);
+          id_vector_temp_.push_back(result[1]);
+          id_vector_temp_.push_back(result[2]);
+          builder_->createStore(
+              builder_->createCompositeConstruct(type_float3_, id_vector_temp_),
+              var_main_tfetch_gradients_h_);
+        }
+
+        if (GetSpirvShaderModification().pixel.debug_gow3_scene_composite_input &&
+            fetch_constant_index < 5) {
+          assert_true(input_fragment_coordinates_ != spv::NoResult);
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(const_int_0_);
+          spv::Id position_x = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassInput,
+                                          input_fragment_coordinates_,
+                                          id_vector_temp_),
+              spv::NoPrecision);
+          spv::Id in_band = builder_->createBinOp(
+              spv::OpLogicalAnd, type_bool_,
+              builder_->createBinOp(
+                  spv::OpFOrdGreaterThanEqual, type_bool_, position_x,
+                  builder_->makeFloatConstant(float(fetch_constant_index * 256))),
+              builder_->createBinOp(
+                  spv::OpFOrdLessThan, type_bool_, position_x,
+                  builder_->makeFloatConstant(float((fetch_constant_index + 1) * 256))));
+          SpirvBuilder::IfBuilder if_in_band(
+              in_band, spv::SelectionControlMaskNone, *builder_);
+          {
+            id_vector_temp_.clear();
+            id_vector_temp_.push_back(result[0]);
+            id_vector_temp_.push_back(result[1]);
+            id_vector_temp_.push_back(result[2]);
+            builder_->createStore(
+                builder_->createCompositeConstruct(type_float3_,
+                                                   id_vector_temp_),
+                var_main_tfetch_gradients_h_);
+          }
+          if_in_band.makeEndIf();
+        }
+
+        if (GetSpirvShaderModification().pixel.debug_gow3_yuv_samples &&
+            fetch_constant_index < 3) {
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(builder_->makeIntConstant(int32_t(fetch_constant_index)));
+          builder_->createStore(
+              result[0],
+              builder_->createAccessChain(spv::StorageClassFunction,
+                                          var_main_tfetch_gradients_h_, id_vector_temp_));
         }
       }
     }
@@ -2205,7 +2333,9 @@ void SpirvShaderTranslator::SampleTexture(spv::Builder::TextureParameters& textu
               builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, sign_result,
                                                  lerp_first),
               lerp_factor);
-          sign_result = builder_->createNoContractionBinOp(spv::OpFAdd, type_float4_, sign_result,
+          // Interpolate from the lower layer. Adding to the upper sample would
+          // select the upper layer at t=0 and extrapolate beyond it at t=1.
+          sign_result = builder_->createNoContractionBinOp(spv::OpFAdd, type_float4_, lerp_first,
                                                            lerp_difference);
         }
       }

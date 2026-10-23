@@ -117,7 +117,6 @@ target_include_directories(rexcodegen
 
 target_link_libraries(rexcodegen
     PUBLIC
-        rexcore
         rexruntime
         fmt::fmt
         spdlog::spdlog
@@ -127,4 +126,3 @@ target_link_libraries(rexcodegen
         xxHash::xxhash
         simde
 )
-

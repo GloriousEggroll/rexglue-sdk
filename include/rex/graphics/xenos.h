@@ -1521,6 +1521,61 @@ struct alignas(uint32_t) xe_gpu_depth_sample_counts {
 };
 static_assert_size(xe_gpu_depth_sample_counts, sizeof(uint32_t) * 8);
 
+struct XenosZPDReport {
+  static constexpr uint32_t kRecordSizeBytes = 0x20;
+  static constexpr uint32_t kRecordAlignMask = ~(kRecordSizeBytes - 1);
+  static constexpr uint32_t kSlotSizeBytes = 0x40;
+  static constexpr uint32_t kSlotAlignMask = ~(kSlotSizeBytes - 1);
+
+  static constexpr uint32_t GetRecordBase(uint32_t address) {
+    return address & kRecordAlignMask;
+  }
+
+  static constexpr uint32_t GetSlotBase(uint32_t address) {
+    return address & kSlotAlignMask;
+  }
+
+  static constexpr uint32_t GetBeginRecordBase(uint32_t address) {
+    return GetSlotBase(address) + kRecordSizeBytes;
+  }
+
+  static constexpr uint32_t GetEndRecordBase(uint32_t address) {
+    return GetSlotBase(address);
+  }
+
+  static constexpr bool IsBeginRecord(uint32_t address) {
+    const uint32_t record_base = GetRecordBase(address);
+    return record_base && record_base == GetBeginRecordBase(record_base);
+  }
+
+  static constexpr bool IsEndRecord(uint32_t address) {
+    const uint32_t record_base = GetRecordBase(address);
+    return record_base && record_base == GetEndRecordBase(record_base);
+  }
+
+  static bool HasPendingSentinel(const xe_gpu_depth_sample_counts* report) {
+    constexpr uint32_t kSentinelLE = 0xEDFEFFFFu;
+    constexpr uint32_t kSentinelBE = 0xFFFFFEEDu;
+    auto is_sentinel = [](uint32_t value) {
+      return value == kSentinelLE || value == kSentinelBE;
+    };
+    return is_sentinel(report->ZPass_A) || is_sentinel(report->ZPass_B) ||
+           is_sentinel(report->ZFail_A) || is_sentinel(report->ZFail_B);
+  }
+
+  static void WriteSampleCount(xe_gpu_depth_sample_counts* report,
+                               uint32_t sample_count) {
+    report->Total_A = sample_count;
+    report->Total_B = 0;
+    report->ZFail_A = 0;
+    report->ZFail_B = 0;
+    report->ZPass_A = sample_count;
+    report->ZPass_B = 0;
+    report->StencilFail_A = 0;
+    report->StencilFail_B = 0;
+  }
+};
+
 // Enum of event values used for VGT_EVENT_INITIATOR
 enum Event {
   VS_DEALLOC = 0,

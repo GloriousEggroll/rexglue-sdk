@@ -12,6 +12,7 @@
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/cvar.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/hdr_display.h>
 #include <imgui.h>
 
 #include <algorithm>
@@ -311,6 +312,8 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
     }
 
     bool read_only = (entry.lifecycle == rex::cvar::Lifecycle::kInitOnly);
+    const bool hdr_unavailable = entry.name.starts_with("present_hdr") && !IsNativeHdrAvailable();
+    read_only |= hdr_unavailable;
 
     ImGui::PushID(entry.name.c_str());
 
@@ -318,6 +321,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
       ImGui::BeginDisabled();
 
     std::string current_val = entry.getter();
+    if (hdr_unavailable && entry.name == "present_hdr") current_val = "false";
 
     // Use description as display label if available, otherwise CVAR name
     const char* display_label =

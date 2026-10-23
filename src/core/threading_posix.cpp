@@ -248,6 +248,59 @@ class PosixConditionBase {
 #else
     std::unique_lock<std::mutex> lock(mutex_);
 #endif
+#if REX_PLATFORM_LINUX
+    // A robust mutex may report owner death when a condition wait reacquires
+    // it, even after the initial lock above succeeded. std::condition_variable
+    // cannot recover that result (its indefinite wait asserts success).
+    const bool infinite = timeout == std::chrono::milliseconds::max();
+    const auto deadline = infinite ? std::chrono::steady_clock::time_point::max()
+                                   : std::chrono::steady_clock::now() + timeout;
+    while (!predicate()) {
+      int wait_result;
+      if (infinite) {
+        wait_result = pthread_cond_wait(cond_.native_handle(), native_mutex);
+      } else {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero()) {
+          break;
+        }
+#ifdef _GLIBCXX_USE_PTHREAD_COND_CLOCKWAIT
+        // Match the monotonic clock used by this standard-library build.
+        auto absolute = DurationToTimeSpec(
+            std::chrono::ceil<std::chrono::nanoseconds>(deadline.time_since_epoch()));
+        wait_result = pthread_cond_clockwait(cond_.native_handle(), native_mutex,
+                                            CLOCK_MONOTONIC, &absolute);
+#else
+        // Match condition_variable's realtime conversion on builds without
+        // clockwait support; recheck the original steady deadline after wake.
+        auto absolute = DurationToTimeSpec(std::chrono::ceil<std::chrono::nanoseconds>(
+            (std::chrono::system_clock::now() + remaining).time_since_epoch()));
+        wait_result = pthread_cond_timedwait(cond_.native_handle(), native_mutex, &absolute);
+#endif
+      }
+      if (wait_result == EOWNERDEAD) {
+        // The mutex is owned by this waiter. Repair it before evaluating or
+        // updating the protected event/semaphore/thread state.
+        if (pthread_mutex_consistent(native_mutex) != 0) {
+          return WaitResult::kFailed;
+        }
+      } else if (wait_result == ENOTRECOVERABLE) {
+        // Unlike EOWNERDEAD, this result does not acquire the mutex. Prevent
+        // unique_lock from attempting to unlock a mutex the waiter does not own.
+        lock.release();
+        return WaitResult::kFailed;
+      } else if (wait_result != 0 && wait_result != ETIMEDOUT) {
+        // Other wait errors leave the already-owned mutex unchanged.
+        return WaitResult::kFailed;
+      }
+      if (!infinite && std::chrono::steady_clock::now() >= deadline) {
+        break;
+      }
+    }
+    // Preserve predicate priority at a timeout boundary and the original
+    // post_execution semantics, including auto reset and semaphore consumption.
+    executed = predicate();
+#else
     if (predicate()) {
       executed = true;
     } else {
@@ -258,6 +311,7 @@ class PosixConditionBase {
         executed = cond_.wait_for(lock, timeout, predicate);
       }
     }
+#endif
     if (executed) {
       post_execution();
       return WaitResult::kSuccess;
@@ -357,13 +411,10 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      if (timeout == std::chrono::milliseconds::max()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
-      }
+      // Keep sub-millisecond precision. Alertable waits call us with a 1 ms
+      // slice: truncating the remaining duration to milliseconds makes it zero
+      // immediately, busy-spinning and locking every handle for the whole slice.
+      std::this_thread::sleep_until(std::min(end_time, now + std::chrono::milliseconds(1)));
     }
   }
 
@@ -998,12 +1049,13 @@ std::chrono::milliseconds ComputeAlertableWaitTimeout(
   if (deadline == std::chrono::steady_clock::time_point::max()) {
     return kAlertablePollSlice;
   }
-  auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-      deadline - std::chrono::steady_clock::now());
-  if (remaining <= std::chrono::milliseconds::zero()) {
+  auto remaining = deadline - std::chrono::steady_clock::now();
+  if (remaining <= std::chrono::steady_clock::duration::zero()) {
     return std::chrono::milliseconds::zero();
   }
-  return std::min(remaining, kAlertablePollSlice);
+  // The public wait API has millisecond precision. Round a positive remainder
+  // up so the final fractional millisecond is a blocking wait, not a busy poll.
+  return std::min(std::chrono::ceil<std::chrono::milliseconds>(remaining), kAlertablePollSlice);
 }
 
 }  // namespace
@@ -1312,12 +1364,12 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
+    thread->handle_.suspend_count_ = create_suspended ? 1 : 0;
     thread->handle_.state_signal_.notify_all();
   }
 
   if (create_suspended) {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
-    thread->handle_.suspend_count_ = 1;
     thread->handle_.state_signal_.wait(lock,
                                        [thread] { return thread->handle_.suspend_count_ == 0; });
   }

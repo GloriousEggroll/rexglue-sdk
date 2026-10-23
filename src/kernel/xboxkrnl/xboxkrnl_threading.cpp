@@ -15,9 +15,12 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -38,9 +41,52 @@
 #include <rex/thread/atomic.h>
 #include <rex/thread/mutex.h>
 
+REXCVAR_DEFINE_UINT32(trace_wait_handle, 0, "Debug",
+                      "Guest object handle to aggregate wait results for")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 using rex::runtime::current_ppc_context;
+
+namespace {
+
+struct WaitProbeCounters {
+  uint64_t total = 0;
+  uint64_t success = 0;
+  uint64_t timeout = 0;
+  uint64_t other = 0;
+};
+
+std::mutex wait_probe_mutex;
+std::unordered_map<uint32_t, WaitProbeCounters> wait_probe_counters;
+
+void RecordWaitProbe(uint32_t object_handle, X_STATUS result, bool zero_timeout) {
+  if (!REXCVAR_GET(trace_wait_handle) ||
+      !zero_timeout ||
+      (REXCVAR_GET(trace_wait_handle) != UINT32_MAX &&
+       object_handle != REXCVAR_GET(trace_wait_handle))) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(wait_probe_mutex);
+  WaitProbeCounters& counters = wait_probe_counters[object_handle];
+  if (result == X_STATUS_SUCCESS) {
+    ++counters.success;
+  } else if (result == X_STATUS_TIMEOUT) {
+    ++counters.timeout;
+  } else {
+    ++counters.other;
+  }
+  if ((++counters.total & 127) == 0) {
+    REXLOG_WARN(
+        "Wait probe handle={:#010x} total={} success={} timeout={} other={}",
+        object_handle, counters.total, counters.success, counters.timeout,
+        counters.other);
+  }
+}
+
+}  // namespace
 
 // r13 + 0x100: pointer to thread local state
 // Thread local state:
@@ -852,6 +898,7 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
 u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
                                   mapped_u64 timeout_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
+  const bool zero_timeout = timeout_ptr && *timeout_ptr == 0;
 
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
   if (object) {
@@ -864,6 +911,7 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
     result = X_STATUS_INVALID_HANDLE;
   }
 
+  RecordWaitProbe(object_handle, result, zero_timeout);
   return result;
 }
 

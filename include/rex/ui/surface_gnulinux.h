@@ -13,9 +13,48 @@
 #include <rex/ui/surface.h>
 
 #include <xcb/xcb.h>
+#include <rex/ui/hdr_display.h>
+#include <memory>
+#include <functional>
+struct _GtkWidget;
+struct _GdkWindow;
+struct wl_surface;
+struct wl_subsurface;
+struct wp_viewport;
+struct wp_fractional_scale_v1;
+struct wp_color_manager_v1;
+struct wp_color_management_output_v1;
 
 namespace rex {
 namespace ui {
+
+class WaylandWindowSurface final : public Surface {
+ public:
+  static std::unique_ptr<WaylandWindowSurface> Create(_GtkWidget* widget, std::function<void()> changed);
+  ~WaylandWindowSurface() override;
+  TypeIndex GetType() const override { return kTypeIndex_WaylandWindow; }
+  wl_display* display() const { return display_; }
+  wl_surface* surface() const { return surface_; }
+  HdrDisplay GetHdrDisplay() const;
+ protected:
+  bool GetSizeImpl(uint32_t& width, uint32_t& height) const override;
+ private:
+  void ScheduleUpdate();
+  void EnterOutput(wl_output* output);
+  std::function<void()> changed_;
+  unsigned update_source_ = 0;
+  uint32_t fractional_scale_ = 0;
+  wp_viewport* viewport_ = nullptr;
+  wp_fractional_scale_v1* fractional_ = nullptr;
+  wp_color_manager_v1* color_manager_ = nullptr;
+  wp_color_management_output_v1* color_output_ = nullptr;
+  wl_output* output_ = nullptr;
+  _GtkWidget* widget_ = nullptr;
+  _GdkWindow* parent_window_ = nullptr;
+  wl_display* display_ = nullptr;
+  wl_surface* surface_ = nullptr;
+  wl_subsurface* subsurface_ = nullptr;
+};
 
 class XcbWindowSurface final : public Surface {
  public:

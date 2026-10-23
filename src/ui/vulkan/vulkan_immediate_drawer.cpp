@@ -513,6 +513,9 @@ void VulkanImmediateDrawer::OnLeavePresenter() {
     dfn.vkDestroyBuffer(device, submitted_texture_upload_buffer.buffer, nullptr);
     dfn.vkFreeMemory(device, submitted_texture_upload_buffer.buffer_memory, nullptr);
   }
+  // These uploads belonged to the timeline we just drained. Leaving their
+  // handles queued would free them again on the next Begin or in the destructor.
+  texture_upload_buffers_submitted_.clear();
 
   vertex_buffer_pool_->ChangeSubmissionTimeline();
 

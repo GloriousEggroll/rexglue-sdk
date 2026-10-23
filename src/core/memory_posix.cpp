@@ -10,6 +10,8 @@
  */
 
 #include <cerrno>
+#include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -23,8 +25,16 @@
 
 #include <rex/math.h>
 #include <rex/memory/utils.h>
+#include <rex/memory/proc_maps_parser.h>
 #include <rex/platform.h>
 #include <rex/string.h>
+
+#if REX_PLATFORM_LINUX
+#include <atomic>
+
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#endif
 
 #if REX_PLATFORM_ANDROID
 #include <string.h>
@@ -114,29 +124,55 @@ bool IsWritableExecutableMemorySupported() {
 #if REX_PLATFORM_LINUX
 namespace {
 
-struct LinuxMapEntry {
-  uintptr_t start = 0;
-  uintptr_t end = 0;
-  char perms[5] = {};
-};
+using detail::LinuxMapEntry;
+using detail::ParseProcMapsLine;
 
-// Parse a line from /proc/self/maps into a LinuxMapEntry
-static bool ParseProcMapsLine(const std::string& line, LinuxMapEntry& out) {
-  out = LinuxMapEntry{};
-  unsigned long long start = 0, end = 0;
-  char perms[5] = {};
-  const int matched = std::sscanf(line.c_str(), "%llx-%llx %4s", &start, &end, perms);
-  if (matched < 3)
-    return false;
-  out.start = static_cast<uintptr_t>(start);
-  out.end = static_cast<uintptr_t>(end);
-  std::memcpy(out.perms, perms, sizeof(out.perms));
-  return out.start < out.end;
+#if defined(PROCMAP_QUERY)
+// Opened once at load: queries run inside the fault handler, so they must not
+// allocate or initialize anything there.
+const int g_maps_fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+std::atomic<bool> g_procmap_query_unsupported{false};
+#endif
+
+// Mapping covering addr, or the next one above it, via the PROCMAP_QUERY ioctl
+// (Linux 6.11+): one syscall instead of generating and parsing the whole maps
+// text. Returns 1 when found, 0 when no mapping is at or above addr, and -1
+// when the kernel lacks the ioctl; callers then parse /proc/self/maps.
+static int QueryMapping(uintptr_t addr, LinuxMapEntry& out) {
+#if defined(PROCMAP_QUERY)
+  if (g_maps_fd < 0 || g_procmap_query_unsupported.load(std::memory_order_relaxed))
+    return -1;
+  procmap_query query{};
+  query.size = sizeof(query);
+  query.query_flags = PROCMAP_QUERY_COVERING_OR_NEXT_VMA;
+  query.query_addr = addr;
+  if (ioctl(g_maps_fd, PROCMAP_QUERY, &query) != 0) {
+    if (errno == ENOENT)
+      return 0;
+    if (errno == ENOTTY || errno == EINVAL || errno == EOPNOTSUPP)
+      g_procmap_query_unsupported.store(true, std::memory_order_relaxed);
+    return -1;
+  }
+  out = {};
+  out.start = static_cast<uintptr_t>(query.vma_start);
+  out.end = static_cast<uintptr_t>(query.vma_end);
+  out.perms[0] = (query.vma_flags & PROCMAP_QUERY_VMA_READABLE) ? 'r' : '-';
+  out.perms[1] = (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) ? 'w' : '-';
+  out.perms[2] = (query.vma_flags & PROCMAP_QUERY_VMA_EXECUTABLE) ? 'x' : '-';
+  out.perms[3] = (query.vma_flags & PROCMAP_QUERY_VMA_SHARED) ? 's' : 'p';
+  return 1;
+#else
+  (void)addr;
+  (void)out;
+  return -1;
+#endif
 }
 
 // Find the mapping entry in /proc/self/maps that contains the given address
 static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
   const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
+  if (const int found = QueryMapping(addr, out_entry); found >= 0)
+    return found == 1 && out_entry.start <= addr;
   std::ifstream maps("/proc/self/maps");
   if (!maps.is_open())
     return false;
@@ -162,6 +198,21 @@ static bool IsRangeFullyMapped(void* base_address, size_t length) {
   const uintptr_t end = begin + length;
   if (end < begin) {  // overflow check
     return false;
+  }
+
+  {
+    uintptr_t cursor = begin;
+    LinuxMapEntry e;
+    int found;
+    while (cursor < end && (found = QueryMapping(cursor, e)) == 1) {
+      if (e.start > cursor)
+        return false;  // gap found
+      cursor = e.end;
+    }
+    if (cursor >= end)
+      return true;
+    if (found == 0)
+      return false;
   }
 
   std::ifstream maps("/proc/self/maps");
@@ -320,6 +371,69 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   access_out = PermsToPageAccess(e.perms);
 
   return true;
+#endif
+}
+
+bool QueryProtectPages(std::span<const PageProtectionQuery> requests) {
+#if !REX_PLATFORM_LINUX
+  return false;
+#else
+  constexpr size_t kMaximumRanges=16,kMaximumPages=16384;
+  if(requests.empty() || requests.size()>kMaximumRanges)return false;
+  const size_t page=page_size();
+  if(!page)return false;
+  size_t total=0;
+  for(const auto& request:requests) {
+    if(!request.address || request.address%page || request.pages.empty() ||
+       request.pages.size()>kMaximumPages-total ||
+       request.pages.size()>(UINTPTR_MAX-request.address)/page)return false;
+    total+=request.pages.size();
+  }
+  std::array<size_t,kMaximumRanges> filled{};
+  {
+    bool supported=true;
+    for(size_t i=0;i<requests.size() && supported;++i) {
+      const auto& request=requests[i];
+      while(filled[i]<request.pages.size()) {
+        const uintptr_t cursor=request.address+filled[i]*page;
+        LinuxMapEntry entry;
+        const int found=QueryMapping(cursor,entry);
+        if(found<0) {supported=false;break;}
+        if(found==0 || entry.start>cursor || entry.start%page || entry.end%page)
+          return false; // A required mapping has a gap.
+        const size_t count=std::min<size_t>((entry.end-cursor)/page,request.pages.size()-filled[i]);
+        std::fill_n(request.pages.begin()+filled[i],count,PermsToPageAccess(entry.perms));
+        filled[i]+=count;
+      }
+    }
+    if(supported)return true;
+    filled={};
+  }
+  std::ifstream maps("/proc/self/maps");
+  if(!maps.is_open())return false;
+  std::string line;
+  size_t remaining=total;
+  uintptr_t previous_end=0;
+  while(std::getline(maps,line)) {
+    LinuxMapEntry entry;
+    if(!ParseProcMapsLine(line,entry) || entry.start%page || entry.end%page ||
+       entry.start<previous_end)return false;
+    previous_end=entry.end;
+    const auto access=PermsToPageAccess(entry.perms);
+    for(size_t i=0;i<requests.size();++i) {
+      const auto& request=requests[i];
+      if(filled[i]==request.pages.size())continue;
+      const uintptr_t cursor=request.address+filled[i]*page;
+      if(entry.end<=cursor)continue;
+      if(entry.start>cursor)return false; // A required mapping has a gap.
+      const size_t count=std::min<size_t>((entry.end-cursor)/page,
+                                        request.pages.size()-filled[i]);
+      std::fill_n(request.pages.begin()+filled[i],count,access);
+      filled[i]+=count;remaining-=count;
+    }
+    if(!remaining)return true;
+  }
+  return false;
 #endif
 }
 

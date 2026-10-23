@@ -41,7 +41,15 @@ class SDLAudioDriver : public AudioDriver {
   bool sdl_initialized_ = false;
   uint8_t sdl_device_channels_ = 0;
 
-  static const uint32_t frame_frequency_ = 48000;
+  // Accessed only by the serialized SDL stream callback. Diagnostics are opt-in.
+  uint64_t diagnostic_start_ms_ = 0;
+  uint64_t diagnostic_frames_ = 0;
+  uint64_t diagnostic_silence_frames_ = 0;
+  uint64_t diagnostic_nonfinite_samples_ = 0;
+  uint64_t diagnostic_overrange_samples_ = 0;
+  float diagnostic_peak_ = 0.0f;
+
+  static constexpr uint32_t frame_frequency_ = 48000;
   static const uint32_t frame_channels_ = 6;
   static const uint32_t channel_samples_ = 256;
   static const uint32_t frame_samples_ = frame_channels_ * channel_samples_;

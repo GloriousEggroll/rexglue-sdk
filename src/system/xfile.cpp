@@ -155,14 +155,16 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                                         memory::PageAccess::kReadWrite) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
-          result = file_->ReadSync(
-              std::span<uint8_t>(
-                  buffer_physical_heap
-                      ? memory()->TranslatePhysical(
-                            buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
-                      : memory()->TranslateVirtual(buffer_guest_address),
-                  buffer_length),
-              size_t(byte_offset), &bytes_read);
+          auto* destination=buffer_physical_heap
+              ? memory()->TranslatePhysical(buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
+              : memory()->TranslateVirtual(buffer_guest_address);
+          // Preserve the existing post-success unwatch behavior. Guard retirement
+          // also notifies physical ownership on partial/error OS writes without
+          // changing protection; byte certification is optional.
+          auto byte_writer=memory()->BeginExternalHostWrite(destination,buffer_length);
+          result=byte_writer
+              ? file_->ReadSync(std::span<uint8_t>(destination,buffer_length),size_t(byte_offset),&bytes_read)
+              : X_STATUS_ACCESS_VIOLATION;
           if (XSUCCEEDED(result)) {
             if (buffer_physical_heap) {
               buffer_physical_heap->TriggerCallbacks(

@@ -16,6 +16,7 @@
 #include <string>
 
 #include <rex/cvar.h>
+#include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -78,6 +79,8 @@ float GetConfiguredVideoModeRefreshRate() {
   return float(refresh_rate_hz);
 }
 }  // namespace
+
+REXCVAR_DECLARE(bool, native_direct_execution);
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -399,8 +402,10 @@ u32 VdCallGraphicsNotificationRoutines_entry(u32 unk0, ppc_ptr_t<BufferScaling> 
 }
 
 u32 VdIsHSIOTrainingSucceeded_entry() {
-  // BOOL return value
-  return 1;
+  // BOOL return value. Reporting a failed CPU-GPU link puts the guest D3D
+  // runtime in its GPU-less mode: it never submits the ring and completes
+  // fences on the CPU. Direct execution renders its API calls natively instead.
+  return REXCVAR_GET(native_direct_execution) ? 0 : 1;
 }
 
 u32 VdPersistDisplay_entry(u32 unk0, mapped_u32 unk1_ptr) {
@@ -495,12 +500,23 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   dwords[offset++] = gpu_fetch.dword_4;
   dwords[offset++] = gpu_fetch.dword_5;
 
-  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
+  const uint32_t api_frame=rex::graphics::ApiFrameMarker();
+  if (REXCVAR_GET(native_direct_execution)) {
+    // GPU-less guest D3D never submits this buffer; present directly.
+    auto* graphics_system =
+        static_cast<graphics::GraphicsSystem*>(REX_KERNEL_STATE()->emulator()->graphics_system());
+    if (graphics_system && graphics_system->command_processor()) {
+      graphics_system->command_processor()->PostDirectSwap(frontbuffer_physical_address, *width,
+                                                           *height, api_frame);
+    }
+  }
+  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, api_frame==UINT32_MAX?4:5);
   dwords[offset++] = rex::graphics::xenos::kSwapSignature;
   dwords[offset++] = frontbuffer_physical_address;
 
   dwords[offset++] = *width;
   dwords[offset++] = *height;
+  if(api_frame!=UINT32_MAX)dwords[offset++]=api_frame;
 
   // Fill the rest of the buffer with NOP packets.
   for (uint32_t i = offset; i < 64; i++) {

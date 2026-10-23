@@ -165,6 +165,17 @@ X_RESULT SDLInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
   return X_ERROR_SUCCESS;
 }
 
+X_RESULT SDLInputDriver::GetHostState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  if (!attached_window_ || !sdl_events_initialized_ || !SDL_Gamepad_initialized_ ||
+      user_index >= HID_SDL_USER_COUNT || !out_state) return X_ERROR_DEVICE_NOT_CONNECTED;
+  QueueControllerUpdate();
+  auto guard = DrainAndLock();
+  auto* controller = GetControllerState(user_index);
+  if (!controller) return X_ERROR_DEVICE_NOT_CONNECTED;
+  *out_state = controller->state;
+  return X_ERROR_SUCCESS;
+}
+
 X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   assert(sdl_events_initialized_ && SDL_Gamepad_initialized_);
   if (user_index >= HID_SDL_USER_COUNT) {
@@ -193,6 +204,7 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     controller->state_changed = false;
   }
   std::memcpy(out_state, &controller->state, sizeof(*out_state));
+  if (!REXCVAR_GET(guide_button)) out_state->gamepad.buttons = uint16_t(out_state->gamepad.buttons) & ~X_INPUT_GAMEPAD_GUIDE;
   if (!is_active) {
     // Simulate an "untouched" controller. When we become active again the
     // pressed buttons aren't lost and will be visible again.
@@ -579,7 +591,7 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
   auto xbutton = xbutton_lookup.at(event.gbutton.button);
   // Pressed or released?
   if (event.gbutton.down) {
-    if (xbutton == X_INPUT_GAMEPAD_GUIDE && !REXCVAR_GET(guide_button)) {
+    if (xbutton == X_INPUT_GAMEPAD_GUIDE && event.gbutton.button != SDL_GAMEPAD_BUTTON_GUIDE && !REXCVAR_GET(guide_button)) {
       return;
     }
     xbuttons |= xbutton;

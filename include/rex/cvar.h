@@ -91,6 +91,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -104,10 +105,16 @@ namespace rex::cvar {
 //=============================================================================
 
 std::vector<std::string> Init(int argc, char** argv);
-void LoadConfig(const std::filesystem::path& config_path);
+// Applications may normalize selectors and remove settings for inactive
+// backends before registry validation. Explicit command-line values still win.
+using ConfigValues = std::map<std::string, std::string>;
+using ConfigTransform = std::function<void(ConfigValues&)>;
+void LoadConfig(const std::filesystem::path& config_path,
+                const ConfigTransform& transform = {});
 void ApplyEnvironment();
 void FinalizeInit();
 bool IsFinalized();
+bool IsCommandLineOverride(std::string_view name);
 void SaveConfig(const std::filesystem::path& config_path);
 
 //=============================================================================

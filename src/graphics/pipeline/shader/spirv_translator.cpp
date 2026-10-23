@@ -21,6 +21,7 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
@@ -152,6 +153,7 @@ void SpirvShaderTranslator::Reset() {
   var_main_kill_pixel_ = spv::NoResult;
   var_main_fragment_depth_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
+  std::fill(output_fragment_data_.begin(), output_fragment_data_.end(), spv::NoResult);
 
   main_switch_op_.reset();
   main_switch_next_pc_phi_operands_.clear();
@@ -253,6 +255,9 @@ void SpirvShaderTranslator::StartTranslation() {
   spv::Id type_uint4_array_4 =
       builder_->makeArrayType(type_uint4_, builder_->makeUintConstant(4), sizeof(uint32_t) * 4);
   builder_->addDecoration(type_uint4_array_4, spv::DecorationArrayStride, sizeof(uint32_t) * 4);
+  spv::Id type_uint4_array_8 =
+      builder_->makeArrayType(type_uint4_, builder_->makeUintConstant(8), sizeof(uint32_t) * 4);
+  builder_->addDecoration(type_uint4_array_8, spv::DecorationArrayStride, sizeof(uint32_t) * 4);
   const SystemConstant system_constants[] = {
       {"flags", offsetof(SystemConstants, flags), type_uint_},
       {"vertex_index_load_address", offsetof(SystemConstants, vertex_index_load_address),
@@ -305,6 +310,8 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
+      {"texture_integer_scale_bits", offsetof(SystemConstants, texture_integer_scale_bits),
+       type_uint4_array_8},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));
@@ -2207,6 +2214,14 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
           spv::NoPrecision);
       auto remap_vertex_index_to_float = [this, vertex_base_index, vertex_index_min,
                                           vertex_index_max](spv::Id index) {
+        if (REXCVAR_GET(vulkan_unclamped_vertex_indices) && IsSpirvVertexShader()) {
+          return builder_->createUnaryOp(
+              spv::OpConvertSToF, type_float_,
+              builder_->createBinOp(
+                  spv::OpIAdd, type_int_,
+                  builder_->createUnaryOp(spv::OpBitcast, type_int_, index),
+                  vertex_base_index));
+        }
         index = builder_->createBinOp(
             spv::OpIAdd, type_uint_, index,
             builder_->createUnaryOp(spv::OpBitcast, type_uint_, vertex_base_index));
@@ -2850,7 +2865,8 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
                                      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
-      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible) {
+      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible ||
+      GetSpirvShaderModification().pixel.debug_gow3_scene_composite_input) {
     input_fragment_coordinates_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                            type_float4_, "gl_FragCoord");
     builder_->addDecoration(input_fragment_coordinates_, spv::DecorationBuiltIn,
@@ -2891,8 +2907,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
 
   if (!edram_fragment_shader_interlock_) {
     // Framebuffer color attachment outputs.
-    std::fill(output_or_var_fragment_data_.begin(), output_or_var_fragment_data_.end(),
-              spv::NoResult);
+    std::fill(output_fragment_data_.begin(), output_fragment_data_.end(), spv::NoResult);
     if (!is_depth_only_fragment_shader_) {
       static const char* const kFragmentDataOutputNames[] = {
           "xe_out_fragment_data_0",
@@ -2907,7 +2922,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
         spv::Id output_fragment_data_rt =
             builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput, type_float4_,
                                      kFragmentDataOutputNames[color_target_index]);
-        output_or_var_fragment_data_[color_target_index] = output_fragment_data_rt;
+        output_fragment_data_[color_target_index] = output_fragment_data_rt;
         builder_->addDecoration(output_fragment_data_rt, spv::DecorationLocation,
                                 int(color_target_index));
         // Make invariant as pixel shaders may be used for various precise
@@ -2957,36 +2972,39 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     // to the execution mask GPUs naturally have.
   }
 
+  // Keep guest color exports in function storage for both rendering paths.
+  // SPIR-V output variables are write-only, but alpha test and alpha-to-
+  // coverage need to read the exported color before it is committed.
+  std::fill(output_or_var_fragment_data_.begin(), output_or_var_fragment_data_.end(),
+            spv::NoResult);
+  var_main_fsi_color_written_ = spv::NoResult;
+  uint32_t color_targets_written = current_shader().writes_color_targets();
+  if (color_targets_written && !is_depth_only_fragment_shader_) {
+    static const char* const kFragmentDataVariableNames[] = {
+        "xe_var_fragment_data_0",
+        "xe_var_fragment_data_1",
+        "xe_var_fragment_data_2",
+        "xe_var_fragment_data_3",
+    };
+    uint32_t color_targets_remaining = color_targets_written;
+    uint32_t color_target_index;
+    while (rex::bit_scan_forward(color_targets_remaining, &color_target_index)) {
+      color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
+      output_or_var_fragment_data_[color_target_index] = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+          kFragmentDataVariableNames[color_target_index], const_float4_0_);
+    }
+    var_main_fsi_color_written_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
+                                 "xe_var_color_written", const_uint_0_);
+  }
+
   if (edram_fragment_shader_interlock_) {
-    // Initialize color output variables with fragment shader interlock.
-    std::fill(output_or_var_fragment_data_.begin(), output_or_var_fragment_data_.end(),
-              spv::NoResult);
     var_main_fragment_depth_ = spv::NoResult;
-    var_main_fsi_color_written_ = spv::NoResult;
     if (current_shader().writes_depth()) {
       var_main_fragment_depth_ =
           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
                                    "xe_var_fragment_depth", const_float_0_);
-    }
-    uint32_t color_targets_written = current_shader().writes_color_targets();
-    if (color_targets_written) {
-      static const char* const kFragmentDataVariableNames[] = {
-          "xe_var_fragment_data_0",
-          "xe_var_fragment_data_1",
-          "xe_var_fragment_data_2",
-          "xe_var_fragment_data_3",
-      };
-      uint32_t color_targets_remaining = color_targets_written;
-      uint32_t color_target_index;
-      while (rex::bit_scan_forward(color_targets_remaining, &color_target_index)) {
-        color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
-        output_or_var_fragment_data_[color_target_index] = builder_->createVariable(
-            spv::NoPrecision, spv::StorageClassFunction, type_float4_,
-            kFragmentDataVariableNames[color_target_index], const_float4_0_);
-      }
-      var_main_fsi_color_written_ =
-          builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
-                                   "xe_var_fsi_color_written", const_uint_0_);
     }
   }
 
@@ -3250,13 +3268,6 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   }
 
   if (!edram_fragment_shader_interlock_) {
-    // Initialize the colors for safety.
-    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-      spv::Id output_fragment_data_rt = output_or_var_fragment_data_[i];
-      if (output_fragment_data_rt != spv::NoResult) {
-        builder_->createStore(const_float4_0_, output_fragment_data_rt);
-      }
-    }
     if (output_fragment_depth_ != spv::NoResult) {
       // Keep output deterministic if oDepth is not written on a control flow
       // path.
@@ -3601,7 +3612,7 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
       assert_not_zero(used_write_mask);
       assert_true(current_shader().writes_color_target(result.storage_index));
       target_pointer = output_or_var_fragment_data_[result.storage_index];
-      if (edram_fragment_shader_interlock_) {
+      if (var_main_fsi_color_written_ != spv::NoResult) {
         assert_true(var_main_fsi_color_written_ != spv::NoResult);
         builder_->createStore(
             builder_->createBinOp(

@@ -18,6 +18,7 @@
 #include <rex/ui/window.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 
@@ -27,6 +28,7 @@
 #endif
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
+REXCVAR_DEFINE_BOOL(mnk_trace_input, false, "Input diagnostics", "Log bounded keyboard focus and controller polling diagnostics");
 REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
@@ -44,6 +46,10 @@ REXCVAR_DEFINE_STRING(keybind_lstick_down, "S", "Input/Keybinds/Controller", "Le
 REXCVAR_DEFINE_STRING(keybind_lstick_left, "A", "Input/Keybinds/Controller", "Left stick left");
 REXCVAR_DEFINE_STRING(keybind_lstick_right, "D", "Input/Keybinds/Controller", "Left stick right");
 REXCVAR_DEFINE_STRING(keybind_lstick_press, "C", "Input/Keybinds/Controller", "Left stick press");
+REXCVAR_DEFINE_STRING(keybind_rstick_up, "", "Input/Keybinds/Controller", "Right stick up");
+REXCVAR_DEFINE_STRING(keybind_rstick_down, "", "Input/Keybinds/Controller", "Right stick down");
+REXCVAR_DEFINE_STRING(keybind_rstick_left, "", "Input/Keybinds/Controller", "Right stick left");
+REXCVAR_DEFINE_STRING(keybind_rstick_right, "", "Input/Keybinds/Controller", "Right stick right");
 REXCVAR_DEFINE_STRING(keybind_rstick_press, "MMB", "Input/Keybinds/Controller",
                       "Right stick press");
 REXCVAR_DEFINE_STRING(keybind_dpad_up, "Up", "Input/Keybinds/Controller", "D-pad up");
@@ -136,6 +142,12 @@ X_RESULT MnkInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
 }
 
 X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  if (REXCVAR_GET(mnk_trace_input)) {
+    static std::atomic_uint samples{0};
+    if (samples.fetch_add(1) < 16)
+      REXLOG_INFO("MnK input trace GetState: user={} configured={} enabled={} active={} focus={}",
+                  user_index, UserIndex(), IsEnabled(), is_active(), has_focus_);
+  }
   if (!IsEnabled() || user_index != UserIndex()) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -200,16 +212,32 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
 
   double sensitivity = REXCVAR_GET(mnk_sensitivity);
   constexpr double kBaseScale = 200.0;
-  int32_t rx = static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale);
-  int32_t ry = static_cast<int32_t>(-mouse_dy_ * sensitivity * kBaseScale);
+  // Accumulate in a wider type so mouse motion plus held keys cannot overflow
+  // before the final controller-range clamp. Opposing keys cancel each other.
+  int64_t rx = static_cast<int64_t>(mouse_dx_ * sensitivity * kBaseScale);
+  int64_t ry = static_cast<int64_t>(-double(mouse_dy_) * sensitivity * kBaseScale);
   mouse_dx_ = 0;
   mouse_dy_ = 0;
 
-  auto clamp16 = [](int32_t v) -> int16_t {
-    return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
+    rx -= INT16_MAX;
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_right)))
+    rx += INT16_MAX;
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_up)))
+    ry += INT16_MAX;
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
+    ry -= INT16_MAX;
+
+  auto clamp16 = [](int64_t v) -> int16_t {
+    return static_cast<int16_t>(std::clamp(v, int64_t(INT16_MIN), int64_t(INT16_MAX)));
   };
 
   packet_number_++;
+  if (buttons && REXCVAR_GET(mnk_trace_input)) {
+    static std::atomic_uint samples{0};
+    if (samples.fetch_add(1) < 64)
+      REXLOG_INFO("MnK input trace buttons: user={} packet={} buttons=0x{:04X}", user_index, packet_number_, buttons);
+  }
 
   if (out_state) {
     out_state->packet_number = packet_number_;
@@ -233,6 +261,12 @@ X_RESULT MnkInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibrat
 
 X_RESULT MnkInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
                                       X_INPUT_KEYSTROKE* out_keystroke) {
+  if (REXCVAR_GET(mnk_trace_input)) {
+    static std::atomic_uint samples{0};
+    if (samples.fetch_add(1) < 16)
+      REXLOG_INFO("MnK input trace GetKeystroke: user={} configured={} enabled={} active={} focus={}",
+                  user_index, UserIndex(), IsEnabled(), is_active(), has_focus_);
+  }
   if (!IsEnabled() || user_index != UserIndex()) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -306,6 +340,12 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
 }
 
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
+  if (REXCVAR_GET(mnk_trace_input)) {
+    static std::atomic_uint samples{0};
+    if (samples.fetch_add(1) < 256)
+      REXLOG_INFO("MnK input trace KeyDown: vk={} enabled={} active={} focus={}",
+                  uint32_t(e.virtual_key()), IsEnabled(), is_active(), has_focus_);
+  }
   if (!IsEnabled() || !has_focus_)
     return;
   std::lock_guard lock(state_mutex_);
@@ -314,6 +354,9 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
 }
 
 void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+  if (REXCVAR_GET(mnk_trace_input))
+    REXLOG_INFO("MnK input trace KeyUp: vk={} enabled={} active={} focus={}",
+                uint32_t(e.virtual_key()), IsEnabled(), is_active(), has_focus_);
   if (!IsEnabled())
     return;
   std::lock_guard lock(state_mutex_);
@@ -374,6 +417,7 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
 void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   std::lock_guard lock(state_mutex_);
   has_focus_ = false;
+  if (REXCVAR_GET(mnk_trace_input)) REXLOG_INFO("MnK input trace focus lost");
   std::memset(key_down_, 0, sizeof(key_down_));
   mouse_dx_ = 0;
   mouse_dy_ = 0;
@@ -387,6 +431,7 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
 void MnkInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
   std::lock_guard lock(state_mutex_);
   has_focus_ = true;
+  if (REXCVAR_GET(mnk_trace_input)) REXLOG_INFO("MnK input trace focus gained");
 }
 
 }  // namespace rex::input::mnk

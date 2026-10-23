@@ -11,7 +11,9 @@
  */
 
 #include <cstdint>
+#include <mutex>
 
+#include <rex/graphics/async_shader_translation.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/vulkan/device.h>
@@ -28,9 +30,11 @@ class VulkanShader : public SpirvShader {
 
     VkShaderModule GetOrCreateShaderModule();
     VkShaderModule shader_module() const { return shader_module_; }
+    AsyncShaderTranslation& translation_work() { return translation_work_; }
 
    private:
     VkShaderModule shader_module_ = VK_NULL_HANDLE;
+    AsyncShaderTranslation translation_work_;
   };
 
   explicit VulkanShader(const ui::vulkan::VulkanDevice* vulkan_device,
@@ -44,18 +48,24 @@ class VulkanShader : public SpirvShader {
   // incompatible layout has been bound.
   size_t GetTextureBindingLayoutUserUID() const { return texture_binding_layout_user_uid_; }
   size_t GetSamplerBindingLayoutUserUID() const { return sampler_binding_layout_user_uid_; }
-  // Modifications of the same shader can be translated on different threads.
-  // The "set" function must only be called if "enter" returned true - these are
-  // set up only once.
+  // Layout IDs are installed on the GPU command thread after a translation's
+  // completion has published the shared resource bindings.
+  bool binding_layout_user_uids_ready() const {
+    return binding_layout_user_uids_set_up_.test(std::memory_order_relaxed);
+  }
   bool EnterBindingLayoutUserUIDSetup() { return !binding_layout_user_uids_set_up_.test_and_set(); }
   void SetTextureBindingLayoutUserUID(size_t uid) { texture_binding_layout_user_uid_ = uid; }
   void SetSamplerBindingLayoutUserUID(size_t uid) { sampler_binding_layout_user_uid_ = uid; }
+  // Variants share the first successful translation's resource bindings.
+  // Serialize writers so no variant can publish before those bindings exist.
+  std::mutex& translation_mutex() { return translation_mutex_; }
 
  protected:
   Translation* CreateTranslationInstance(uint64_t modification) override;
 
  private:
   const ui::vulkan::VulkanDevice* vulkan_device_;
+  std::mutex translation_mutex_;
 
   std::atomic_flag binding_layout_user_uids_set_up_ = ATOMIC_FLAG_INIT;
   size_t texture_binding_layout_user_uid_ = 0;

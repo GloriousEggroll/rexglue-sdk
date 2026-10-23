@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <rex/graphics/native_completion_markers.h>
+
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -31,11 +33,18 @@
 #include <rex/thread.h>
 #include <rex/ui/presenter.h>
 
+#include <rex/graphics/shader_storage_progress.h>
+#include <rex/graphics/frame_limiter.h>
+
 namespace rex::stream {
 class ByteStream;
 }  // namespace rex::stream
 
 namespace rex::graphics {
+// Optional CPU API frame marker carried in the host-generated swap packet.
+// Thread-local scope prevents another guest thread from changing its identity.
+uint32_t ExchangeApiFrameMarker(uint32_t frame);
+uint32_t ApiFrameMarker();
 
 class GraphicsSystem;
 class Shader;
@@ -75,6 +84,9 @@ enum class GammaRampType {
 };
 
 class CommandProcessor {
+  ShaderStorageProgress shader_storage_progress_;
+  FrameLimiter frame_limiter_;
+
  public:
   enum class SwapPostEffect {
     kNone,
@@ -88,6 +100,8 @@ class CommandProcessor {
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
 
+  ShaderStorageProgress& shader_storage_progress() { return shader_storage_progress_; }
+
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
 
@@ -95,6 +109,24 @@ class CommandProcessor {
   virtual void Shutdown();
 
   void CallInThread(std::function<void()> fn);
+
+  // Direct execution (no PM4 ring): the guest's D3D runs GPU-less and the
+  // native renderer posts its work here. Thread-safe; runs in order on the
+  // worker thread and wakes it when idle.
+  void PostDirectWork(std::function<void()> fn);
+  // Installed once before direct work is posted. Called on the worker thread
+  // while it has no work; returns true while GPU work is still outstanding,
+  // so the worker keeps polling instead of sleeping.
+  void SetDirectIdleHook(std::function<bool()> hook);
+  bool direct_execution() const { return direct_idle_hook_.load() != nullptr; }
+  // Direct execution: present a guest VdSwap without an XE_SWAP packet. Posts
+  // the swap behind all previously posted work (frame limiter, IssueSwap).
+  void PostDirectSwap(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height, uint32_t api_frame);
+  // Optional: receives each direct swap's work item instead of posting it, so
+  // a renderer that plans asynchronously can post it after the frame's own
+  // work. Returning false posts the item immediately as usual.
+  using DirectSwapRouter = std::function<bool(std::function<void()>&)>;
+  void SetDirectSwapRouter(DirectSwapRouter router);
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
@@ -117,8 +149,14 @@ class CommandProcessor {
                                        bool blocking);
 
   virtual void RequestFrameTrace(const std::filesystem::path& root_path);
+  // Zero-based swap sequence, for pairing a CPU API capture with the exact
+  // preceding GPU state. A past request fails instead of capturing another frame.
+  void RequestFrameTraceAtFrame(const std::filesystem::path& root_path,uint32_t frame);
   virtual void BeginTracing(const std::filesystem::path& root_path);
   virtual void EndTracing();
+  // Diagnostic replay inspection only, called on the command processor thread.
+  // Requires a new directory; writes a state-only trace with explicit provenance.
+  bool ExportDiagnosticSnapshot(const std::filesystem::path& directory,uint32_t title_id);
 
   virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
 
@@ -144,6 +182,12 @@ class CommandProcessor {
   bool Restore(::rex::stream::ByteStream* stream);
 
  protected:
+  // Opt-in immutable identity of the PM4 draw currently being decoded. The
+  // derived backend can validate native ownership without trusting FIFO draw
+  // counts or addresses that may have been reused by the guest.
+  bool capture_native_draw_packets_ = false;
+  uint32_t native_draw_packet_address_ = 0;
+  std::vector<uint8_t> native_draw_packet_bytes_;
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
     xenos::Endian endianness = xenos::Endian::kNone;
@@ -182,6 +226,30 @@ class CommandProcessor {
   virtual void MakeCoherent();
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
+  // Executed on the command thread after predicate checks, before a type-3
+  // packet can observe or publish effects of preceding native GPU work.
+  // Strict scene backends reject unsupported or failed work before the decoder
+  // drops a draw, fabricates a query, or advances a failed packet boundary.
+  virtual void OnPacketExecutionFailure(const char* reason) {}
+  virtual void PrepareForPacket(uint32_t opcode, uint32_t count) {}
+  // Narrow known title pair only; the original scalar decoder remains the
+  // fallback. A returned guard is released before the next packet is decoded.
+  bool native_immediate_marker_pairs_enabled_=false;
+  virtual std::shared_ptr<void> PrepareNativeImmediateMarkerPair(
+      const NativeCompletionMarkerPair&) {return {};}
+  bool TryExecuteNativeImmediateMarkerPair(memory::RingBuffer* reader);
+  void WriteEventShdValue(uint32_t initiator,uint32_t address,uint32_t value);
+
+  // Observation after the original pre-packet completion and operand reads,
+  // before the existing register/store effects. No callback can alter decoding.
+  bool observe_decoded_event_write_shd_=false;
+  virtual void ObserveDecodedEventWriteShd(uint32_t packet,uint32_t count,
+      uint32_t initiator,uint32_t address,uint32_t value,uintptr_t command_buffer,
+      uint32_t capacity,uint32_t end_offset) noexcept {}
+  // Decoded operands are copied before this hook. It runs before the first
+  // memory/register read, MakeCoherent effect or predicate evaluation.
+  virtual void PrepareForRegisterWait(uint32_t count, uint32_t info, uint32_t address,
+                                     uint32_t reference, uint32_t mask, uint32_t delay) {}
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
@@ -235,6 +303,9 @@ class CommandProcessor {
                          IndexBufferInfo* index_buffer_info, bool major_mode_explicit) = 0;
   virtual bool IssueCopy() = 0;
 
+  void TraceDrawState(xenos::PrimitiveType prim_type, uint32_t index_count,
+                      const IndexBufferInfo* index_buffer_info);
+
   // "Actual" is for the command processor thread, to be read by the
   // implementations.
   SwapPostEffect GetActualSwapPostEffect() const { return swap_post_effect_actual_; }
@@ -245,6 +316,29 @@ class CommandProcessor {
   ReadbackResolveMode GetReadbackResolveMode(bool legacy_readback_resolve_enabled) const;
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
+
+  void RecordDrawSubmitted() { ++command_summary_.draws_submitted; }
+  void RecordDrawSkippedNoEffect() { ++command_summary_.draws_no_effect; }
+  void RecordDrawSkippedSurfacePitchZero() {
+    ++command_summary_.draws_no_effect;
+    ++command_summary_.draws_no_effect_surface_pitch_zero;
+  }
+  void RecordDrawSkippedNoRasterizationOrMemexport(
+      bool edram_mode, bool vertex_multipass, bool surface_pitch_zero,
+      bool cull_both) {
+    ++command_summary_.draws_no_effect;
+    ++command_summary_.draws_no_effect_no_rasterization_or_memexport;
+    command_summary_.draws_no_effect_edram_mode += edram_mode;
+    command_summary_.draws_no_effect_vertex_multipass += vertex_multipass;
+    command_summary_.draws_no_effect_surface_pitch_zero += surface_pitch_zero;
+    command_summary_.draws_no_effect_cull_both += cull_both;
+  }
+  void RecordDrawSkippedZeroVertices() {
+    ++command_summary_.draws_no_effect;
+    ++command_summary_.draws_no_effect_zero_vertices;
+  }
+  void RecordDrawSkippedAsync() { ++command_summary_.draws_async_placeholder; }
+  void RecordCopyAttempt() { ++command_summary_.copy_attempts; }
 
   memory::Memory* memory_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;
@@ -260,11 +354,21 @@ class CommandProcessor {
   TraceState trace_state_ = TraceState::kDisabled;
   std::filesystem::path trace_stream_path_;
   std::filesystem::path trace_frame_path_;
+  uint32_t trace_requested_frame_ = UINT32_MAX;
+  uint32_t trace_history_snapshots_left_ = 0;
+  uint32_t external_frame_number_ = UINT32_MAX;
 
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
 
   std::queue<std::function<void()>> pending_fns_;
+
+  bool RunDirectWork();
+  std::mutex direct_work_mutex_;
+  std::vector<std::function<void()>> direct_work_;
+  std::atomic<bool> direct_work_pending_{false};
+  std::atomic<std::shared_ptr<std::function<bool()>>> direct_idle_hook_;
+  std::atomic<std::shared_ptr<DirectSwapRouter>> direct_swap_router_;
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
@@ -288,6 +392,43 @@ class CommandProcessor {
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
+
+  struct CommandSummary {
+    uint64_t type0_constant_packets = 0, type0_constant_words = 0;
+    uint64_t type0_bulk_packets = 0, type0_bulk_words = 0;
+    bool movie_yuv = false;
+    uint64_t type3_packets = 0;
+    uint64_t indirect_buffers = 0;
+    uint64_t predicated_packets = 0;
+    uint64_t predicated_packets_skipped = 0;
+    uint64_t unsupported_packets = 0;
+    uint64_t draw_packets = 0;
+    uint64_t draw_issue_attempts = 0;
+    uint64_t draw_issue_failures = 0;
+    uint64_t draws_viz_query_skipped = 0;
+    uint64_t draws_submitted = 0;
+    uint64_t draws_no_effect = 0;
+    uint64_t draws_no_effect_surface_pitch_zero = 0;
+    uint64_t draws_no_effect_no_rasterization_or_memexport = 0;
+    uint64_t draws_no_effect_edram_mode = 0;
+    uint64_t draws_no_effect_vertex_multipass = 0;
+    uint64_t draws_no_effect_cull_both = 0;
+    uint64_t draws_no_effect_zero_vertices = 0;
+    uint64_t draws_async_placeholder = 0;
+    uint64_t copy_attempts = 0;
+    uint64_t occlusion_queries = 0;
+    uint64_t memexport_full_readbacks = 0;
+    uint64_t submissions = 0;
+    uint64_t submission_us = 0;
+    uint64_t submission_replay_us = 0;
+    uint64_t submission_queue_us = 0;
+    uint64_t fence_waits = 0;
+    uint64_t fence_wait_us = 0;
+  };
+  CommandSummary command_summary_;
+  uint32_t draw_trace_frame_ = UINT32_MAX;
+  uint64_t draw_trace_index_ = 0;
+  std::vector<uint32_t> draw_trace_memory_addresses_;
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;

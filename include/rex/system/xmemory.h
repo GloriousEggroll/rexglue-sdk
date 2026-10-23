@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -20,6 +21,8 @@
 #include <rex/memory/utils.h>
 #include <rex/ppc/context.h>  // PPCFunc type (minimal header)
 #include <rex/system/mmio_handler.h>
+#include <rex/system/physical_snapshot.h>
+#include <rex/system/physical_allocation_observation.h>
 #include <rex/thread/mutex.h>
 
 namespace rex::stream {
@@ -215,6 +218,11 @@ class BaseHeap {
   // range.
   rex::memory::PageAccess QueryRangeAccess(uint32_t low_address, uint32_t high_address);
 
+  // Bounded metadata check for certificate misses. Inspect exactly the pages
+  // touched by the requested interval, including partial edge pages; do not
+  // scan to the end of their potentially much larger containing allocation.
+  bool IsRangeCommittedReadable(uint32_t low_address,uint32_t high_address);
+
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 
@@ -225,6 +233,29 @@ class BaseHeap {
 
   void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
                   uint32_t heap_size, uint32_t page_size, uint32_t host_address_offset = 0);
+
+  void InvalidateAllocationObservations(uint32_t address,uint64_t bytes) noexcept;
+
+  // QueryRangeAccess caches results against access_generation_. Generations
+  // come from one process-wide counter, so a later heap at the same address
+  // never repeats one. Results are not cached while any mutation is active.
+  static uint64_t NextAccessGeneration() noexcept;
+  class AccessMutation {
+   public:
+    explicit AccessMutation(BaseHeap& heap) noexcept : heap_(heap) {
+      heap_.access_mutations_.fetch_add(1);
+    }
+    ~AccessMutation() {
+      heap_.access_generation_.store(NextAccessGeneration());
+      heap_.access_mutations_.fetch_sub(1);
+    }
+    AccessMutation(const AccessMutation&) = delete;
+    AccessMutation& operator=(const AccessMutation&) = delete;
+   private:
+    BaseHeap& heap_;
+  };
+  std::atomic<uint64_t> access_generation_{NextAccessGeneration()};
+  std::atomic<uint32_t> access_mutations_{0};
 
   memory::Memory* memory_;
   uint8_t* membase_;
@@ -283,6 +314,10 @@ class PhysicalHeap : public BaseHeap {
 
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                              bool enable_invalidation_notifications, bool enable_data_providers);
+  // Checked variant: failed arms retain fault-repair ownership, but cannot
+  // satisfy a subsequent arm without a successful OS protection call.
+  bool TryEnableAccessCallbacks(uint32_t physical_address, uint32_t length,
+                                bool enable_invalidation_notifications, bool enable_data_providers);
   // Returns true if any page in the range was watched.
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
@@ -300,6 +335,9 @@ class PhysicalHeap : public BaseHeap {
     // Whether writing to each page should result trigger invalidation
     // callbacks.
     uint64_t notify_on_invalidation;
+    // An OS protection may fail after changing only part of its range. Keep
+    // notification ownership for possible RO pages, but force a checked rearm.
+    uint64_t unconfirmed_write_protection;
   };
   // Protected by global_critical_region. Flags for each 64 system pages,
   // interleaved as blocks, so bit scan can be used to quickly extract ranges.
@@ -329,6 +367,64 @@ class Memory {
   // This may fail if the host address space could not be reserved or the
   // mapping to the file system fails.
   bool Initialize();
+
+  // Optional byte certification. Configure before guest launch; unsupported
+  // platforms/ranges and any uncertainty use the caller's exact-copy fallback.
+  bool SetCertifiedPhysicalSnapshotsEnabled(bool enabled);
+  void SetCertifiedPhysicalFaultFastPath(bool enabled);
+  void SetCertifiedPhysicalSnapshotBatchQueries(bool enabled);
+  void SetCertifiedPhysicalSnapshotDiagnostics(bool enabled);
+  CertifiedPhysicalSnapshotPtr TryGetCertifiedPhysicalSnapshot(
+      uint32_t physical_address, uint32_t length,
+      const CertifiedPhysicalSnapshotPtr& previous = {});
+  // Reuse-only validation under the same all-alias/global mutation lock. An
+  // invalid token returns empty without permission queries, copying or arming.
+  CertifiedPhysicalSnapshotPtr ValidatePhysicalSnapshot(
+      uint32_t physical_address,uint32_t length,
+      const CertifiedPhysicalSnapshotPtr& previous);
+  // Bounded per-view admission under ONE existing mutation/protection lock.
+  // ValidateOnly entries never fall through to capture. No guest span escapes.
+  std::vector<CertifiedPhysicalSnapshotPtr> TryGetCertifiedPhysicalSnapshots(
+      std::span<const PhysicalSnapshotBatchRequest> requests);
+  PhysicalSnapshotTracker::Stats certified_physical_snapshot_stats();
+  // Lock-free; zero when certification is unavailable. See
+  // PhysicalSnapshotTracker::mutation_generation for the reuse contract.
+  uint64_t CertifiedPhysicalSnapshotGeneration() const noexcept {
+    if(!snapshot_tracking_installed_.load(std::memory_order_acquire)||!certified_snapshots_)return 0;
+    return certified_snapshots_->mutation_generation();
+  }
+
+  // Kernel writes do not reliably produce user-mode protection faults. Keep
+  // this guard alive through every synchronous OS write, including failures.
+  // Retirement invalidates page-rounded physical destinations before removing
+  // the active writer, under the global critical region. It does not unprotect
+  // memory or require byte certification; even a failed/empty write may invalidate.
+  class ExternalHostWrite {
+   public:
+    ExternalHostWrite() = default;
+    ExternalHostWrite(const ExternalHostWrite&) = delete;
+    ExternalHostWrite& operator=(const ExternalHostWrite&) = delete;
+    ExternalHostWrite(ExternalHostWrite&& other) noexcept
+        : memory_(std::exchange(other.memory_,nullptr)), host_(other.host_),
+          length_(other.length_), ready_(other.ready_), snapshot_tracked_(other.snapshot_tracked_) {}
+    ~ExternalHostWrite();
+    explicit operator bool() const noexcept { return ready_; }
+   private:
+    friend class Memory;
+    Memory* memory_=nullptr; uintptr_t host_=0; size_t length_=0; bool ready_=true;
+    bool snapshot_tracked_=false;
+  };
+  static constexpr size_t kMaxExternalHostWrites=4096;
+  ExternalHostWrite BeginExternalHostWrite(void* destination,size_t length);
+  // Exact active OS-writer overlap, independent of optional byte certificates.
+  // Hold the global critical region through the subsequent arm/copy to prevent
+  // a new overlapping writer from being admitted after this check.
+  bool IsExternalHostWritePending(uint32_t physical_address,uint32_t length);
+
+  // Observe one currently committed/writable parent physical allocation.
+  // A token is invalidated before overlapping allocator mutation. It is not
+  // a pin; hold the global memory lock through synchronous authorized effects.
+  PhysicalAllocationObservations::Ptr ObservePhysicalAllocation(uint32_t address,uint32_t bytes);
 
   // Resets all memory to zero and resets all allocations.
   void Reset();
@@ -460,6 +556,9 @@ class Memory {
   void EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
                                            bool enable_invalidation_notifications,
                                            bool enable_data_providers);
+  bool TryEnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
+                                              bool enable_invalidation_notifications,
+                                              bool enable_data_providers);
 
   // Forces triggering of watch callbacks for a virtual address range if pages
   // are watched there and unwatching them. Returns whether any page was
@@ -518,6 +617,13 @@ class Memory {
   bool HasAnyFunctionTable() const;
 
  private:
+  bool IsSnapshotHostRange(void* base,size_t length) const noexcept;
+  std::unique_lock<std::recursive_mutex> AcquireSnapshotMutationLock();
+  bool ProtectHostMemory(void* base,size_t length,PageAccess access,
+                         PageAccess* previous=nullptr);
+  void* AllocateHostMemory(void* base,size_t length,AllocationType type,PageAccess access);
+  void InvalidateHostSnapshot(void* base,size_t length);
+  void EndExternalHostWrite(uintptr_t host,size_t length,bool snapshot_tracked);
   int MapViews(uint8_t* mapping_base);
   void UnmapViews();
 
@@ -525,6 +631,7 @@ class Memory {
 
   bool AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                void* host_address, bool is_write);
+  static bool CertifiedAccessViolationOwnedThunk(void* context,void* host_address,bool is_write);
   static bool AccessViolationCallbackThunk(
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
       void* host_address, bool is_write);
@@ -581,6 +688,19 @@ class Memory {
   rex::thread::global_critical_region global_critical_region_;
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
+  // Published once before guest launch, never destroyed while users can fault.
+  // A disabled tracker may retain repair ownership after a failed OS restore.
+  PhysicalAllocationObservations allocation_observations_;
+  std::unique_ptr<PhysicalSnapshotTracker> certified_snapshots_;
+  std::atomic<bool> snapshot_tracking_installed_{false};
+  // Counts physical OS writers even before optional tracker installation.
+  // Enabling is refused until previously untracked syscalls have returned.
+  uint32_t external_snapshot_writers_=0;
+  // Only host ranges, never byte owners. Duplicate/overlapping guards each
+  // retain a record until their own syscall has returned. Protected by global.
+  std::vector<std::pair<uintptr_t,size_t>> external_host_writes_;
+  bool certified_fault_fastpath_=false;
+  bool certified_batch_queries_=false,certified_diagnostics_=false;
 };
 
 }  // namespace rex::memory

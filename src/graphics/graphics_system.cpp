@@ -353,15 +353,18 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
   if (!REXCVAR_GET(store_shaders)) {
     return;
   }
+  command_processor_->shader_storage_progress().Begin(ShaderStorageProgress::Phase::kReading);
   if (blocking) {
     if (command_processor_->is_paused()) {
       // Safe to run on any thread while the command processor is paused, no
       // race condition.
       command_processor_->InitializeShaderStorage(cache_root, title_id, true);
+      command_processor_->shader_storage_progress().Finish();
     } else {
       rex::thread::Fence fence;
       command_processor_->CallInThread([this, cache_root, title_id, &fence]() {
         command_processor_->InitializeShaderStorage(cache_root, title_id, true);
+        command_processor_->shader_storage_progress().Finish();
         fence.Signal();
       });
       fence.Wait();
@@ -369,6 +372,7 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
   } else {
     command_processor_->CallInThread([this, cache_root, title_id]() {
       command_processor_->InitializeShaderStorage(cache_root, title_id, false);
+      command_processor_->shader_storage_progress().Finish();
     });
   }
 }

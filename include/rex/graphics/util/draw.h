@@ -354,6 +354,9 @@ union ResolveEdramInfo {
     // of the resolve region with the contents of the first surely covered
     // column / row with resolution scaling.
     uint32_t fill_half_pixel_offset : 1;
+    // Decode PWL gamma before averaging or converting full gamma color
+    // resolves, then encode compatible 8:8:8:8 destinations again.
+    uint32_t decode_pwl_gamma : 1;
   };
   ResolveEdramInfo() : packed(0) { static_assert_size(*this, sizeof(packed)); }
 };

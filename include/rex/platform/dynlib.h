@@ -22,6 +22,8 @@ class DynamicLibrary {
   DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
 
   bool Load(const std::filesystem::path& path);
+  // Take a reference only if the library is already loaded in this process.
+  bool LoadExisting(const std::filesystem::path& path);
   void Close();
   explicit operator bool() const { return handle_ != nullptr; }
 

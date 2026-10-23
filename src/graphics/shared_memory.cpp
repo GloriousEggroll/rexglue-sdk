@@ -578,6 +578,38 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   return RequestRanges(&range, 1);
 }
 
+bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) const {
+  if (!length) {
+    return true;
+  }
+  if (start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
+  }
+
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  const uint32_t block_first = page_first >> 6;
+  const uint32_t block_last = page_last >> 6;
+  const uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
+  if (!valid_flags) {
+    return false;
+  }
+
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t valid_mask = UINT64_MAX;
+    if (i == block_first) {
+      valid_mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      valid_mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if ((valid_flags[i] & valid_mask) != valid_mask) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackThunk(
     void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range) {
   return reinterpret_cast<SharedMemory*>(context_ptr)
@@ -655,37 +687,21 @@ void SharedMemory::PrepareForTraceDownload() {
   // doesn't have to be written into every frame trace, and collect the list of
   // ranges with data modified on the GPU.
 
-  uint32_t fire_watches_range_start = UINT32_MAX;
   uint32_t gpu_written_range_start = UINT32_MAX;
   auto global_lock = global_critical_region_.Acquire();
+  // Decoded textures may outlive the CPU-valid page flags. The frame-end
+  // validity-buffer rotation retains GPU-written flags only, so using the
+  // active flags to find cached CPU assets omits textures that stayed resident
+  // across that rotation. Refresh every watched view when tracing starts;
+  // retain GPU-produced bytes below and download them separately. This does
+  // not represent a CPU write and must not discard GPU memory ownership.
+  const uint32_t page_count = kBufferSize >> page_size_log2_;
+  FireWatches(0, page_count - 1, true);
   uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
   for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
-    uint64_t previously_valid_block = valid_flags ? valid_flags[i] : 0;
     uint64_t gpu_written_block = system_page_flags_valid_and_gpu_written_[i];
     if (valid_flags) {
       valid_flags[i] = gpu_written_block;
-    }
-
-    // Fire watches on the invalidated pages.
-    uint64_t fire_watches_block = previously_valid_block & ~gpu_written_block;
-    uint64_t fire_watches_break_block = ~fire_watches_block;
-    while (true) {
-      uint32_t fire_watches_block_page;
-      if (!rex::bit_scan_forward(fire_watches_range_start == UINT32_MAX ? fire_watches_block
-                                                                        : fire_watches_break_block,
-                                 &fire_watches_block_page)) {
-        break;
-      }
-      uint32_t fire_watches_page = (i << 6) + fire_watches_block_page;
-      if (fire_watches_range_start == UINT32_MAX) {
-        fire_watches_range_start = fire_watches_page;
-      } else {
-        FireWatches(fire_watches_range_start, fire_watches_page - 1, false);
-        fire_watches_range_start = UINT32_MAX;
-      }
-      uint64_t fire_watches_block_mask = ~((uint64_t(1) << fire_watches_block_page) - 1);
-      fire_watches_block &= fire_watches_block_mask;
-      fire_watches_break_block &= fire_watches_block_mask;
     }
 
     // Add to the GPU-written ranges.
@@ -719,10 +735,6 @@ void SharedMemory::PrepareForTraceDownload() {
       gpu_written_block &= gpu_written_block_mask;
       gpu_written_break_block &= gpu_written_block_mask;
     }
-  }
-  uint32_t page_count = kBufferSize >> page_size_log2_;
-  if (fire_watches_range_start != UINT32_MAX) {
-    FireWatches(fire_watches_range_start, page_count - 1, false);
   }
   if (gpu_written_range_start != UINT32_MAX) {
     uint32_t gpu_written_range_length = page_count - gpu_written_range_start;

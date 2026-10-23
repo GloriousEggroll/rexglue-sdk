@@ -34,6 +34,14 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     pipeline/shader/translator_disasm.cpp
 )
 
+if(REXGLUE_BUILD_TOOLS)
+    list(APPEND REXGRAPHICS_SYSTEM_SOURCES
+        trace_reader.cpp
+        trace_player.cpp
+        trace_viewer.cpp
+    )
+endif()
+
 # SPIR-V shader translation
 set(REXGRAPHICS_SPIRV_SOURCES
     pipeline/shader/spirv_builder.cpp
@@ -148,4 +156,3 @@ if(REXGLUE_USE_D3D12)
     )
     target_compile_definitions(rexgraphics PUBLIC REX_HAS_D3D12=1)
 endif()
-

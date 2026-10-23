@@ -1227,6 +1227,13 @@ void VulkanRenderTargetCache::InitializeTraceCompleteDownloads() {
   ResetTraceDownload();
 }
 
+bool VulkanRenderTargetCache::PrepareNativeStateTransfer(bool write) {
+  if (GetPath() != Path::kPixelShaderInterlock || IsDrawResolutionScaled()) return false;
+  UseEdramBuffer(write ? EdramBufferUsage::kComputeWrite : EdramBufferUsage::kComputeRead);
+  if (write) MarkEdramBufferModified();
+  return true;
+}
+
 void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
   if (IsDrawResolutionScaled()) {
     // No 1:1 mapping.
@@ -1342,6 +1349,67 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                  draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
                                  IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
     return false;
+  }
+
+  if (REXCVAR_GET(gpu_draw_trace_resources)) {
+    std::array<uint32_t, 15> trace_key = {
+        resolve_info.rb_copy_control.value,
+        resolve_info.depth_edram_info.packed,
+        resolve_info.color_edram_info.packed,
+        resolve_info.coordinate_info.packed,
+        resolve_info.height_div_8,
+        resolve_info.copy_dest_info.value,
+        resolve_info.copy_dest_coordinate_info.packed,
+        resolve_info.copy_dest_base,
+        resolve_info.copy_dest_extent_start,
+        resolve_info.copy_dest_extent_length,
+        resolve_info.depth_original_base,
+        resolve_info.color_original_base,
+        resolve_info.rb_depth_clear,
+        resolve_info.rb_color_clear,
+        resolve_info.rb_color_clear_lo,
+    };
+    static std::vector<decltype(trace_key)> traced_resolve_states;
+    if (traced_resolve_states.size() < 256 &&
+        std::find(traced_resolve_states.begin(), traced_resolve_states.end(),
+                  trace_key) == traced_resolve_states.end()) {
+      const size_t trace_index = traced_resolve_states.size();
+      traced_resolve_states.push_back(trace_key);
+      REXGPU_INFO(
+          "GPU resolve state[{}]: control={:08X} depth_edram={:08X} "
+          "color_edram={:08X} coord={:08X} height8={} dest={:08X} "
+          "dest_coord={:08X} base={:08X} extent={:08X}+{:08X} "
+          "original={:X},{:X} clear={:08X},{:08X},{:08X}",
+          trace_index, resolve_info.rb_copy_control.value,
+          resolve_info.depth_edram_info.packed,
+          resolve_info.color_edram_info.packed,
+          resolve_info.coordinate_info.packed, resolve_info.height_div_8,
+          resolve_info.copy_dest_info.value,
+          resolve_info.copy_dest_coordinate_info.packed,
+          resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+          resolve_info.copy_dest_extent_length,
+          resolve_info.depth_original_base, resolve_info.color_original_base,
+          resolve_info.rb_depth_clear, resolve_info.rb_color_clear,
+          resolve_info.rb_color_clear_lo);
+    }
+    if (resolve_info.depth_original_base == 720 ||
+        resolve_info.color_original_base == 720) {
+      static uint32_t gow3_tile_720_resolve_trace_count = 0;
+      if (gow3_tile_720_resolve_trace_count++ < 8192) {
+        REXGPU_INFO(
+            "GPU GOW3 tile720 resolve: host_frame={} control={:08X} "
+            "depth_edram={:08X} color_edram={:08X} original={:X},{:X} "
+            "dest_base={:08X} dest_extent={:08X}+{:08X}",
+            command_processor_.GetCurrentFrame(),
+            resolve_info.rb_copy_control.value,
+            resolve_info.depth_edram_info.packed,
+            resolve_info.color_edram_info.packed,
+            resolve_info.depth_original_base,
+            resolve_info.color_original_base, resolve_info.copy_dest_base,
+            resolve_info.copy_dest_extent_start,
+            resolve_info.copy_dest_extent_length);
+      }
+    }
   }
 
   // Nothing to copy/clear.
@@ -1934,7 +2002,7 @@ VkFormat VulkanRenderTargetCache::GetColorVulkanFormat(
                                              : VK_FORMAT_R8G8B8A8_UNORM;
     case xenos::ColorRenderTargetFormat::k_2_10_10_10:
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
-      return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+      return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
       return VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -4760,8 +4828,79 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   uint64_t current_submission = command_processor_.GetCurrentSubmission();
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  bool resolve_clear_needed =
+      render_target_resolve_clear_values && resolve_clear_rectangle;
 
-  bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+  if (REXCVAR_GET(gpu_draw_trace_resources)) {
+    static uint32_t gow3_tile_720_transfer_trace_count = 0;
+    static bool gow3_tile_720_title_active = false;
+    for (uint32_t i = 0; i < render_target_count &&
+                         gow3_tile_720_transfer_trace_count < 16384;
+         ++i) {
+      const RenderTarget* dest_rt = render_targets[i];
+      if (!dest_rt) {
+        continue;
+      }
+      const RenderTargetKey dest_key = dest_rt->key();
+      const std::vector<Transfer>& transfers = render_target_transfers[i];
+      bool relevant = dest_key.base_tiles == 720;
+      for (const Transfer& transfer : transfers) {
+        relevant |=
+            (transfer.start_tiles <= 720 && 720 < transfer.end_tiles) ||
+            (transfer.source && transfer.source->key().base_tiles == 720) ||
+            (transfer.host_depth_source &&
+             transfer.host_depth_source->key().base_tiles == 720);
+        gow3_tile_720_title_active |=
+            (transfer.source &&
+             !transfer.source->key().is_depth &&
+             transfer.source->key().resource_format ==
+                 uint32_t(xenos::ColorRenderTargetFormat::
+                              k_2_10_10_10_FLOAT_AS_16_16_16_16)) ||
+            (transfer.host_depth_source &&
+             !transfer.host_depth_source->key().is_depth &&
+             transfer.host_depth_source->key().resource_format ==
+                 uint32_t(xenos::ColorRenderTargetFormat::
+                              k_2_10_10_10_FLOAT_AS_16_16_16_16));
+      }
+      gow3_tile_720_title_active |=
+          !dest_key.is_depth &&
+          dest_key.resource_format ==
+              uint32_t(xenos::ColorRenderTargetFormat::
+                           k_2_10_10_10_FLOAT_AS_16_16_16_16);
+      if (!relevant || !gow3_tile_720_title_active) {
+        continue;
+      }
+      REXGPU_INFO(
+          "GPU GOW3 tile720 transfer set: host_frame={} slot={} "
+          "dest_base={} dest_pitch={} dest_msaa={} dest_depth={} "
+          "dest_format={} transfers={} clear={}",
+          command_processor_.GetCurrentFrame(), i, dest_key.base_tiles,
+          dest_key.pitch_tiles_at_32bpp,
+          uint32_t(dest_key.msaa_samples), dest_key.is_depth,
+          uint32_t(dest_key.resource_format), transfers.size(),
+          resolve_clear_needed);
+      ++gow3_tile_720_transfer_trace_count;
+      for (const Transfer& transfer : transfers) {
+        const RenderTargetKey source_key = transfer.source->key();
+        const RenderTargetKey host_depth_key =
+            transfer.host_depth_source
+                ? transfer.host_depth_source->key()
+                : RenderTargetKey();
+        REXGPU_INFO(
+            "GPU GOW3 tile720 transfer: host_frame={} range={}..{} "
+            "source_base={} source_pitch={} source_msaa={} source_depth={} "
+            "source_format={} host_depth_base={}",
+            command_processor_.GetCurrentFrame(), transfer.start_tiles,
+            transfer.end_tiles, source_key.base_tiles,
+            source_key.pitch_tiles_at_32bpp,
+            uint32_t(source_key.msaa_samples), source_key.is_depth,
+            uint32_t(source_key.resource_format),
+            transfer.host_depth_source ? host_depth_key.base_tiles
+                                       : UINT32_MAX);
+      }
+    }
+  }
+
   VkClearRect resolve_clear_rect;
   if (resolve_clear_needed) {
     // Assuming the rectangle is already clamped by the setup function from the

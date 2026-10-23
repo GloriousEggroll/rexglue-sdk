@@ -51,7 +51,9 @@ if(REXGLUE_BUILD_TESTS)
 endif()
 
 foreach(submodule ${REQUIRED_SUBMODULES})
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/.git")
+    # Source snapshots may omit Git metadata; require dependency contents.
+    file(GLOB dependency_contents "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/*")
+    if(NOT dependency_contents)
         message(FATAL_ERROR
             "Git submodule '${submodule}' is not initialized.\n"
             "Please run: git submodule update --init --recursive\n"
@@ -255,9 +257,9 @@ set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
 set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
 set(SDL_METAL OFF CACHE BOOL "" FORCE)
 
-# Disable dummy drivers
+# The opt-in dummy audio backend permits device negotiation tests without hardware.
 set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
-set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
+set(SDL_DUMMYAUDIO ${REXGLUE_BUILD_TESTS} CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
 # Linux audio backends

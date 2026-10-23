@@ -16,6 +16,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <unordered_set>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -30,11 +31,25 @@ REXCVAR_DEFINE_STRING(guest_function_state_trace_path, "", "Debug",
 REXCVAR_DEFINE_UINT32(guest_function_state_trace_address, 0, "Debug",
                       "Guest function address to trace state for")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(
+    guest_function_state_trace_address_end, 0, "Debug",
+    "Optional exclusive end address for guest function state tracing")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_UINT32(guest_function_state_trace_lr, 0, "Debug",
                       "Optional guest link register filter for function state tracing")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(guest_function_state_trace_memory, false, "Debug",
                     "Include 64-byte memory snapshots for r3, r4, and r5")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(
+    guest_function_state_trace_memory_register_mask, 7, "Debug",
+    "Bit mask selecting r3, r4, and r5 memory snapshots")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(guest_indirect_call_trace_path, "", "Debug",
+                      "Write first-seen indirect guest call targets to CSV")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(guest_indirect_call_trace_lr, 0, "Debug",
+                      "Optional guest link register filter for indirect call tracing")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::debug {
@@ -148,6 +163,10 @@ uint32_t LoadGuestU32(const uint8_t* memory_base, uint32_t address) {
 void WriteGuestWords(std::FILE* file, const uint8_t* memory_base,
                      uint32_t address) {
   std::fputc('"', file);
+  if (address > UINT32_MAX - 63) {
+    std::fputc('"', file);
+    return;
+  }
   for (uint32_t offset = 0; offset < 64; offset += sizeof(uint32_t)) {
     std::fprintf(file, "%s%08X", offset ? ":" : "",
                  LoadGuestU32(memory_base, address + offset));
@@ -189,13 +208,23 @@ class GuestFunctionStateTrace {
       std::fflush(file_);
       return;
     }
-    WriteGuestWords(file_, memory_base, context.r3.u32);
-    std::fputc(',', file_);
-    std::fflush(file_);
-    WriteGuestWords(file_, memory_base, context.r4.u32);
-    std::fputc(',', file_);
-    std::fflush(file_);
-    WriteGuestWords(file_, memory_base, context.r5.u32);
+    const uint32_t memory_register_mask =
+        REXCVAR_GET(guest_function_state_trace_memory_register_mask);
+    const uint32_t addresses[] = {
+        context.r3.u32,
+        context.r4.u32,
+        context.r5.u32,
+    };
+    for (size_t i = 0; i < 3; ++i) {
+      if (i) {
+        std::fputc(',', file_);
+      }
+      if (memory_register_mask & (1u << i)) {
+        WriteGuestWords(file_, memory_base, addresses[i]);
+      } else {
+        std::fputs("\"\"", file_);
+      }
+    }
     std::fputc('\n', file_);
     std::fflush(file_);
   }
@@ -235,6 +264,66 @@ GuestFunctionStateTrace& GetStateTrace() {
   return trace;
 }
 
+class GuestIndirectCallTrace {
+ public:
+  ~GuestIndirectCallTrace() {
+    std::lock_guard lock(file_mutex_);
+    if (file_) {
+      std::fclose(file_);
+    }
+  }
+
+  void Record(uint32_t guest_lr, uint32_t guest_target,
+              const PPCContext& context) {
+    const uint64_t key = (uint64_t{guest_lr} << 32) | guest_target;
+
+    std::lock_guard lock(file_mutex_);
+    if (!seen_.insert(key).second || !OpenFile()) {
+      return;
+    }
+
+    std::fprintf(file_,
+                 "0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,"
+                 "0x%08X,0x%08X,0x%08X,0x%08X\n",
+                 guest_lr, guest_target, context.r3.u32, context.r4.u32,
+                 context.r5.u32, context.r6.u32, context.r7.u32,
+                 context.r8.u32, context.r9.u32, context.r10.u32);
+    std::fflush(file_);
+  }
+
+ private:
+  bool OpenFile() {
+    if (file_) {
+      return true;
+    }
+    if (open_attempted_) {
+      return false;
+    }
+    open_attempted_ = true;
+
+    const std::string& path = REXCVAR_GET(guest_indirect_call_trace_path);
+    file_ = std::fopen(path.c_str(), "wb");
+    if (!file_) {
+      REXLOG_ERROR("Unable to open guest indirect call trace '{}'", path);
+      return false;
+    }
+    std::fputs("lr,target,r3,r4,r5,r6,r7,r8,r9,r10\n", file_);
+    std::fflush(file_);
+    REXLOG_INFO("Guest indirect call trace enabled: {}", path);
+    return true;
+  }
+
+  std::unordered_set<uint64_t> seen_;
+  std::mutex file_mutex_;
+  std::FILE* file_ = nullptr;
+  bool open_attempted_ = false;
+};
+
+GuestIndirectCallTrace& GetIndirectCallTrace() {
+  static GuestIndirectCallTrace trace;
+  return trace;
+}
+
 }  // namespace
 
 bool IsGuestFunctionTraceEnabled() {
@@ -246,14 +335,34 @@ void TraceGuestFunction(uint32_t guest_address) {
 }
 
 bool IsGuestFunctionStateTraceEnabled(uint32_t guest_address) {
-  return !REXCVAR_GET(guest_function_state_trace_path).empty() &&
-         REXCVAR_GET(guest_function_state_trace_address) == guest_address;
+  if (REXCVAR_GET(guest_function_state_trace_path).empty()) {
+    return false;
+  }
+  const uint32_t start =
+      REXCVAR_GET(guest_function_state_trace_address);
+  const uint32_t end =
+      REXCVAR_GET(guest_function_state_trace_address_end);
+  return end ? guest_address >= start && guest_address < end
+             : guest_address == start;
 }
 
 void TraceGuestFunctionState(uint32_t guest_address,
                              const PPCContext& context,
                              const uint8_t* memory_base) {
   GetStateTrace().Record(guest_address, context, memory_base);
+}
+
+bool IsGuestIndirectCallTraceEnabled(uint32_t guest_lr) {
+  if (REXCVAR_GET(guest_indirect_call_trace_path).empty()) {
+    return false;
+  }
+  const uint32_t lr_filter = REXCVAR_GET(guest_indirect_call_trace_lr);
+  return !lr_filter || lr_filter == guest_lr;
+}
+
+void TraceGuestIndirectCall(uint32_t guest_lr, uint32_t guest_target,
+                            const PPCContext& context) {
+  GetIndirectCallTrace().Record(guest_lr, guest_target, context);
 }
 
 }  // namespace rex::debug

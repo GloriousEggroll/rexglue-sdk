@@ -13,6 +13,8 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <stdexcept>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -24,6 +26,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
@@ -35,12 +38,24 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+REXCVAR_DEFINE_BOOL(gpu_bulk_type0_constants, false, "GPU diagnostics",
+    "Use the existing bulk constant loader for sequential Type0 shader constants")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(gpu_native_submit_completion_markers, false, "GPU",
+    "Submit owned Native input reuse markers without waiting for their GPU fence");
+
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_DOUBLE(framerate_limit, 60.0, "GPU", "Maximum frame rate (0 = unlimited)")
+    .range(0.0, 1000.0);
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(native_direct_execution, false, "GPU",
+                   "Run the guest's D3D without the PM4 command processor; the native renderer executes API calls directly")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -50,6 +65,10 @@ REXCVAR_DEFINE_BOOL(
     "Bias zero-sample host occlusion query results to one visible sample. "
     "This avoids premature culling in titles that cannot consume immediate "
     "zero results safely.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(zpd_trace, false, "GPU",
+                    "Log a bounded trace of EVENT_WRITE_ZPD report activity")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
@@ -87,7 +106,35 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "pipelines are being prepared.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_command_summary, false, "GPU",
+                    "Log one command processing summary at the end of each guest frame")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    gpu_no_effect_trace, false, "GPU",
+    "Log bounded Xenos register state for draws skipped as having no effect")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    gpu_draw_trace_interval, 0, "GPU",
+    "Log normalized state for every draw in each Nth guest frame; 0 disables")
+    .range(0, 1000000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    gpu_draw_trace_resources, false, "GPU",
+    "Include shader texture fetch and EDRAM copy state in GPU draw traces")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    gpu_draw_trace_memory, false, "GPU",
+    "Hash the first 4 KiB of each unique texture base in sampled GPU draw frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
+namespace {thread_local uint32_t api_frame_marker=UINT32_MAX;}
+uint32_t ExchangeApiFrameMarker(uint32_t frame) {return std::exchange(api_frame_marker,frame);}
+uint32_t ApiFrameMarker() {return api_frame_marker;}
 
 using namespace rex::graphics::xenos;
 
@@ -107,6 +154,239 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
 }
 
 }  // namespace
+
+void CommandProcessor::TraceDrawState(
+    xenos::PrimitiveType prim_type, uint32_t index_count,
+    const IndexBufferInfo* index_buffer_info) {
+  if (draw_trace_frame_ != counter_) {
+    draw_trace_frame_ = counter_;
+    draw_trace_index_ = 0;
+    draw_trace_memory_addresses_.clear();
+  }
+  const uint64_t draw_index = draw_trace_index_++;
+
+  const int32_t interval = REXCVAR_GET(gpu_draw_trace_interval);
+  if (interval <= 0 || counter_ % uint32_t(interval)) {
+    return;
+  }
+
+  const RegisterFile& regs = *register_file_;
+  const Shader* vertex_shader = active_vertex_shader();
+  const Shader* pixel_shader = active_pixel_shader();
+  const auto rb_modecontrol = regs.Get<reg::RB_MODECONTROL>();
+  const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  const auto sq_program_cntl = regs.Get<reg::SQ_PROGRAM_CNTL>();
+  const auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  const auto rb_color_mask = regs.Get<reg::RB_COLOR_MASK>();
+  const auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+  const auto rb_depthcontrol = regs.Get<reg::RB_DEPTHCONTROL>();
+  const auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+  const auto vgt_indx_offset = regs.Get<reg::VGT_INDX_OFFSET>();
+  const auto vgt_min_vtx_indx = regs.Get<reg::VGT_MIN_VTX_INDX>();
+  const auto vgt_max_vtx_indx = regs.Get<reg::VGT_MAX_VTX_INDX>();
+  const auto rb_color_info_0 = regs.Get<reg::RB_COLOR_INFO>(
+      reg::RB_COLOR_INFO::rt_register_indices[0]);
+  const auto rb_color_info_1 = regs.Get<reg::RB_COLOR_INFO>(
+      reg::RB_COLOR_INFO::rt_register_indices[1]);
+  const auto rb_color_info_2 = regs.Get<reg::RB_COLOR_INFO>(
+      reg::RB_COLOR_INFO::rt_register_indices[2]);
+  const auto rb_color_info_3 = regs.Get<reg::RB_COLOR_INFO>(
+      reg::RB_COLOR_INFO::rt_register_indices[3]);
+
+  REXGPU_INFO(
+      "GPU draw state: frame={} draw={} prim={} indices={} indexed={} "
+      "ib={:08X} ifmt={} iendian={} vs={:016X} ps={:016X} "
+      "index_offset={:08X} index_min={:08X} index_max={:08X} "
+      "mode={:08X} surface={:08X} program={:08X} sc={:08X} "
+      "color_mask={:08X} color_control={:08X} depth_control={:08X} "
+      "rt0={:08X} rt1={:08X} rt2={:08X} rt3={:08X} depth={:08X}",
+      counter_, draw_index, uint32_t(prim_type), index_count,
+      index_buffer_info != nullptr,
+      index_buffer_info ? index_buffer_info->guest_base : 0,
+      index_buffer_info ? uint32_t(index_buffer_info->format) : 0,
+      index_buffer_info ? uint32_t(index_buffer_info->endianness) : 0,
+      vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+      pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+      vgt_indx_offset.value, vgt_min_vtx_indx.value,
+      vgt_max_vtx_indx.value,
+      rb_modecontrol.value, rb_surface_info.value, sq_program_cntl.value,
+      pa_su_sc_mode_cntl.value, rb_color_mask.value, rb_colorcontrol.value,
+      rb_depthcontrol.value, rb_color_info_0.value, rb_color_info_1.value,
+      rb_color_info_2.value, rb_color_info_3.value, rb_depth_info.value);
+
+  if (!REXCVAR_GET(gpu_draw_trace_resources)) {
+    return;
+  }
+
+  constexpr uint64_t kGow3TitleVertexShaderHash =
+      UINT64_C(0xF9EBE3D4293EC775);
+  constexpr uint64_t kGow3TitlePixelShaderHash =
+      UINT64_C(0x19055C4D86C6C08C);
+  static uint32_t gow3_title_details_frame = UINT32_MAX;
+  if (vertex_shader &&
+      vertex_shader->ucode_data_hash() == kGow3TitleVertexShaderHash &&
+      pixel_shader &&
+      pixel_shader->ucode_data_hash() == kGow3TitlePixelShaderHash &&
+      gow3_title_details_frame != counter_) {
+    gow3_title_details_frame = counter_;
+
+    auto trace_memory = [&](const char* kind, uint32_t base, size_t size) {
+      size = std::min<size_t>(size, 4096);
+      const uint8_t* bytes = memory_->TranslatePhysical(base);
+      uint64_t hash = UINT64_C(14695981039346656037);
+      uint32_t nonzero = 0;
+      for (size_t i = 0; i < size; ++i) {
+        const uint8_t value = bytes[i];
+        hash = (hash ^ value) * UINT64_C(1099511628211);
+        nonzero += value != 0;
+      }
+      REXGPU_INFO(
+          "GPU GOW3 title memory: frame={} draw={} kind={} base={:08X} "
+          "bytes={} hash={:016X} nonzero={}",
+          counter_, draw_index, kind, base, size, hash, nonzero);
+    };
+
+    const Shader::ConstantRegisterMap& constant_map =
+        vertex_shader->constant_register_map();
+    const auto blend_control = regs.Get<reg::RB_BLENDCONTROL>(
+        reg::RB_BLENDCONTROL::rt_register_indices[0]);
+    REXGPU_INFO(
+        "GPU GOW3 title blend: frame={} draw={} value={:08X} "
+        "color_src={} color_op={} color_dst={} alpha_src={} alpha_op={} "
+        "alpha_dst={}",
+        counter_, draw_index, blend_control.value,
+        uint32_t(blend_control.color_srcblend),
+        uint32_t(blend_control.color_comb_fcn),
+        uint32_t(blend_control.color_destblend),
+        uint32_t(blend_control.alpha_srcblend),
+        uint32_t(blend_control.alpha_comb_fcn),
+        uint32_t(blend_control.alpha_destblend));
+    for (uint32_t i = 0;
+         i < rex::countof(constant_map.vertex_fetch_bitmap); ++i) {
+      uint32_t vfetch_bits_remaining =
+          constant_map.vertex_fetch_bitmap[i];
+      uint32_t j;
+      while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+        vfetch_bits_remaining &= ~(uint32_t(1) << j);
+        const uint32_t vfetch_index = i * 32 + j;
+        const xenos::xe_gpu_vertex_fetch_t vertex_fetch =
+            regs.GetVertexFetch(vfetch_index);
+        REXGPU_INFO(
+            "GPU GOW3 title vertex fetch: frame={} draw={} fetch={} "
+            "words={:08X},{:08X} type={} base={:08X} bytes={}",
+            counter_, draw_index, vfetch_index, vertex_fetch.dword_0,
+            vertex_fetch.dword_1, uint32_t(vertex_fetch.type),
+            vertex_fetch.address << 2, size_t(vertex_fetch.size) << 2);
+        trace_memory("vertex", vertex_fetch.address << 2,
+                     size_t(vertex_fetch.size) << 2);
+        const uint8_t* vertex_bytes =
+            memory_->TranslatePhysical(vertex_fetch.address << 2);
+        const size_t vertex_count =
+            std::min<size_t>(size_t(vertex_fetch.size) / 3, 8);
+        for (size_t vertex_index = 0; vertex_index < vertex_count;
+             ++vertex_index) {
+          uint32_t words[3];
+          std::memcpy(words, vertex_bytes + vertex_index * sizeof(words),
+                      sizeof(words));
+          REXGPU_INFO(
+              "GPU GOW3 title vertex: frame={} draw={} vertex={} "
+              "words={:08X},{:08X},{:08X}",
+              counter_, draw_index, vertex_index, words[0], words[1],
+              words[2]);
+        }
+      }
+    }
+    if (index_buffer_info) {
+      trace_memory(
+          "index", index_buffer_info->guest_base,
+          size_t(index_count) *
+              (index_buffer_info->format == xenos::IndexFormat::kInt16
+                   ? sizeof(uint16_t)
+                   : sizeof(uint32_t)));
+    }
+
+    auto trace_float_constants = [&](const char* stage,
+                                     uint32_t constant_base,
+                                     uint32_t constant_count) {
+      for (uint32_t i = 0; i < constant_count; ++i) {
+        const uint32_t register_base =
+            XE_GPU_REG_SHADER_CONSTANT_000_X +
+            ((constant_base + i) << 2);
+        REXGPU_INFO(
+            "GPU GOW3 title constant: frame={} draw={} stage={} c{}="
+            "{:08X},{:08X},{:08X},{:08X}",
+            counter_, draw_index, stage, i, regs[register_base],
+            regs[register_base + 1], regs[register_base + 2],
+            regs[register_base + 3]);
+      }
+    };
+    trace_float_constants("vs", 0, 8);
+    trace_float_constants("ps", 256, 4);
+  }
+
+  auto trace_shader_textures = [&](const char* stage, const Shader* shader) {
+    if (!shader) {
+      return;
+    }
+    for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+      const xenos::xe_gpu_texture_fetch_t fetch =
+          regs.GetTextureFetch(binding.fetch_constant);
+      REXGPU_INFO(
+          "GPU draw texture: frame={} draw={} stage={} binding={} fetch={} "
+          "words={:08X},{:08X},{:08X},{:08X},{:08X},{:08X}",
+          counter_, draw_index, stage, binding.binding_index,
+          binding.fetch_constant, fetch.dword_0, fetch.dword_1,
+          fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+      if (REXCVAR_GET(gpu_draw_trace_memory) &&
+          fetch.type == xenos::FetchConstantType::kTexture) {
+        const uint32_t base =
+            fetch.base_address << xenos::kTextureSubresourceAlignmentBytesLog2;
+        if (std::find(draw_trace_memory_addresses_.begin(),
+                      draw_trace_memory_addresses_.end(),
+                      base) == draw_trace_memory_addresses_.end()) {
+          draw_trace_memory_addresses_.push_back(base);
+          constexpr size_t kHashSize = 4096;
+          const uint8_t* bytes = memory_->TranslatePhysical(base);
+          uint64_t hash = UINT64_C(14695981039346656037);
+          uint32_t nonzero = 0;
+          uint8_t min_value = UINT8_MAX;
+          uint8_t max_value = 0;
+          for (size_t i = 0; i < kHashSize; ++i) {
+            const uint8_t value = bytes[i];
+            hash = (hash ^ value) * UINT64_C(1099511628211);
+            nonzero += value != 0;
+            min_value = std::min(min_value, value);
+            max_value = std::max(max_value, value);
+          }
+          REXGPU_INFO(
+              "GPU draw memory: frame={} draw={} stage={} binding={} fetch={} "
+              "base={:08X} bytes={} hash={:016X} nonzero={} min={:02X} max={:02X}",
+              counter_, draw_index, stage, binding.binding_index,
+              binding.fetch_constant, base, kHashSize, hash, nonzero,
+              min_value, max_value);
+        }
+      }
+    }
+  };
+  trace_shader_textures("vs", vertex_shader);
+  trace_shader_textures("ps", pixel_shader);
+
+  if (rb_modecontrol.edram_mode == xenos::EdramMode::kCopy) {
+    REXGPU_INFO(
+        "GPU draw copy: frame={} draw={} control={:08X} dest_base={:08X} "
+        "dest_pitch={:08X} dest_info={:08X} hiz_clear={:08X} "
+        "depth_clear={:08X} color_clear={:08X} color_clear_lo={:08X} "
+        "func={:08X} ref={:08X} mask={:08X} slice={:08X}",
+        counter_, draw_index, regs[XE_GPU_REG_RB_COPY_CONTROL],
+        regs[XE_GPU_REG_RB_COPY_DEST_BASE],
+        regs[XE_GPU_REG_RB_COPY_DEST_PITCH],
+        regs[XE_GPU_REG_RB_COPY_DEST_INFO], regs[XE_GPU_REG_RB_HIZ_CLEAR],
+        regs[XE_GPU_REG_RB_DEPTH_CLEAR], regs[XE_GPU_REG_RB_COLOR_CLEAR],
+        regs[XE_GPU_REG_RB_COLOR_CLEAR_LO], regs[XE_GPU_REG_RB_COPY_FUNC],
+        regs[XE_GPU_REG_RB_COPY_REF], regs[XE_GPU_REG_RB_COPY_MASK],
+        regs[XE_GPU_REG_RB_COPY_SURFACE_SLICE]);
+  }
+}
 
 CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
                                    system::KernelState* kernel_state)
@@ -179,6 +459,22 @@ void CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path)
   trace_state_ = TraceState::kSingleFrame;
   trace_frame_path_ = root_path;
 }
+void CommandProcessor::RequestFrameTraceAtFrame(const std::filesystem::path& root_path,uint32_t frame) {
+  CallInThread([this,root_path,frame] {
+    if((external_frame_number_!=UINT32_MAX&&frame<=external_frame_number_+1)||trace_state_!=TraceState::kDisabled||trace_writer_.is_open()||trace_requested_frame_!=UINT32_MAX) {
+      REXGPU_ERROR("Cannot schedule GPU history at API frame {} (last marker {})",frame,external_frame_number_);
+      return;
+    }
+    std::error_code error;
+    std::filesystem::create_directories(root_path,error);
+    if(error){REXGPU_ERROR("Cannot create GPU history directory: {}",error.message());return;}
+    // Two adjacent initial states supply both prior history and an exact
+    // reference frontbuffer for the first captured API frame.
+    if(frame>=UINT32_MAX-1){REXGPU_ERROR("Invalid GPU history frame");return;}
+    trace_frame_path_=root_path;trace_requested_frame_=frame;trace_history_snapshots_left_=2;
+    REXGPU_INFO("Scheduled GPU history for frame {}",frame);
+  });
+}
 
 void CommandProcessor::BeginTracing(const std::filesystem::path& root_path) {
   if (trace_state_ == TraceState::kStreaming) {
@@ -201,6 +497,30 @@ void CommandProcessor::EndTracing() {
   assert_true(trace_state_ == TraceState::kStreaming);
   trace_state_ = TraceState::kDisabled;
   trace_writer_.Close();
+}
+
+bool CommandProcessor::ExportDiagnosticSnapshot(const std::filesystem::path& directory,uint32_t title_id) {
+  if(trace_writer_.is_open()||trace_state_!=TraceState::kDisabled) {
+    REXGPU_ERROR("Cannot export diagnostic state while tracing is active");return false;
+  }
+  // Atomic creation of a new containing directory prevents overwriting either
+  // an original trace or a previous diagnostic artifact.
+  std::error_code error;
+  if(!std::filesystem::create_directory(directory,error)) {
+    REXGPU_ERROR("Diagnostic snapshot requires a new directory: {}",directory.string());return false;
+  }
+  try {
+    if(!trace_writer_.Open(directory/"state.xtr",title_id))return false;
+    InitializeTrace();
+    trace_writer_.Close();
+    std::ofstream metadata(directory/"state.json");
+    metadata<<"{\n  \"version\": 1,\n  \"provenance\": \"diagnostic_replayed_gpu_state\",\n"
+        <<"  \"last_present_api_frame\": "<<external_frame_number_<<",\n  \"has_command_stream\": false\n}\n";
+    if(!metadata)throw std::runtime_error("Cannot write diagnostic snapshot metadata");
+    return true;
+  } catch(const std::exception& e) {
+    trace_writer_.Close();REXGPU_ERROR("Diagnostic state export failed: {}",e.what());return false;
+  }
 }
 
 void CommandProcessor::RestoreRegisters(uint32_t first_register, const uint32_t* register_values,
@@ -244,6 +564,60 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
   } else {
     pending_fns_.push(std::move(fn));
   }
+}
+
+void CommandProcessor::PostDirectWork(std::function<void()> fn) {
+  {
+    std::lock_guard lock(direct_work_mutex_);
+    direct_work_.push_back(std::move(fn));
+    direct_work_pending_.store(true, std::memory_order_release);
+  }
+  write_ptr_index_event_->Set();
+}
+
+void CommandProcessor::SetDirectIdleHook(std::function<bool()> hook) {
+  direct_idle_hook_.store(hook ? std::make_shared<std::function<bool()>>(std::move(hook)) : nullptr);
+  write_ptr_index_event_->Set();
+}
+
+void CommandProcessor::SetDirectSwapRouter(DirectSwapRouter router) {
+  direct_swap_router_.store(router ? std::make_shared<DirectSwapRouter>(std::move(router)) : nullptr);
+}
+
+void CommandProcessor::PostDirectSwap(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height,
+                                      uint32_t api_frame) {
+  std::function<void()> swap = [this, frontbuffer_ptr, width, height, api_frame] {
+    rex::perf::Profiler::Flip();
+    external_frame_number_ = api_frame;
+    frame_limiter_.Wait(REXCVAR_GET(framerate_limit));
+    IssueSwap(frontbuffer_ptr, width, height);
+    command_summary_ = {};
+    ++counter_;
+  };
+  if (const auto router = direct_swap_router_.load(); router && (*router)(swap)) return;
+  PostDirectWork(std::move(swap));
+}
+
+bool CommandProcessor::RunDirectWork() {
+  if (!direct_work_pending_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  std::vector<std::function<void()>> work;
+  {
+    std::lock_guard lock(direct_work_mutex_);
+    work.swap(direct_work_);
+    direct_work_pending_.store(false, std::memory_order_relaxed);
+  }
+  // Poll completion between items too: a guest blocked on a result must not
+  // wait behind a long run of posted work.
+  const auto hook = direct_idle_hook_.load();
+  for (auto& fn : work) {
+    fn();
+    if (hook) {
+      (*hook)();
+    }
+  }
+  return !work.empty();
 }
 
 void CommandProcessor::ClearCaches() {}
@@ -292,6 +666,21 @@ void CommandProcessor::WorkerThreadMain() {
     }
 
     uint32_t write_ptr_index = write_ptr_index_.load();
+    if ((write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) &&
+        direct_idle_hook_.load()) {
+      // Direct execution: the guest submits no packets. Run posted work, and
+      // between items poll GPU completion without forcing a drain.
+      if (RunDirectWork()) {
+        continue;
+      }
+      const auto hook = direct_idle_hook_.load();
+      if (hook && (*hook)()) {
+        rex::thread::MaybeYield();
+      } else {
+        rex::thread::Wait(write_ptr_index_event_.get(), true, std::chrono::milliseconds(1));
+      }
+      continue;
+    }
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
       // We've run out of commands to execute.
@@ -436,7 +825,10 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  // Register metadata is only needed to describe debug logging. Preserve the
+  // register write and every hardware side effect regardless of log level.
+  if (auto* logger = rex::GetLoggerRaw(rex::log::gpu());
+      logger && logger->should_log(spdlog::level::debug) && !regs.GetRegisterInfo(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -723,6 +1115,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   reader.set_write_offset(write_index * sizeof(uint32_t));
   do {
     if (!ExecutePacket(&reader)) {
+      OnPacketExecutionFailure("GPU packet decoding or execution failed");
       // This probably should be fatal - but we're going to continue anyways.
       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
       assert_always();
@@ -747,6 +1140,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
     if (!ExecutePacket(&reader)) {
+      OnPacketExecutionFailure("GPU packet decoding or execution failed");
       // Return up a level if we encounter a bad packet.
       REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
       assert_always();
@@ -763,6 +1157,7 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
     if (!ExecutePacket(&reader)) {
+      OnPacketExecutionFailure("GPU packet decoding or execution failed");
       REXGPU_ERROR("**** ExecutePacket: Failed to execute packet.");
       assert_always();
       break;
@@ -771,8 +1166,26 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  if(native_immediate_marker_pairs_enabled_&&TryExecuteNativeImmediateMarkerPair(reader))return true;
+  const uintptr_t packet_pointer=reader->read_ptr();
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
+  if(capture_native_draw_packets_&&packet_type==3) {
+    const uint32_t opcode=(packet>>8)&127;
+    if(opcode==0x22||opcode==0x36) {
+      const size_t payload_bytes=(((packet>>16)&0x3fff)+1)*sizeof(uint32_t);
+      const uintptr_t physical_base=reinterpret_cast<uintptr_t>(memory_->physical_membase());
+      if(packet_pointer<physical_base||packet_pointer-physical_base>=0x20000000ull||payload_bytes>reader->read_count())
+        return false;
+      native_draw_packet_address_=uint32_t(packet_pointer-physical_base);
+      native_draw_packet_bytes_.resize(payload_bytes+4);
+      for(unsigned byte=0;byte<4;++byte)native_draw_packet_bytes_[byte]=uint8_t(packet>>(24-byte*8));
+      const auto range=reader->BeginRead(payload_bytes);
+      std::memcpy(native_draw_packet_bytes_.data()+4,range.first,range.first_length);
+      if(range.second_length)std::memcpy(native_draw_packet_bytes_.data()+4+range.first_length,range.second,range.second_length);
+      // BeginRead only describes the memory; the normal decoder owns AdvanceRead.
+    }
+  }
   if (packet == 0) {
     trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1);
     trace_writer_.WritePacketEnd();
@@ -814,10 +1227,31 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
-  for (uint32_t m = 0; m < count; m++) {
-    uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
-    uint32_t target_index = write_one_reg ? base_index : base_index + m;
-    WriteRegister(target_index, reg_data);
+  const auto within = [&](uint32_t first, uint32_t last) {
+    return base_index >= first && base_index <= last && count <= last - base_index + 1;
+  };
+  const bool constants = !write_one_reg &&
+      (within(XE_GPU_REG_SHADER_CONSTANT_000_X, XE_GPU_REG_SHADER_CONSTANT_511_W) ||
+       within(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
+       within(XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031, XE_GPU_REG_SHADER_CONSTANT_LOOP_31));
+  if (constants) {
+    ++command_summary_.type0_constant_packets;
+    command_summary_.type0_constant_words += count;
+  }
+  if (constants && REXCVAR_GET(gpu_bulk_type0_constants)) {
+    // Reuse the same endian conversion, ring splitting and backend dirty-state
+    // notifications as SET_CONSTANT2. Only side-effect-free constant families
+    // qualify. Scratch fences, coherence, gamma and repeated writes retain
+    // their original per-word virtual dispatch and completion boundaries.
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    ++command_summary_.type0_bulk_packets;
+    command_summary_.type0_bulk_words += count;
+  } else {
+    for (uint32_t m = 0; m < count; m++) {
+      uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
+      uint32_t target_index = write_one_reg ? base_index : base_index + m;
+      WriteRegister(target_index, reg_data);
+    }
   }
 
   trace_writer_.WritePacketEnd();
@@ -851,6 +1285,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   auto data_start_offset = reader->read_offset();
+  ++command_summary_.type3_packets;
 
   if (reader->read_count() < count * sizeof(uint32_t)) {
     REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
@@ -869,14 +1304,17 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   // the packet. Only type 3 packets are affected.
   // We also skip predicated swaps, as they are never valid (probably?).
   if (packet & 1) {
+    ++command_summary_.predicated_packets;
     bool any_pass = (bin_select_ & bin_mask_) != 0;
     if (!any_pass || opcode == PM4_XE_SWAP) {
+      ++command_summary_.predicated_packets_skipped;
       reader->AdvanceRead(count * sizeof(uint32_t));
       trace_writer_.WritePacketEnd();
       return true;
     }
   }
 
+  PrepareForPacket(opcode, count);
   bool result = false;
   switch (opcode) {
     case PM4_ME_INIT:
@@ -893,6 +1331,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       break;
     case PM4_INDIRECT_BUFFER:
     case PM4_INDIRECT_BUFFER_PFD:
+      ++command_summary_.indirect_buffers;
       result = ExecutePacketType3_INDIRECT_BUFFER(reader, packet, count);
       break;
     case PM4_WAIT_REG_MEM:
@@ -1005,6 +1444,8 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     }
 
     default:
+      OnPacketExecutionFailure("Unimplemented GPU opcode");
+      ++command_summary_.unsupported_packets;
       REXGPU_INFO("Unimplemented GPU OPCODE: 0x{:02X}\t\tCOUNT: {}\n", opcode, count);
       assert_always();
       reader->AdvanceRead(count * sizeof(uint32_t));
@@ -1013,6 +1454,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
 
   trace_writer_.WritePacketEnd();
   if (opcode == PM4_XE_SWAP) {
+    const bool scheduled_history=external_frame_number_!=UINT32_MAX&&external_frame_number_+1==trace_requested_frame_;
     // End the trace writer frame.
     if (trace_writer_.is_open()) {
       trace_writer_.WriteEvent(EventCommand::Type::kSwap);
@@ -1021,13 +1463,29 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
         trace_state_ = TraceState::kDisabled;
         trace_writer_.Close();
       }
-    } else if (trace_state_ == TraceState::kSingleFrame) {
+    }
+    if(scheduled_history) {
+      trace_requested_frame_=UINT32_MAX;
+      if(trace_state_==TraceState::kDisabled&&!trace_writer_.is_open())trace_state_=TraceState::kSingleFrame;
+      else {trace_history_snapshots_left_=0;REXGPU_ERROR("Scheduled GPU history conflicted with another trace");}
+    }
+    if (!trace_writer_.is_open()&&trace_state_ == TraceState::kSingleFrame) {
       // New trace request - we only start tracing at the beginning of a frame.
       uint32_t title_id = kernel_state_->GetExecutableModule()->title_id();
-      auto file_name = fmt::format("{:08X}_{}.xtr", title_id, counter_ - 1);
+      auto file_name = scheduled_history?fmt::format("{:08X}_api_{}.xtr",title_id,external_frame_number_+1):
+          fmt::format("{:08X}_{}.xtr", title_id, counter_ - 1);
       auto path = trace_frame_path_ / file_name;
       trace_writer_.Open(path, title_id);
       InitializeTrace();
+      if(scheduled_history&&trace_writer_.is_open()) {
+        trace_writer_.Flush();
+        std::ofstream metadata(path.string()+".initial.json");
+        metadata << "{\"version\":1,\"frame\":" << external_frame_number_+1
+                 << ",\"provenance\":\"reference_gpu_frame_boundary\",\"trace\":\"" << file_name << "\"}\n";
+        REXGPU_INFO("Captured GPU history immediately before API frame {}: {}",external_frame_number_+1,path.string());
+        if(trace_history_snapshots_left_&&--trace_history_snapshots_left_)
+          trace_requested_frame_=external_frame_number_+2;
+      }
     }
   }
 
@@ -1101,9 +1559,52 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
-  reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+  external_frame_number_=count>=5?reader->ReadAndSwap<uint32_t>():UINT32_MAX;
+  reader->AdvanceRead((count - (count>=5?5:4)) * sizeof(uint32_t));
 
+  const bool timing_enabled = REXCVAR_GET(gpu_command_summary);
+  const auto limiter_start = timing_enabled ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
+  frame_limiter_.Wait(REXCVAR_GET(framerate_limit));
+  const auto swap_start = timing_enabled ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+
+  if (timing_enabled) {
+    const auto swap_end = std::chrono::steady_clock::now();
+    REXGPU_INFO(
+        "GPU frame {}: type3={} indirect={} draw_packets={} issue={} submitted={} "
+        "failed={} no_effect={} no_effect_pitch={} no_effect_raster_memexport={} "
+        "no_effect_edram={} no_effect_multipass={} no_effect_cull_both={} "
+        "no_effect_vertices={} async_placeholder={} viz_skipped={} "
+        "predicated_skipped={}/{} copies={} unsupported={} movie_yuv={} "
+        "queries={} memexport_full={} submissions={} submit_us={} replay_us={} queue_us={} "
+        "fence_waits={} fence_us={} limiter_us={} swap_us={} "
+        "type0_constant_packets={} type0_constant_words={} type0_bulk_packets={} type0_bulk_words={}",
+        counter_, command_summary_.type3_packets, command_summary_.indirect_buffers,
+        command_summary_.draw_packets, command_summary_.draw_issue_attempts,
+        command_summary_.draws_submitted, command_summary_.draw_issue_failures,
+        command_summary_.draws_no_effect,
+        command_summary_.draws_no_effect_surface_pitch_zero,
+        command_summary_.draws_no_effect_no_rasterization_or_memexport,
+        command_summary_.draws_no_effect_edram_mode,
+        command_summary_.draws_no_effect_vertex_multipass,
+        command_summary_.draws_no_effect_cull_both,
+        command_summary_.draws_no_effect_zero_vertices,
+        command_summary_.draws_async_placeholder, command_summary_.draws_viz_query_skipped,
+        command_summary_.predicated_packets_skipped, command_summary_.predicated_packets,
+        command_summary_.copy_attempts, command_summary_.unsupported_packets,
+        command_summary_.movie_yuv, command_summary_.occlusion_queries,
+        command_summary_.memexport_full_readbacks, command_summary_.submissions,
+        command_summary_.submission_us, command_summary_.submission_replay_us,
+        command_summary_.submission_queue_us, command_summary_.fence_waits,
+        command_summary_.fence_wait_us,
+        std::chrono::duration_cast<std::chrono::microseconds>(swap_start - limiter_start).count(),
+        std::chrono::duration_cast<std::chrono::microseconds>(swap_end - swap_start).count(),
+        command_summary_.type0_constant_packets, command_summary_.type0_constant_words,
+        command_summary_.type0_bulk_packets, command_summary_.type0_bulk_words);
+  }
+  command_summary_ = {};
 
   ++counter_;
   return true;
@@ -1132,6 +1633,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t mask = reader->ReadAndSwap<uint32_t>();
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
+  PrepareForRegisterWait(count, wait_info, poll_reg_addr, ref, mask, wait);
   bool is_memory = (wait_info & 0x10) != 0;
 
   bool matched = false;
@@ -1193,7 +1695,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           return false;
         }
       } else {
+        PrepareForWait();
         rex::thread::MaybeYield();
+        ReturnFromWait();
       }
     }
   } while (!matched);
@@ -1338,6 +1842,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader
     // Just an event flag? Where does this write?
   } else {
     // Write to an address.
+    OnPacketExecutionFailure("Addressed EVENT_WRITE is not implemented");
     assert_always();
     reader->AdvanceRead((count - 1) * sizeof(uint32_t));
   }
@@ -1351,6 +1856,14 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   uint32_t address = reader->ReadAndSwap<uint32_t>();
   uint32_t value = reader->ReadAndSwap<uint32_t>();
 
+  if(observe_decoded_event_write_shd_)ObserveDecodedEventWriteShd(packet,count,initiator,address,value,
+      reinterpret_cast<uintptr_t>(reader->buffer()),reader->capacity(),reader->read_offset());
+
+  WriteEventShdValue(initiator,address,value);
+  return true;
+}
+
+void CommandProcessor::WriteEventShdValue(uint32_t initiator,uint32_t address,uint32_t value) {
   // Writeback initiator.
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
   uint32_t data_value;
@@ -1366,11 +1879,45 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   data_value = GpuSwap(data_value, endianness);
   memory::store(memory_->TranslatePhysical(address), data_value);
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
+}
+
+bool CommandProcessor::TryExecuteNativeImmediateMarkerPair(memory::RingBuffer* reader) {
+  // Trace/debug callbacks and partial/wrapped publications retain the original
+  // scalar path. Never inspect bytes beyond this decoder's published extent.
+  if(trace_writer_.is_open()||trace_state_!=TraceState::kDisabled||
+     reader->capacity()<32||reader->read_count()<32||reader->read_offset()>reader->capacity()-32)return false;
+  const uintptr_t physical=reinterpret_cast<uintptr_t>(memory_->physical_membase());
+  const uintptr_t buffer=reinterpret_cast<uintptr_t>(reader->buffer());
+  if(buffer<physical||buffer-physical>=0x20000000ull||
+     uint64_t(buffer-physical)+reader->read_offset()+32>0x20000000ull)return false;
+  auto copy=*reader;
+  NativeCompletionMarkerPair pair;
+  pair.words[0]=copy.ReadAndSwap<uint32_t>();
+  if(pair.words[0]!=0xc0025800u)return false;
+  pair.command_buffer=uint32_t(buffer-physical);pair.command_capacity=reader->capacity();
+  pair.command_address=pair.command_buffer+reader->read_offset();
+  for(size_t i=1;i<pair.words.size();++i)pair.words[i]=copy.ReadAndSwap<uint32_t>();
+  pair.counter=pair.words[6]&~3u;
+  if(!IsNativeCompletionMarkerPair(pair))return false;
+  auto guard=PrepareNativeImmediateMarkerPair(pair);
+  if(!guard)return false;
+  // No queue/provider/capture callback may run while the target guard is held.
+  // Both original stores remain immediate; only their redundant GPU wait was
+  // removed. The real pending-work latch and future mandatory fences survive.
+  for(size_t part=0;part<2;++part) {
+    const auto begin=reader->read_ptr();
+    reader->AdvanceRead(16);
+    ++command_summary_.type3_packets;
+    trace_writer_.WritePacketStart(uint32_t(begin),4);
+    WriteEventShdValue(pair.words[part*4+1],pair.words[part*4+2],pair.words[part*4+3]);
+    trace_writer_.WritePacketEnd();
+  }
   return true;
 }
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
+  OnPacketExecutionFailure("Screen-extent query results are not implemented");
   // generate a screen extent event
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   uint32_t address = reader->ReadAndSwap<uint32_t>();
@@ -1400,8 +1947,6 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
-  // Set by D3D as BE but struct ABI is LE
-  const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
   assert_true(count == 1);
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   // Writeback initiator.
@@ -1412,22 +1957,24 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
   // As a workaround report some fixed amount of passed samples.
   auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
   if (fake_sample_count >= 0) {
+    const uint32_t report_address =
+        register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+    uint32_t sample_count_address =
+        xenos::XenosZPDReport::GetRecordBase(report_address);
     auto* pSampleCounts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
-        register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
+        sample_count_address);
     if (!pSampleCounts) {
       return true;
     }
-    // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
-    // and used to detect a finished query.
-    bool is_end_via_z_pass =
-        pSampleCounts->ZPass_A == kQueryFinished && pSampleCounts->ZPass_B == kQueryFinished;
-    // Older versions of D3D also checks for ZFail (4D5307D5).
-    bool is_end_via_z_fail =
-        pSampleCounts->ZFail_A == kQueryFinished && pSampleCounts->ZFail_B == kQueryFinished;
-    std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
-    if (is_end_via_z_pass || is_end_via_z_fail) {
-      pSampleCounts->ZPass_A = fake_sample_count;
-      pSampleCounts->Total_A = fake_sample_count;
+    bool is_end = xenos::XenosZPDReport::IsEndRecord(report_address);
+    if (!xenos::XenosZPDReport::IsBeginRecord(report_address) && !is_end) {
+      is_end = xenos::XenosZPDReport::HasPendingSentinel(pSampleCounts);
+    }
+    if (is_end) {
+      xenos::XenosZPDReport::WriteSampleCount(pSampleCounts,
+                                              uint32_t(fake_sample_count));
+    } else {
+      std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
     }
   }
 
@@ -1443,6 +1990,9 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // when true, render conditionally based on query result
   // uint32_t viz_use = viz_query_condition & 0x100;
 
+  if (viz_query_condition & 0x100)
+    OnPacketExecutionFailure("Conditional visualization-query draws are not implemented");
+  ++command_summary_.draw_packets;
   assert_not_zero(count_remaining);
   if (!count_remaining) {
     REXGPU_ERROR("{}: Packet too small, can't read VGT_DRAW_INITIATOR", opcode_name);
@@ -1496,6 +2046,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       index_buffer_info.count = vgt_draw_initiator.num_indices;
     } break;
     case xenos::SourceSelect::kImmediate: {
+      OnPacketExecutionFailure("Immediate vertex indices are not implemented");
       // TODO(Triang3l): VGT_IMMED_DATA.
       REXGPU_ERROR(
           "{}: Using immediate vertex indices, which are not supported yet. "
@@ -1510,6 +2061,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       index_buffer_info.length = 0;
     } break;
     default: {
+      OnPacketExecutionFailure("Invalid draw source selection");
       // Invalid source selection.
       draw_succeeded = false;
       assert_unhandled_case(vgt_draw_initiator.source_select);
@@ -1530,9 +2082,15 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+      ++command_summary_.draw_issue_attempts;
+      TraceDrawState(vgt_draw_initiator.prim_type,
+                     vgt_draw_initiator.num_indices,
+                     is_indexed ? &index_buffer_info : nullptr);
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
       if (!draw_succeeded) {
+        OnPacketExecutionFailure("Draw backend rejected an owned packet");
+        ++command_summary_.draw_issue_failures;
         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
         auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
         auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
@@ -1545,6 +2103,9 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
             uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
             uint32_t(rb_modecontrol.edram_mode));
       }
+    } else {
+      OnPacketExecutionFailure("Post-HiZ visualization-query draw suppression is not implemented");
+      ++command_summary_.draws_viz_query_skipped;
     }
   }
 
@@ -1739,6 +2300,7 @@ bool CommandProcessor::ExecutePacketType3_INVALIDATE_STATE(memory::RingBuffer* r
 
 bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
+  OnPacketExecutionFailure("Visualization-query results are not implemented");
   // begin/end initiator for viz query extent processing
   // https://www.google.com/patents/US20050195186
   assert_true(count == 1);

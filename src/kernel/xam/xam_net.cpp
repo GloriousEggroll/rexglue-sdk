@@ -684,9 +684,17 @@ i32 NetDll_getsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
     return static_cast<i32>(SetSocketError(0x2736));  // WSAENOTSOCK
   }
 
-  REXKRNL_WARN("NetDll_getsockopt: option {} at level {} is unimplemented",
-               optname, level);
-  return static_cast<i32>(SetSocketError(kWsaNoProtoOpt));
+  if (!optval_ptr || !optlen_ptr) {
+    return static_cast<i32>(SetSocketError(10014));  // WSAEFAULT
+  }
+  uint32_t length = *optlen_ptr;
+  X_STATUS status = socket->GetOption(level, optname, optval_ptr, &length);
+  if (XFAILED(status)) {
+    return static_cast<i32>(SetSocketError(
+        status == X_STATUS_NOT_SUPPORTED ? kWsaNoProtoOpt : 0x2726));  // WSAEINVAL
+  }
+  *optlen_ptr = length;
+  return 0;
 }
 
 u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {

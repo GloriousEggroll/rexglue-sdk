@@ -85,7 +85,8 @@ class VulkanPipelineCache {
       reg::RB_DEPTHCONTROL normalized_depth_control) const;
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
-                               VulkanShader::VulkanTranslation* pixel_shader);
+                               VulkanShader::VulkanTranslation* pixel_shader,
+                               bool* pending_out = nullptr, bool allow_async = false);
   // TODO(Triang3l): Return a deferred creation handle.
   bool ConfigurePipeline(
       VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
@@ -94,6 +95,10 @@ class VulkanPipelineCache {
       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
       const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
   bool IsCreatingPipelines() const;
+  // Authoritative native-query handback cannot omit an in-flight reference
+  // pipeline. Complete queued work and return only the real pipeline.
+  bool WaitForPipeline(void* handle,VkPipeline& pipeline_out,
+                       const PipelineLayoutProvider*& pipeline_layout_out);
   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
                                     const PipelineLayoutProvider*& pipeline_layout_out,
                                     bool* is_placeholder_out = nullptr) const;
@@ -237,6 +242,8 @@ class VulkanPipelineCache {
     // The layouts are owned by the VulkanCommandProcessor, and must not be
     // destroyed by it while the pipeline cache is active.
     std::atomic<const PipelineLayoutProvider*> pipeline_layout{nullptr};
+    // True while a background pipeline is pending. Its VkPipeline may be null;
+    // no discard pipeline is compiled because pending draws are never bound.
     std::atomic<bool> is_placeholder{false};
     Pipeline() = default;
     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
@@ -328,9 +335,14 @@ class VulkanPipelineCache {
   VulkanShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                            uint32_t dword_count, uint64_t data_hash);
 
-  // Can be called from multiple threads.
+  std::unique_ptr<SpirvShaderTranslator> CreateShaderTranslator() const;
+  AsyncShaderTranslation::State EnsureShaderTranslated(
+      VulkanShader::VulkanTranslation& translation, bool allow_async);
+  // Can be called from multiple threads, each with its own translator.
   bool TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                VulkanShader::VulkanTranslation& translation);
+  // Cache maps and layout IDs remain owned by the GPU command thread.
+  void SetupShaderBindingLayout(VulkanShader& shader);
 
   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
                                             PipelineRenderTarget& render_target_out) const;
@@ -415,7 +427,6 @@ class VulkanPipelineCache {
   // Empty depth-only pixel shader for writing to depth buffer using fragment
   // shader interlock when no Xenos pixel shader provided.
   VkShaderModule depth_only_fragment_shader_ = VK_NULL_HANDLE;
-  VkShaderModule placeholder_pixel_shader_ = VK_NULL_HANDLE;
   // Depth-only shaders for float24 emulation when no Xenos pixel shader is
   // provided in host render target mode.
   VkShaderModule depth_float24_truncate_fragment_shader_ = VK_NULL_HANDLE;
@@ -459,6 +470,7 @@ class VulkanPipelineCache {
 
   mutable std::mutex creation_request_lock_;
   std::condition_variable creation_request_cond_;
+  std::deque<VulkanShader::VulkanTranslation*> translation_queue_;
   std::priority_queue<PipelineCreationArguments, std::vector<PipelineCreationArguments>,
                       PipelineCreationArgumentsPriorityComparator>
       creation_queue_;

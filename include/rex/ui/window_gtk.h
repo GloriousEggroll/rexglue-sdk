@@ -12,6 +12,7 @@
 #pragma once
 
 #include <memory>
+#include <atomic>
 #include <string>
 
 #include <rex/platform.h>
@@ -29,6 +30,8 @@ class GTKWindow : public Window {
   using super = Window;
 
  public:
+  double GetMonitorRefreshRateHz() const override;
+  std::string GetDisplayOutputName() const override;
   GTKWindow(WindowedAppContext& app_context, const std::string_view title,
             uint32_t desired_logical_width, uint32_t desired_logical_height);
   ~GTKWindow() override;
@@ -42,6 +45,7 @@ class GTKWindow : public Window {
   void RequestCloseImpl() override;
 
   void ApplyNewFullscreen() override;
+  void ApplyNewLogicalSize() override;
   void ApplyNewTitle() override;
   void ApplyNewMainMenu(MenuItem* old_main_menu) override;
   // Mouse capture seems to happen implicitly compared to Windows.
@@ -51,6 +55,7 @@ class GTKWindow : public Window {
   void RequestPaintImpl() override;
 
  private:
+  void ScheduleSizeUpdate();
   void HandleSizeUpdate(WindowDestructionReceiver& destruction_receiver);
   // For updating multiple factors that may influence the window size at once,
   // without handling the configure event multiple times (that may not only
@@ -76,6 +81,19 @@ class GTKWindow : public Window {
   GtkWidget* box_ = nullptr;
   GtkWidget* drawing_area_ = nullptr;
 
+  // Vulkan uses a child Wayland surface. Its opaque buffer may occlude the
+  // GTK parent, whose frame callbacks therefore cannot drive host overlays.
+  bool native_wayland_ = false;
+  // Zero-based GDK monitor index for the monitor cvar, or -1 to let the
+  // compositor choose. Automatic (0) prefers the desktop's primary output.
+  int ResolveMonitorIndex() const;
+  // Weak identity prevents stale connector names if a monitor is unplugged.
+  mutable GdkMonitor* output_name_monitor_ = nullptr;
+  mutable std::string display_output_name_;
+  bool restore_windowed_size_ = false;
+  guint native_paint_timer_ = 0;
+  guint size_update_source_ = 0;
+  std::atomic<bool> native_paint_pending_{false};
   uint32_t batched_size_update_depth_ = 0;
   bool batched_size_update_contained_configure_ = false;
   bool batched_size_update_contained_draw_ = false;

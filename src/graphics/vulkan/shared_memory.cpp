@@ -284,11 +284,20 @@ void VulkanSharedMemory::InitializeTraceCompleteDownloads() {
   void* download_mapping;
   if (dfn.vkMapMemory(device, trace_download_buffer_memory_, 0, VK_WHOLE_SIZE, 0,
                       &download_mapping) == VK_SUCCESS) {
+    VkMappedMemoryRange mapped_range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    mapped_range.memory=trace_download_buffer_memory_;
+    mapped_range.size=VK_WHOLE_SIZE;
+    if(dfn.vkInvalidateMappedMemoryRanges(device,1,&mapped_range)!=VK_SUCCESS) {
+      dfn.vkUnmapMemory(device,trace_download_buffer_memory_);
+      REXGPU_ERROR("Failed to invalidate GPU history readback memory");
+      ResetTraceDownload();return;
+    }
     uint32_t download_buffer_offset = 0;
     for (const auto& download_range : trace_download_ranges()) {
       trace_writer_.WriteMemoryRead(
           download_range.first, download_range.second,
           reinterpret_cast<const uint8_t*>(download_mapping) + download_buffer_offset);
+      download_buffer_offset+=download_range.second;
     }
     dfn.vkUnmapMemory(device, trace_download_buffer_memory_);
   } else {
@@ -411,7 +420,7 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
   switch (usage) {
     case Usage::kComputeWrite:
       stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-      access_mask = VK_ACCESS_SHADER_READ_BIT;
+      access_mask = VK_ACCESS_SHADER_WRITE_BIT;
       return;
     case Usage::kTransferDestination:
       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;

@@ -47,6 +47,11 @@ class MMIOHandler {
   typedef bool (*AccessViolationCallback)(
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
       void* host_address, bool is_write);
+  // Optional explicit ownership proof for a non-MMIO fault, queried under the
+  // global protection lock. True permits dispatch directly to the same handler
+  // without an OS permission query. The handler must service its own temporary
+  // restriction/repair authority; it must never claim genuine guest protection.
+  typedef bool (*AccessViolationOwnershipQuery)(void* context,void* host_address,bool is_write);
 
   // access_violation_callback is called with global_critical_region locked once
   // on the thread, so if multiple threads trigger an access violation in the
@@ -56,7 +61,8 @@ class MMIOHandler {
                                               HostToGuestVirtual host_to_guest_virtual,
                                               const void* host_to_guest_virtual_context,
                                               AccessViolationCallback access_violation_callback,
-                                              void* access_violation_callback_context);
+                                              void* access_violation_callback_context,
+                                              AccessViolationOwnershipQuery ownership_query=nullptr);
   static MMIOHandler* global_handler();
 
   bool RegisterRange(uint32_t virtual_address, uint32_t mask, uint32_t size, void* context,
@@ -70,7 +76,8 @@ class MMIOHandler {
   MMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase, uint8_t* membase_end,
               HostToGuestVirtual host_to_guest_virtual, const void* host_to_guest_virtual_context,
               AccessViolationCallback access_violation_callback,
-              void* access_violation_callback_context);
+              void* access_violation_callback_context,
+              AccessViolationOwnershipQuery ownership_query);
 
   static bool ExceptionCallbackThunk(arch::Exception* ex, void* data);
   bool ExceptionCallback(arch::Exception* ex);
@@ -86,6 +93,7 @@ class MMIOHandler {
 
   AccessViolationCallback access_violation_callback_;
   void* access_violation_callback_context_;
+  AccessViolationOwnershipQuery access_violation_ownership_query_=nullptr;
 
   static MMIOHandler* global_handler_;
 

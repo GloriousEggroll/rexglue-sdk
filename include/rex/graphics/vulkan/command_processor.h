@@ -1,4 +1,12 @@
 #pragma once
+
+#include <rex/graphics/native_callback.h>
+#include <rex/graphics/native_scene_authority.h>
+#include <rex/graphics/native_completion.h>
+#include <rex/graphics/marker_following_census.h>
+#include <rex/graphics/marker_query_cohort_census.h>
+#include <rex/graphics/native_coherence_wait.h>
+#include <rex/graphics/native_query_tickets.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -11,11 +19,14 @@
  */
 
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -24,6 +35,8 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/pending_query_results.h>
+#include <rex/graphics/native_query_accumulator.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -138,6 +151,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
   void RestoreEdramSnapshot(const void* snapshot) override;
+  // GPU-thread only. Callbacks use this device and queue, and must fence their
+  // work before returning. Import's ranges are sorted (address, byte count).
+  // Import preserves other bytes and invalidates cached texture/geometry views;
+  // guest CPU publication is a separate operation. False means no callback ran.
+  bool ImportNativeGpuState(std::span<const std::pair<uint32_t,uint32_t>> physical,
+                            std::span<const std::pair<uint32_t,uint32_t>> edram,
+                            const std::function<void(VkBuffer,VkBuffer)>& copy);
+  bool InitializeNativeEdram(const std::function<void(VkBuffer)>& copy);
 
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
@@ -146,6 +167,163 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
                           std::vector<uint32_t>& spirv_out, std::string& error_out) const;
+
+  // A native renderer may replace the final image while retaining the existing
+  // gamma, HDR, scaling and platform presentation. The image must belong to our
+  // VkDevice and have been submitted on graphics/compute queue zero, ending in
+  // SHADER_READ_ONLY_OPTIMAL. keep_alive owns its image, view and backing memory
+  // until the swap submission fence completes; the provider must not reuse it
+  // for writes before that ownership is released.
+  struct NativeSwapSource {
+    VkDevice device = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    xenos::TextureFormat format = xenos::TextureFormat::k_8_8_8_8;
+    std::shared_ptr<const void> keep_alive;
+  };
+  using NativeSwapSourceProvider = std::function<std::optional<NativeSwapSource>(
+      uint32_t api_frame, uint32_t frontbuffer, uint32_t width, uint32_t height)>;
+  // Installation is queued onto the GPU thread. An empty provider restores the
+  // reference source; nullopt declines only the current frame. This hook alone
+  // does not disable or replace reference draw/resolve submission.
+  void SetNativeSwapSourceProvider(NativeSwapSourceProvider provider);
+  using NativeQueryBoundary = NativeQueryIdentity;
+  using NativeQueryBoundaryProvider=std::function<void(const NativeQueryBoundary&)>;
+  // The optional SharedImmutable storage applies only to the installed callable
+  // and requires NativeCallbackStorage's immutable-target contract. The default
+  // preserves per-invocation std::function copies for arbitrary SDK clients.
+  // Observes query end in PM4 order, after submitting preceding reference
+  // commands and before that ZPD packet returns. Reference reports remain the
+  // guest authority; this callback never bypasses reference query/draw work.
+  void SetNativeQueryBoundaryProvider(
+      NativeQueryBoundaryProvider provider,
+      NativeCallbackStorage storage = NativeCallbackStorage::CopyPerInvocation);
+  // GPU-thread only, with this exact current end capability or a deferred
+  // ticket. The caller must fence all earlier native command lists first.
+  // Writes actual samples once; a superseded ticket retires without a write.
+  void PublishNativeQueryResult(const NativeQueryBoundary& boundary,uint64_t samples);
+  // Startup opt-in, queued after SetNativeQueryAuthority(true). Default false.
+  // Changing this mode requires no active query; disabling drains old tickets.
+  void SetNativeQueryDeferralEnabled(bool enabled);
+  // GPU-thread only, during the exact native end callback, after closing the
+  // matching native query. Reserves bounded ownership even for zero draws.
+  void DeferNativeQueryResult(const NativeQueryBoundary& boundary);
+  // Elects native ownership at subsequent ZPD begin packets, before any host
+  // query exists. Installation is queued; returning to reference is one-way
+  // until a fresh provider is installed. Requires complete raster ownership.
+  void SetNativeQueryAuthority(bool enabled);
+  // Startup preflight before guest execution. Waits for the GPU-thread context
+  // setup through its callback queue; never reads partially initialized pools.
+  bool CanUseNativeQueryAuthority();
+  // Terminal teardown after guest execution stops. Prevents any further
+  // rendering, fences existing work, and destroys provider-owned GPU resources
+  // while the shared Vulkan device remains alive. Not a runtime fallback.
+  void ShutdownNativeRendering();
+  // GPU-thread only, after importing committed native GPU state. An active
+  // native query must match this end report and contributes its completed
+  // sample subtotal; the reference counts only the remaining draws. Pass 0,0
+  // when no query is active. This permanently relinquishes native authority.
+  void HandBackNativeQuery(uint32_t end_address,uint64_t native_samples);
+  std::optional<NativeQueryBoundary> ActiveNativeQuery() const {
+    return native_query_authority_ ? (native_query_tickets_.current_end() ?
+        native_query_tickets_.current_end() : active_native_query_boundary_) : std::nullopt;
+  }
+  struct NativeDrawBoundary {
+    uint32_t command_address=0;
+    std::span<const uint8_t> packet_bytes;
+    uint32_t primitive=0,index_count=0,edram_mode=0;
+    uint32_t index_address=0,index_endian=0,index_format=0;
+    uint32_t copy_destination=0,copy_destination_info=0;
+    std::span<const uint32_t> vertex_shader_words;
+    std::array<uint32_t,2> vertex_fetch95{};
+    std::array<uint32_t,8> export_constants{};
+    uint32_t clip_control=0,vte_control=0,index_offset=0;
+    uint32_t color_mask=0,depth_control=0,surface_info=0;
+    // 1: no vertices; 2: rasterization disabled and no vertex memory export;
+    // 3: no framebuffer writes, either shader's memexport, or active query.
+    uint32_t proven_no_effect=0;
+    uint64_t bin_mask=0,bin_select=0;
+    bool packet_predicated=false,predicate_passed=false;
+  };
+  enum class NativeDrawDisposition { ReferenceCoherent, NativeCompleted, NativePending, ProvenNoEffect };
+  using NativeDrawBoundaryProvider=std::function<NativeDrawDisposition(const NativeDrawBoundary&)>;
+  // Invoked before raster/copy submission. A selected replacement calls
+  // PrepareNativeDrawSubmission before touching the shared queue.
+  // NativeCompleted requires exact ownership and successful native completion.
+  // NativePending accepts exact ownership but retains immutable GPU resources
+  // until the completion provider is drained before an external side effect.
+  // ReferenceCoherent requires state handback if earlier work was replaced.
+  // An exception is fatal to the native transaction, never permission to
+  // silently replay potentially half-written rendering through the reference.
+  void SetNativeDrawBoundaryProvider(
+      NativeDrawBoundaryProvider provider,
+      NativeCallbackStorage storage = NativeCallbackStorage::CopyPerInvocation);
+  using NativeCompletionProvider=std::function<void(NativeCompletionReason)>;
+  void SetNativeCompletionProvider(
+      NativeCompletionProvider provider,
+      NativeCallbackStorage storage = NativeCallbackStorage::CopyPerInvocation);
+  // Separate opt-in for cache-only register waits. True certifies all accepted
+  // input ownership, explicit same-queue cache dependencies and completion of
+  // every CPU-visible native write before this callback. Submit/poll may retire
+  // older fences for bounded pressure, but must not clear the pending latch or
+  // advance guest serials. False retains the full completion fallback.
+  using NativeCoherenceProvider = std::function<bool()>;
+  void SetNativeCoherenceProvider(
+      NativeCoherenceProvider provider,
+      NativeCallbackStorage storage = NativeCallbackStorage::CopyPerInvocation);
+  // Optional CP-only diagnostic. Pure POD observer: no callback replacement,
+  // owner mutation, JSON, allocation, clocks, submission, polling or waiting.
+  // Installed in the strict transaction, retained through final observation.
+  using NativeAcceptedWorkObserver =
+      std::function<gow3::diagnostic::MarkerFollowingCensus::Snapshot()>;
+  using NativeMarkerReadinessObserver =
+      std::function<gow3::diagnostic::MarkerQueryCohortCensus::Readiness()>;
+  // Runtime operation adapter: observation only, on the same CP thread.
+  void ObserveNativeMarkerOperation(std::string_view operation) noexcept;
+  // Optional pure metadata lookup, not a mutable target lease. An observed
+  // registration cannot authenticate allocation lifetime or authorize stores.
+  using NativeMarkerAllocationObserver = std::function<
+      gow3::diagnostic::MarkerOperandCensus::Allocation(uint32_t physical_target)>;
+  // Atomic startup installation, synchronously confirmed on the CP thread.
+  // Rendering providers are mandatory except cache-coherence progress; the
+  // diagnostic observer is optional and cannot authorize work. Once enabled,
+  // no provider downgrade or reference scene operation is permitted; only the
+  // terminal shutdown seam may release the providers after fencing their work.
+  struct StrictNativeProviders {
+    NativeSwapSourceProvider present;
+    NativeQueryBoundaryProvider query;
+    NativeDrawBoundaryProvider draw;
+    NativeCompletionProvider complete;
+    NativeCoherenceProvider coherence;
+    NativeImmediateMarkerProviders immediate_markers;
+    NativeAcceptedWorkObserver observe_accepted_work;
+    NativeMarkerReadinessObserver observe_marker_readiness;
+    NativeMarkerAllocationObserver observe_marker_allocation;
+    NativeCallbackStorage storage = NativeCallbackStorage::CopyPerInvocation;
+    bool defer_queries = false;
+  };
+  void InstallStrictNativeRendering(StrictNativeProviders providers);
+  // CP-thread fatal diagnostic; never changes scene authority or releases owners.
+  void ReportNativeSceneFailure(std::string_view reason) noexcept;
+  // Called from the draw provider after choosing a replacement, or from a
+  // query/swap provider to hand back committed state. Merely observing a draw
+  // must not split an active reference occlusion query.
+  // Returns false if a query is active; the caller must retain reference work.
+  bool PrepareNativeDrawSubmission();
+  struct NativeReferenceQueryResult {
+    uint64_t samples = 0;
+    uint64_t submission = 0;
+    uint64_t frame = 0;
+    uint32_t guest_samples = 0;
+    uint32_t skipped_async_draws = 0;
+  };
+  // GPU-thread only, after the native renderer's same-queue fence. Retires
+  // already-completed reference results; it does not add a GPU wait. A result
+  // is returned only for the currently open reference frame and query record.
+  void PollNativeComparisonResults();
+  std::optional<NativeReferenceQueryResult> ReadNativeComparisonResult(uint32_t end_address) const;
 
   // Returns the deferred drawing command list for the currently open
   // submission.
@@ -255,11 +433,24 @@ class VulkanCommandProcessor : public CommandProcessor {
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
-                                          uint32_t count) override;
+                                         uint32_t count) override;
+  bool ExecutePacketType3_EVENT_WRITE_ZPD_Reference(memory::RingBuffer* reader,uint32_t packet,uint32_t count);
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
   void OnPrimaryBufferEnd() override;
+  void PrepareForWait() override;
+  void OnPacketExecutionFailure(const char* reason) override;
+  void PrepareForPacket(uint32_t opcode, uint32_t count) override;
+  std::shared_ptr<void> PrepareNativeImmediateMarkerPair(const NativeCompletionMarkerPair&) override;
+  void ObserveDecodedEventWriteShd(uint32_t packet,uint32_t count,
+      uint32_t initiator,uint32_t address,uint32_t value,uintptr_t command_buffer,
+      uint32_t capacity,uint32_t end_offset) noexcept override;
+  void PrepareForRegisterWait(uint32_t count, uint32_t info, uint32_t address,
+                             uint32_t reference, uint32_t mask, uint32_t delay) override;
+  void CompleteNativeWork(NativeCompletionReason reason, uint32_t opcode=UINT32_MAX);
+  void LogNativeCompletionSummary(bool force=false);
+  void LogNativeQueryStatistics();
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -442,13 +633,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   void ShutdownOcclusionQueryResources();
   bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
   bool EndGuestOcclusionQuery(uint32_t sample_count_address);
+  void RecordOcclusionQueryEnd(uint32_t sample_count_address,bool final_segment);
   bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
   void DisableHostOcclusionQueries();
+  void RetireOcclusionQueries();
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(uint32_t sample_count_address, uint64_t samples);
-  void InvalidateAllVertexBufferResidency();
-  void InvalidateVertexBufferResidency(uint32_t vfetch_index);
-  void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
   struct ReadbackBuffer {
     VkBuffer buffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDeviceMemory memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -535,6 +725,49 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<VkPipelineStageFlags> current_submission_wait_stage_masks_;
   std::vector<VkFence> submissions_in_flight_fences_;
   std::deque<std::pair<uint64_t, VkSemaphore>> submissions_in_flight_semaphores_;
+  NativeSceneAuthority native_scene_authority_;
+  bool native_scene_statistics_logged_ = false;
+  void LogNativeSceneStatistics();
+  NativeSwapSourceProvider native_swap_source_provider_;
+  NativeCallback<NativeQueryBoundaryProvider> native_query_boundary_provider_;
+  NativeCallback<NativeDrawBoundaryProvider> native_draw_boundary_provider_;
+  NativeCallback<NativeCompletionProvider> native_completion_provider_;
+  NativeCompletionState native_completion_state_;
+  NativeAcceptedWorkObserver native_accepted_work_observer_;
+  NativeMarkerReadinessObserver native_marker_readiness_observer_;
+  NativeMarkerAllocationObserver native_marker_allocation_observer_;
+  NativeImmediateMarkerProviders native_immediate_marker_providers_;
+  struct NativeImmediateMarkerStatistics {
+    uint64_t candidates=0,selected=0,pending_selected=0,authority_refusals=0,
+        query_refusals=0,provider_refusals=0,target_refusals=0;
+  } native_immediate_marker_stats_;
+
+  gow3::diagnostic::MarkerOperandCensus native_marker_operands_;
+  gow3::diagnostic::MarkerQueryCohortCensus native_marker_query_cohorts_;
+  gow3::diagnostic::MarkerQueryCohortCensus::Readiness ObserveNativeMarkerReadiness() noexcept;
+  void ObserveNativeMarkerBoundary(gow3::diagnostic::MarkerQueryCohortCensus::Boundary reason) noexcept;
+  gow3::diagnostic::MarkerFollowingCensus native_marker_following_;
+  gow3::diagnostic::MarkerFollowingCensus::Snapshot ObserveNativeAcceptedWork() noexcept;
+  NativeCallback<NativeCoherenceProvider> native_coherence_provider_;
+  uint64_t native_coherence_submissions_ = 0, native_coherence_fallbacks_ = 0;
+  static constexpr size_t kNativeCompletionReasonCount=
+      static_cast<size_t>(NativeCompletionReason::Shutdown)+1;
+  // Subset of finalized windows whose SDK endpoint had no pending latch/ticket.
+  std::array<uint64_t,kNativeCompletionReasonCount> native_marker_no_pending_finalized_{};
+  std::array<uint64_t,kNativeCompletionReasonCount> native_completion_reason_counts_{};
+  std::array<uint64_t,128> native_completion_opcode_counts_{};
+  std::array<double,128> native_completion_opcode_wall_ms_{};
+  uint32_t native_completion_summary_frames_=0;
+  bool in_native_draw_boundary_=false,native_draw_submission_prepared_=false,in_native_swap_boundary_=false;
+  uint64_t native_query_generation_=0;
+  bool native_query_authority_=false,native_query_authority_retired_=false,native_query_authority_armed_=false;
+  bool native_rendering_shutdown_=false;
+  std::atomic<bool> native_rendering_shutdown_requested_{false};
+  std::optional<NativeQueryBoundary> active_native_query_boundary_;
+  NativeQueryTickets native_query_tickets_;
+  bool native_query_deferral_enabled_=false;
+  bool native_query_statistics_logged_=false;
+  std::deque<std::pair<uint64_t, std::shared_ptr<const void>>> native_swap_sources_in_flight_;
 
   static constexpr uint32_t kMaxFramesInFlight = 3;
   bool frame_open_ = false;
@@ -739,20 +972,25 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkDeviceMemory occlusion_query_readback_memory_ = VK_NULL_HANDLE;
   uint32_t occlusion_query_readback_memory_type_ = UINT32_MAX;
   VkDeviceSize occlusion_query_readback_memory_size_ = 0;
+  VkDeviceSize occlusion_query_readback_stride_ = sizeof(uint64_t);
   uint8_t* occlusion_query_readback_mapping_ = nullptr;
   uint32_t occlusion_query_cursor_ = 0;
+  std::array<uint64_t, kMaxOcclusionQueries> occlusion_query_last_submission_ = {};
+  std::array<uint64_t, kMaxOcclusionQueries> occlusion_query_frame_ = {};
+  std::array<uint32_t, kMaxOcclusionQueries> occlusion_query_skipped_async_draws_ = {};
+  std::array<std::shared_ptr<NativeQueryAccumulator>, kMaxOcclusionQueries> occlusion_query_native_prefix_ = {};
+  std::array<bool, kMaxOcclusionQueries> occlusion_query_final_segment_ = {};
+  std::shared_ptr<NativeQueryAccumulator> resume_native_query_;
+  std::unordered_map<uint32_t, NativeReferenceQueryResult> native_reference_query_results_;
+  PendingQueryResults pending_occlusion_results_;
   bool occlusion_query_resources_available_ = false;
   struct ActiveOcclusionQuery {
     uint32_t sample_count_address = 0;
     uint32_t host_index = UINT32_MAX;
+    uint32_t skipped_async_draws = 0;
+    std::shared_ptr<NativeQueryAccumulator> native_prefix;
     bool valid = false;
   } active_occlusion_query_;
-  struct VertexBufferState {
-    uint32_t address = UINT32_MAX;
-    uint32_t size = UINT32_MAX;
-  };
-  std::array<VertexBufferState, 96> vertex_buffer_states_{};
-  uint64_t vertex_buffers_in_sync_[2] = {};
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 

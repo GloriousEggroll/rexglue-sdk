@@ -34,6 +34,8 @@ class InputDriver {
   virtual X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                                    X_INPUT_CAPABILITIES* out_caps) = 0;
   virtual X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) = 0;
+  // Physical controller state for host menus, independent of guest input capture.
+  virtual X_RESULT GetHostState(uint32_t, X_INPUT_STATE*) { return X_ERROR_DEVICE_NOT_CONNECTED; }
   virtual X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) = 0;
   virtual X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                                 X_INPUT_KEYSTROKE* out_keystroke) = 0;

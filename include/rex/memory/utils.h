@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <span>
 #include <string_view>
 #include <type_traits>
 
@@ -113,6 +114,18 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 // rights. The length will start from the first byte of the first page of
 // the region.
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out);
+
+// Ephemeral full-page permission query. Caller owns valid, non-overlapping
+// output storage and must keep the target mappings/protections stable for the
+// whole call and any subsequent use. No permissions are changed or retained.
+// A false result supplies no proof (output may be partially filled). Requests
+// must be nonempty/aligned, at most16 ranges and16384 pages total; arithmetic
+// overflow, an unmapped gap or unsupported platform rejects the whole query.
+struct PageProtectionQuery {
+  uintptr_t address = 0;
+  std::span<PageAccess> pages;
+};
+bool QueryProtectPages(std::span<const PageProtectionQuery> requests);
 
 // Allocates a block of memory for a type with the given alignment.
 // The memory must be freed with AlignedFree.

@@ -14,6 +14,7 @@
 #include <fstream>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <CLI/CLI.hpp>
 
@@ -26,6 +27,7 @@ namespace rex::cvar {
 
 namespace {
 
+std::unordered_set<std::string> g_cli_overrides;
 bool g_finalized = false;
 bool g_lifecycle_override = false;
 std::mutex g_mutex;
@@ -57,13 +59,15 @@ std::string FlagNameToEnvVar(std::string_view name) {
   return result;
 }
 
-// Recursively apply TOML values
-void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
+// Flatten first so backend selection is independent of TOML key order.
+void CollectTomlValues(const toml::table& table, const std::string& prefix,
+                       ConfigValues& values,
+                       std::unordered_set<std::string>& unsupported) {
   for (const auto& [key, value] : table) {
     std::string full_key = prefix.empty() ? std::string(key) : prefix + "_" + std::string(key);
 
     if (value.is_table()) {
-      ApplyTomlTable(*value.as_table(), full_key);
+      CollectTomlValues(*value.as_table(), full_key, values, unsupported);
     } else {
       std::string value_str;
       if (value.is_boolean()) {
@@ -75,15 +79,10 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
       } else if (value.is_string()) {
         value_str = value.as_string()->get();
       } else {
-        REXLOG_WARN("Config: unsupported type for key '{}'", full_key);
-        continue;
+        unsupported.insert(full_key);
       }
 
-      if (SetFlagByName(full_key, value_str)) {
-        REXLOG_DEBUG("Config: {} = {}", full_key, value_str);
-      } else {
-        REXLOG_WARN("Config: unknown cvar '{}'", full_key);
-      }
+      values.insert_or_assign(std::move(full_key), std::move(value_str));
     }
   }
 }
@@ -222,6 +221,10 @@ void FlagRegistrar::apply_(std::function<void(FlagEntry&)> fn) {
     return;
   }
   fn(GetRegistryStorage()[it->second]);
+}
+
+bool IsCommandLineOverride(std::string_view name) {
+  return g_cli_overrides.contains(std::string(name));
 }
 
 bool SetFlagByName(std::string_view name, std::string_view value) {
@@ -466,16 +469,21 @@ void UnregisterChangeCallbacks(std::string_view name) {
 std::vector<std::string> Init(int argc, char** argv) {
   CLI::App app{"", ""};
   app.allow_extras();
+  g_cli_overrides.clear();
 
   for (auto& entry : GetRegistryStorage()) {
     if (entry.type == FlagType::Boolean) {
       app.add_flag_function(
           "--" + entry.name + ",!--no-" + entry.name,
-          [&entry](int64_t count) { entry.setter(count > 0 ? "true" : "false"); },
+          [&entry](int64_t count) {
+            if (entry.setter(count > 0 ? "true" : "false")) g_cli_overrides.insert(entry.name);
+          },
           entry.description);
     } else {
       app.add_option_function<std::string>(
-          "--" + entry.name, [&entry](const std::string& val) { entry.setter(val); },
+          "--" + entry.name, [&entry](const std::string& val) {
+            if (entry.setter(val)) g_cli_overrides.insert(entry.name);
+          },
           entry.description);
     }
   }
@@ -491,24 +499,47 @@ std::vector<std::string> Init(int argc, char** argv) {
   return app.remaining();
 }
 
-void LoadConfig(const std::filesystem::path& config_path) {
-  if (!std::filesystem::exists(config_path)) {
+void LoadConfig(const std::filesystem::path& config_path,
+                const ConfigTransform& transform) {
+  const bool exists = std::filesystem::exists(config_path);
+  if (!exists) {
     REXLOG_DEBUG("Config file not found: {}", config_path.string());
-    return;
+    if (!transform) return;
   }
 
   try {
-    auto config = toml::parse_file(config_path.string());
-    ApplyTomlTable(config, "");
-    REXLOG_INFO("Loaded config from {}", config_path.string());
+    auto config = exists ? toml::parse_file(config_path.string()) : toml::table{};
+    ConfigValues values;
+    std::unordered_set<std::string> unsupported;
+    CollectTomlValues(config, "", values, unsupported);
+    if (transform) transform(values);
+    for (const auto& [key, value] : values) {
+      if (g_cli_overrides.contains(key)) continue;
+      // A transform may replace a malformed inactive setting with a required
+      // backend value. Only an unchanged unsupported sentinel is skipped.
+      if (unsupported.contains(key) && value.empty()) {
+        REXLOG_WARN("Config: unsupported type for key '{}'", key);
+        continue;
+      }
+      if (SetFlagByName(key, value)) {
+        REXLOG_DEBUG("Config: {} = {}", key, value);
+      } else {
+        REXLOG_WARN("Config: unknown or invalid cvar '{}'", key);
+      }
+    }
+    if (exists) REXLOG_INFO("Loaded config from {}", config_path.string());
   } catch (const toml::parse_error& err) {
     REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+    // A backend-selecting application cannot safely substitute default values
+    // when its selection could not be read.
+    if (transform) throw;
   }
 }
 
 void ApplyEnvironment() {
   int count = 0;
   for (const auto& entry : GetRegistryStorage()) {
+    if (g_cli_overrides.contains(entry.name)) continue;
     std::string env_name = FlagNameToEnvVar(entry.name);
     const char* env_value = std::getenv(env_name.c_str());
     if (env_value != nullptr) {

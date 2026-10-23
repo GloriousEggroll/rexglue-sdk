@@ -170,6 +170,12 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   return true;
 }
 
+bool QueryProtectPages(std::span<const PageProtectionQuery>) {
+  // The optional batch proof remains unsupported until its Windows mapping
+  // fixture is validated. Existing point queries and exact fallback remain.
+  return false;
+}
+
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit) {
   DWORD protect = ToWin32ProtectFlags(access) | (commit ? SEC_COMMIT : SEC_RESERVE);

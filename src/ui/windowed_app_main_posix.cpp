@@ -24,9 +24,9 @@
 #include <gtk/gtk.h>
 
 extern "C" int main(int argc_pre_gtk, char** argv_pre_gtk) {
-  // Before touching anything GTK+, make sure that when running on Wayland,
-  // we'll still get an X11 (Xwayland) window
-  setenv("GDK_BACKEND", "x11", 1);
+  // Prefer native Wayland. GTK tries X11/Xwayland if it cannot connect.
+  // Respect an explicit GDK_BACKEND=x11 for compatibility comparisons.
+  setenv("GDK_BACKEND", "wayland,x11", 0);
 
   // Initialize GTK+, which will handle and remove its own arguments from argv.
   // Both GTK+ and Xenia use --option=value argument format (see man

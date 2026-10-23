@@ -31,6 +31,9 @@ REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "GPU", "Enable half pixel offset");
 REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU",
                     "Fill half pixel offset during resolution scale resolve");
 
+REXCVAR_DEFINE_BOOL(gamma_decode_pwl_resolve, true, "GPU",
+                    "Decode PWL gamma before averaging full gamma color resolves");
+
 // Very prominent in 545407F2.
 // DEFINE_bool(
 //     resolve_resolution_scale_fill_half_pixel_offset, true,
@@ -1066,6 +1069,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     color_edram_info.format = uint32_t(color_info.color_format);
     color_edram_info.format_is_64bpp = is_64bpp;
     color_edram_info.fill_half_pixel_offset = uint32_t(fill_half_pixel_offset);
+    color_edram_info.decode_pwl_gamma = REXCVAR_GET(gamma_decode_pwl_resolve) ? 1u : 0u;
     if ((fixed_rg16_truncated_to_minus_1_to_1 &&
          color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16) ||
         (fixed_rgba16_truncated_to_minus_1_to_1 &&

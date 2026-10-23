@@ -30,6 +30,17 @@ bool DynamicLibrary::Load(const std::filesystem::path& path) {
   return handle_ != nullptr;
 }
 
+bool DynamicLibrary::LoadExisting(const std::filesystem::path& path) {
+  Close();
+  HMODULE module = nullptr;
+  // Increment the reference count so Close() can release it normally.
+  if (!GetModuleHandleExW(0, path.c_str(), &module)) {
+    return false;
+  }
+  handle_ = static_cast<void*>(module);
+  return true;
+}
+
 void DynamicLibrary::Close() {
   if (handle_) {
     FreeLibrary(static_cast<HMODULE>(handle_));

@@ -74,6 +74,13 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
   return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
+X_RESULT InputSystem::GetHostState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  for (auto& driver : drivers_) {
+    if (driver->GetHostState(user_index, out_state) == X_ERROR_SUCCESS) return X_ERROR_SUCCESS;
+  }
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
 

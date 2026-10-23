@@ -178,12 +178,14 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
   }
 
-  const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
   assert_true(count == 1);
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
 
-  uint32_t sample_count_addr = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+  const uint32_t report_address =
+      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+  uint32_t sample_count_addr =
+      xenos::XenosZPDReport::GetRecordBase(report_address);
   auto* sample_counts =
       memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_addr);
   if (!sample_counts) {
@@ -191,44 +193,48 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     return true;
   }
 
-  auto write_fallback_result = [sample_counts, kQueryFinished]() -> bool {
+  auto write_fallback_result = [sample_counts, report_address]() -> bool {
     auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
     if (fake_sample_count < 0) {
       return true;
     }
-    bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
-    bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
-    std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
-    if (is_end_via_z_pass || is_end_via_z_fail) {
-      sample_counts->ZPass_A = fake_sample_count;
-      sample_counts->Total_A = fake_sample_count;
+    bool is_end = xenos::XenosZPDReport::IsEndRecord(report_address);
+    if (!xenos::XenosZPDReport::IsBeginRecord(report_address) && !is_end) {
+      is_end = xenos::XenosZPDReport::HasPendingSentinel(sample_counts);
+    }
+    if (is_end) {
+      xenos::XenosZPDReport::WriteSampleCount(
+          sample_counts, uint32_t(fake_sample_count));
+    } else {
+      std::memset(sample_counts, 0,
+                  sizeof(xenos::xe_gpu_depth_sample_counts));
     }
     return true;
   };
 
-  bool is_end_via_z_pass =
-      sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
-  bool is_end_via_z_fail =
-      sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
-  bool is_end = is_end_via_z_pass || is_end_via_z_fail;
+  const bool is_begin =
+      xenos::XenosZPDReport::IsBeginRecord(report_address);
+  const bool is_end = xenos::XenosZPDReport::IsEndRecord(report_address);
 
-  if (!is_end) {
+  if (is_begin) {
     if (active_occlusion_query_.valid &&
-        active_occlusion_query_.sample_count_address != sample_count_addr) {
+        xenos::XenosZPDReport::GetSlotBase(active_occlusion_query_.sample_count_address) !=
+            xenos::XenosZPDReport::GetSlotBase(sample_count_addr)) {
       DisableHostOcclusionQueries();
       return write_fallback_result();
     }
+    std::memset(sample_counts, 0,
+                sizeof(xenos::xe_gpu_depth_sample_counts));
     if (!BeginGuestOcclusionQuery(sample_count_addr)) {
       return write_fallback_result();
     }
     return true;
   }
 
-  if (!active_occlusion_query_.valid ||
-      active_occlusion_query_.sample_count_address != sample_count_addr) {
-    DisableHostOcclusionQueries();
+  if (!is_end || !active_occlusion_query_.valid ||
+      xenos::XenosZPDReport::GetSlotBase(
+          active_occlusion_query_.sample_count_address) !=
+          xenos::XenosZPDReport::GetSlotBase(sample_count_addr)) {
     return write_fallback_result();
   }
 

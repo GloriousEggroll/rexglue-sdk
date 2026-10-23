@@ -6,6 +6,7 @@
 #define REX_CONFIG_H_INCLUDED
 
 #include <rex/ppc.h>
+#include <rex/trace/guest_function.h>
 #include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/chrono/clock.h>
@@ -181,4 +182,3 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
     assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
     rex::thread::global_critical_region::mutex().unlock();                                \
   } while (0)
-

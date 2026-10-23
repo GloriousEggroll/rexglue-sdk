@@ -35,6 +35,12 @@ REXCVAR_DECLARE(bool, readback_memexport);
 REXCVAR_DECLARE(bool, readback_memexport_fast);
 REXCVAR_DECLARE(bool, occlusion_query_enable);
 REXCVAR_DECLARE(bool, occlusion_query_zero_is_visible);
+REXCVAR_DECLARE(bool, zpd_trace);
+REXCVAR_DECLARE(bool, gpu_no_effect_trace);
+REXCVAR_DECLARE(int32_t, gpu_draw_trace_interval);
+REXCVAR_DECLARE(bool, gpu_draw_trace_resources);
+REXCVAR_DECLARE(bool, gpu_draw_trace_memory);
+REXCVAR_DECLARE(int32_t, gpu_texture_trace_address);
 REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
 
 // GPU Depth / Render Target Behavior
@@ -79,6 +85,12 @@ REXCVAR_DECLARE(bool, use_fuzzy_alpha_epsilon);
 REXCVAR_DECLARE(std::string, dump_shaders);
 REXCVAR_DECLARE(bool, dxbc_switch);
 REXCVAR_DECLARE(bool, dxbc_source_map);
+REXCVAR_DECLARE(bool, gpu_probe_gow3_yuv_samples);
+REXCVAR_DECLARE(bool, gpu_probe_gow3_yuv_constant);
+REXCVAR_DECLARE(bool, gpu_probe_gow3_scene_composite_constant);
+REXCVAR_DECLARE(bool, gpu_probe_gow3_scene_composite_input);
+REXCVAR_DECLARE(bool, gpu_probe_gow3_title_texture);
+REXCVAR_DECLARE(bool, gpu_probe_gow3_title_opaque);
 REXCVAR_DECLARE(std::string, trace_gpu_prefix);
 REXCVAR_DECLARE(bool, trace_gpu_stream);
 REXCVAR_DECLARE(std::string, swap_post_effect);
@@ -93,6 +105,7 @@ REXCVAR_DECLARE(bool, vulkan_tessellation_wireframe);
 REXCVAR_DECLARE(bool, vulkan_force_expand_point_sprites_in_vs);
 REXCVAR_DECLARE(bool, vulkan_force_expand_rectangle_lists_in_vs);
 REXCVAR_DECLARE(bool, vulkan_force_convert_quad_lists_to_triangle_lists);
+REXCVAR_DECLARE(bool, vulkan_unclamped_vertex_indices);
 REXCVAR_DECLARE(std::string, render_target_path_vulkan);
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DECLARE(bool, vulkan_readback_resolve);

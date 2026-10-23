@@ -16,6 +16,7 @@
 #include <SPIRV/GLSL.std.450.h>
 
 #include <rex/assert.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/util/draw.h>
@@ -436,11 +437,10 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
   }
 
   uint32_t color_targets_written = current_shader().writes_color_targets();
-
   if ((color_targets_written & 0b1) && !IsExecutionModeEarlyFragmentTests()) {
     spv::Id fsi_sample_mask_in_rt_0_alpha_tests = spv::NoResult;
-    spv::Block* block_fsi_rt_0_alpha_tests_rt_written_head = nullptr;
-    spv::Block* block_fsi_rt_0_alpha_tests_rt_written_merge = nullptr;
+    spv::Block* block_rt_0_alpha_tests_rt_written_head = nullptr;
+    spv::Block* block_rt_0_alpha_tests_rt_written_merge = nullptr;
     if (!edram_fragment_shader_interlock_ && output_fragment_sample_mask_ != spv::NoResult) {
       // If alpha to coverage is disabled, output full coverage.
       id_vector_temp_.clear();
@@ -452,39 +452,41 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
                                       id_vector_temp_));
     }
     builder_->makeNewBlock();
-    if (edram_fragment_shader_interlock_) {
+    if (var_main_fsi_color_written_ != spv::NoResult) {
       // Skip the alpha test and alpha to coverage if the render target 0 is not
       // written to dynamically.
-      fsi_sample_mask_in_rt_0_alpha_tests = main_fsi_sample_mask_;
+      if (edram_fragment_shader_interlock_) {
+        fsi_sample_mask_in_rt_0_alpha_tests = main_fsi_sample_mask_;
+      }
       spv::Id rt_0_written = builder_->createBinOp(
           spv::OpINotEqual, type_bool_,
           builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
                                 builder_->createLoad(var_main_fsi_color_written_, spv::NoPrecision),
                                 builder_->makeUintConstant(0b1)),
           const_uint_0_);
-      block_fsi_rt_0_alpha_tests_rt_written_head = builder_->getBuildPoint();
-      spv::Block& block_fsi_rt_0_alpha_tests_rt_written = builder_->makeNewBlock();
-      block_fsi_rt_0_alpha_tests_rt_written_merge = &builder_->makeNewBlock();
-      builder_->createSelectionMerge(block_fsi_rt_0_alpha_tests_rt_written_merge,
+      block_rt_0_alpha_tests_rt_written_head = builder_->getBuildPoint();
+      spv::Block& block_rt_0_alpha_tests_rt_written = builder_->makeNewBlock();
+      block_rt_0_alpha_tests_rt_written_merge = &builder_->makeNewBlock();
+      builder_->createSelectionMerge(block_rt_0_alpha_tests_rt_written_merge,
                                      spv::SelectionControlDontFlattenMask);
       {
         std::unique_ptr<spv::Instruction> rt_0_written_branch_conditional_op =
             std::make_unique<spv::Instruction>(spv::OpBranchConditional);
         rt_0_written_branch_conditional_op->addIdOperand(rt_0_written);
         rt_0_written_branch_conditional_op->addIdOperand(
-            block_fsi_rt_0_alpha_tests_rt_written.getId());
+            block_rt_0_alpha_tests_rt_written.getId());
         rt_0_written_branch_conditional_op->addIdOperand(
-            block_fsi_rt_0_alpha_tests_rt_written_merge->getId());
+            block_rt_0_alpha_tests_rt_written_merge->getId());
         // More likely to write to the render target 0 than not.
         rt_0_written_branch_conditional_op->addImmediateOperand(2);
         rt_0_written_branch_conditional_op->addImmediateOperand(1);
         builder_->getBuildPoint()->addInstruction(std::move(rt_0_written_branch_conditional_op));
       }
-      block_fsi_rt_0_alpha_tests_rt_written.addPredecessor(
-          block_fsi_rt_0_alpha_tests_rt_written_head);
-      block_fsi_rt_0_alpha_tests_rt_written_merge->addPredecessor(
-          block_fsi_rt_0_alpha_tests_rt_written_head);
-      builder_->setBuildPoint(&block_fsi_rt_0_alpha_tests_rt_written);
+      block_rt_0_alpha_tests_rt_written.addPredecessor(
+          block_rt_0_alpha_tests_rt_written_head);
+      block_rt_0_alpha_tests_rt_written_merge->addPredecessor(
+          block_rt_0_alpha_tests_rt_written_head);
+      builder_->setBuildPoint(&block_rt_0_alpha_tests_rt_written);
     }
 
     // Alpha test.
@@ -504,9 +506,8 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       id_vector_temp_.clear();
       id_vector_temp_.push_back(builder_->makeIntConstant(3));
       spv::Id alpha_test_alpha = builder_->createLoad(
-          builder_->createAccessChain(edram_fragment_shader_interlock_ ? spv::StorageClassFunction
-                                                                       : spv::StorageClassOutput,
-                                      output_or_var_fragment_data_[0], id_vector_temp_),
+          builder_->createAccessChain(spv::StorageClassFunction, output_or_var_fragment_data_[0],
+                                      id_vector_temp_),
           spv::NoPrecision);
       id_vector_temp_.clear();
       id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantAlphaTestReference));
@@ -605,8 +606,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         id_vector_temp_.clear();
         id_vector_temp_.push_back(builder_->makeIntConstant(3));
         spv::Id alpha_to_coverage_alpha = builder_->createLoad(
-            builder_->createAccessChain(edram_fragment_shader_interlock_ ? spv::StorageClassFunction
-                                                                         : spv::StorageClassOutput,
+            builder_->createAccessChain(spv::StorageClassFunction,
                                         output_or_var_fragment_data_[0], id_vector_temp_),
             spv::NoPrecision);
         assert_true(input_fragment_coordinates_ != spv::NoResult);
@@ -775,19 +775,19 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       if_alpha_to_coverage_enabled.makeEndIf();
     }
 
-    if (edram_fragment_shader_interlock_) {
+    if (block_rt_0_alpha_tests_rt_written_merge) {
       // Close the render target 0 written check.
-      builder_->createBranch(block_fsi_rt_0_alpha_tests_rt_written_merge);
-      spv::Block& block_fsi_rt_0_alpha_tests_rt_written_end = *builder_->getBuildPoint();
-      builder_->setBuildPoint(block_fsi_rt_0_alpha_tests_rt_written_merge);
-      if (!features_.demote_to_helper_invocation) {
+      builder_->createBranch(block_rt_0_alpha_tests_rt_written_merge);
+      spv::Block& block_rt_0_alpha_tests_rt_written_end = *builder_->getBuildPoint();
+      builder_->setBuildPoint(block_rt_0_alpha_tests_rt_written_merge);
+      if (edram_fragment_shader_interlock_ && !features_.demote_to_helper_invocation) {
         // The tests might have modified the sample mask via
         // fsi_sample_mask_in_rt_0_alpha_tests.
         id_vector_temp_.clear();
         id_vector_temp_.push_back(fsi_sample_mask_in_rt_0_alpha_tests);
-        id_vector_temp_.push_back(block_fsi_rt_0_alpha_tests_rt_written_end.getId());
+        id_vector_temp_.push_back(block_rt_0_alpha_tests_rt_written_end.getId());
         id_vector_temp_.push_back(main_fsi_sample_mask_);
-        id_vector_temp_.push_back(block_fsi_rt_0_alpha_tests_rt_written_head->getId());
+        id_vector_temp_.push_back(block_rt_0_alpha_tests_rt_written_head->getId());
         main_fsi_sample_mask_ = builder_->createOp(spv::OpPhi, type_uint_, id_vector_temp_);
       }
     }
@@ -927,12 +927,30 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       id_vector_temp_.clear();
       id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantColorExpBias));
       id_vector_temp_.push_back(builder_->makeIntConstant(int32_t(color_target_index)));
-      color = builder_->createNoContractionBinOp(
-          spv::OpVectorTimesScalar, type_float4_, color,
-          builder_->createLoad(
-              builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                          id_vector_temp_),
-              spv::NoPrecision));
+      spv::Id color_exp_bias = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                      id_vector_temp_),
+          spv::NoPrecision);
+      if (GetSpirvShaderModification().pixel.debug_gow3_yuv_samples &&
+          color_target_index == 0) {
+        spv::Id yuv =
+            builder_->createLoad(var_main_tfetch_gradients_h_, spv::NoPrecision);
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(yuv);
+        id_vector_temp_.push_back(const_float_1_);
+        color = builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
+      }
+      if (GetSpirvShaderModification().pixel.debug_gow3_title_texture &&
+          color_target_index == 0) {
+        spv::Id title_rgb =
+            builder_->createLoad(var_main_tfetch_gradients_h_, spv::NoPrecision);
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(title_rgb);
+        id_vector_temp_.push_back(const_float_1_);
+        color = builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
+      }
+      color = builder_->createNoContractionBinOp(spv::OpVectorTimesScalar, type_float4_, color,
+                                                 color_exp_bias);
 
       if (edram_fragment_shader_interlock_) {
         // Write the color to the target in the EDRAM only it was written on the
@@ -1361,6 +1379,58 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         }
 
         builder_->createStore(color, color_variable);
+      }
+    }
+  }
+
+  if (!edram_fragment_shader_interlock_) {
+    uint32_t color_targets_to_copy = current_shader().writes_color_targets();
+    uint32_t color_target_index;
+    while (rex::bit_scan_forward(color_targets_to_copy, &color_target_index)) {
+      color_targets_to_copy &= ~(UINT32_C(1) << color_target_index);
+      spv::Id var_color = output_or_var_fragment_data_[color_target_index];
+      spv::Id out_color = output_fragment_data_[color_target_index];
+      if (var_color != spv::NoResult && out_color != spv::NoResult) {
+        spv::Id color = builder_->createLoad(var_color, spv::NoPrecision);
+        if (color_target_index == 0 &&
+            GetSpirvShaderModification().pixel.debug_gow3_yuv_constant) {
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(const_float_0_);
+          id_vector_temp_.push_back(const_float_1_);
+          id_vector_temp_.push_back(const_float_0_);
+          id_vector_temp_.push_back(const_float_1_);
+          color = builder_->createCompositeConstruct(type_float4_,
+                                                     id_vector_temp_);
+        }
+        if (color_target_index == 0 &&
+            GetSpirvShaderModification()
+                .pixel.debug_gow3_scene_composite_constant) {
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(const_float_1_);
+          id_vector_temp_.push_back(const_float_0_);
+          id_vector_temp_.push_back(const_float_0_);
+          id_vector_temp_.push_back(const_float_1_);
+          color = builder_->createCompositeConstruct(type_float4_,
+                                                     id_vector_temp_);
+        }
+        if (color_target_index == 0 &&
+            GetSpirvShaderModification()
+                .pixel.debug_gow3_scene_composite_input) {
+          spv::Id scene_rgb =
+              builder_->createLoad(var_main_tfetch_gradients_h_,
+                                   spv::NoPrecision);
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(scene_rgb);
+          id_vector_temp_.push_back(const_float_1_);
+          color =
+              builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
+        }
+        if (color_target_index == 0 &&
+            GetSpirvShaderModification().pixel.debug_gow3_title_opaque) {
+          color = builder_->createCompositeInsert(
+              const_float_1_, color, type_float4_, 3);
+        }
+        builder_->createStore(color, out_color);
       }
     }
   }

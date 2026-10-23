@@ -36,7 +36,8 @@ std::unique_ptr<MMIOHandler> MMIOHandler::Install(uint8_t* virtual_membase,
                                                   HostToGuestVirtual host_to_guest_virtual,
                                                   const void* host_to_guest_virtual_context,
                                                   AccessViolationCallback access_violation_callback,
-                                                  void* access_violation_callback_context) {
+                                                  void* access_violation_callback_context,
+                                                  AccessViolationOwnershipQuery ownership_query) {
   // There can be only one handler at a time.
   assert_null(global_handler_);
   if (global_handler_) {
@@ -45,7 +46,7 @@ std::unique_ptr<MMIOHandler> MMIOHandler::Install(uint8_t* virtual_membase,
 
   auto handler = std::unique_ptr<MMIOHandler>(new MMIOHandler(
       virtual_membase, physical_membase, membase_end, host_to_guest_virtual,
-      host_to_guest_virtual_context, access_violation_callback, access_violation_callback_context));
+      host_to_guest_virtual_context, access_violation_callback, access_violation_callback_context,ownership_query));
 
   // Install exception handler for memory coherence (SharedMemory write tracking).
   // Note: MMIO operations are handled at the recompiler level via REX_MM_LOAD/STORE
@@ -60,14 +61,16 @@ MMIOHandler::MMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase, ui
                          HostToGuestVirtual host_to_guest_virtual,
                          const void* host_to_guest_virtual_context,
                          AccessViolationCallback access_violation_callback,
-                         void* access_violation_callback_context)
+                         void* access_violation_callback_context,
+                         AccessViolationOwnershipQuery ownership_query)
     : virtual_membase_(virtual_membase),
       physical_membase_(physical_membase),
       memory_end_(membase_end),
       host_to_guest_virtual_(host_to_guest_virtual),
       host_to_guest_virtual_context_(host_to_guest_virtual_context),
       access_violation_callback_(access_violation_callback),
-      access_violation_callback_context_(access_violation_callback_context) {}
+      access_violation_callback_context_(access_violation_callback_context),
+      access_violation_ownership_query_(ownership_query) {}
 
 MMIOHandler::~MMIOHandler() {
   arch::ExceptionHandler::Uninstall(ExceptionCallbackThunk, this);
@@ -406,6 +409,15 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
     auto lock = global_critical_region_.Acquire();
+    if(access_violation_callback_ && access_violation_ownership_query_ &&
+       access_violation_ownership_query_(access_violation_callback_context_,fault_host_address,is_write)) {
+      // Ownership proof and callback entry share this lock. The callback may
+      // release it around legacy GPU notifications, so byte ownership must be
+      // checked again after reacquiring it before any repair. A delayed store
+      // must invalidate a rearmed certificate before retry.
+      return access_violation_callback_(std::move(lock),access_violation_callback_context_,
+                                        fault_host_address,is_write);
+    }
     memory::PageAccess cur_access;
     size_t page_length = memory::page_size();
     memory::QueryProtect(fault_host_address, page_length, cur_access);

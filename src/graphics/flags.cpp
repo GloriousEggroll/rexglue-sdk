@@ -25,6 +25,20 @@ REXCVAR_DEFINE_BOOL(gamma_render_target_as_unorm16, true, "GPU",
                     "Use R16G16B16A16_UNORM for gamma render targets (more accurate than sRGB)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Path to dump shaders to");
+REXCVAR_DEFINE_BOOL(gpu_probe_gow3_yuv_samples, false, "GPU/Debug",
+                    "Visualize the sampled Gears 3 YUV planes as RGB");
+REXCVAR_DEFINE_BOOL(gpu_probe_gow3_yuv_constant, false, "GPU/Debug",
+                    "Replace the Gears 3 YUV shader output with opaque green");
+REXCVAR_DEFINE_BOOL(gpu_probe_gow3_scene_composite_constant, false, "GPU/Debug",
+                    "Replace the Gears 3 scene composite output with opaque red");
+REXCVAR_DEFINE_BOOL(gpu_probe_gow3_scene_composite_input, false, "GPU/Debug",
+                    "Visualize the primary Gears 3 scene composite input");
+REXCVAR_DEFINE_BOOL(gpu_probe_gow3_title_texture, false, "GPU/Debug",
+                    "Visualize the sampled Gears 3 title texture before color processing");
+REXCVAR_DEFINE_BOOL(gpu_probe_gow3_title_opaque, false, "GPU/Debug",
+                    "Force the final Gears 3 title shader output alpha to one");
+REXCVAR_DEFINE_BOOL(vulkan_unclamped_vertex_indices, false, "GPU/Vulkan",
+                    "Use signed index plus base conversion in ordinary vertex shaders");
 REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
                     "Use approximate compare for alpha test values to prevent "
                     "flickering on NVIDIA graphics cards");

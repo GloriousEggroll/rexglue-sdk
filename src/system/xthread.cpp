@@ -42,6 +42,9 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
+REXCVAR_DEFINE_BOOL(trace_guest_threads, false, "Kernel",
+                    "Logs guest thread creation, execution, and exit");
+
 namespace rex::system {
 
 const uint32_t XAPC::kSize;
@@ -468,6 +471,15 @@ X_STATUS XThread::Create() {
   // the current CPU in KPCR and KTHREAD.
   SetActiveCpu(cpu_index);
 
+  if (REXCVAR_GET(trace_guest_threads) && guest_thread_) {
+    REXSYS_INFO(
+        "Guest thread created: id={} handle={:08X} start={:08X} startup={:08X} "
+        "context={:08X} flags={:08X} cpu={} suspended={}",
+        thread_id_, handle(), creation_params_.start_address, creation_params_.xapi_thread_startup,
+        creation_params_.start_context, creation_params_.creation_flags, cpu_index,
+        (creation_params_.creation_flags & X_CREATE_SUSPENDED) != 0);
+  }
+
   // TODO(tomc): do we need thread notifications (related to processor thread management)?
 
   if ((creation_params_.creation_flags & X_CREATE_SUSPENDED) == 0) {
@@ -553,6 +565,10 @@ X_STATUS XThread::Terminate(int exit_code) {
 void XThread::Execute() {
   REXSYS_NOISY_DEBUG("Execute thid {} (handle={:08X}, '{}', native={:08X})", thread_id_, handle(),
                      thread_name_, thread_->system_id());
+  if (REXCVAR_GET(trace_guest_threads) && guest_thread_) {
+    REXSYS_INFO("Guest thread executing: id={} handle={:08X} native={:08X} name='{}'", thread_id_,
+                handle(), thread_->system_id(), thread_name_);
+  }
 
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
@@ -630,6 +646,10 @@ void XThread::Execute() {
   func(*ctx, base);
 
   exit_code = static_cast<int>(ctx->r3.u32);
+  if (REXCVAR_GET(trace_guest_threads) && guest_thread_) {
+    REXSYS_INFO("Guest thread returned: id={} handle={:08X} address={:08X} result={:08X}",
+                thread_id_, handle(), address, uint32_t(exit_code));
+  }
 
   // If we got here it means the execute completed without an exit being called.
   // Treat the return code as an implicit exit code (if desired).

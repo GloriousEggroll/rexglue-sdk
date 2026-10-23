@@ -46,8 +46,12 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
-                      "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
+                      "Guest output effect (spatial): bilinear, cas, fsr; temporal modes require the optional runtime")
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
     .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
+#else
+    .allowed({"bilinear", "cas", "fsr"})
+#endif
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
@@ -664,6 +668,10 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
     request_repaint = true;
   }
 #if defined(REX_HAS_FIDELITYFX_SDK)
+  if (guest_output_paint_config_.GetFsrMaxUpsamplingPasses() != new_config.GetFsrMaxUpsamplingPasses()) {
+    modified = true;
+    request_repaint = true;
+  }
   if (guest_output_paint_config_.GetFsrSharpnessReduction() !=
       new_config.GetFsrSharpnessReduction()) {
     modified = true;

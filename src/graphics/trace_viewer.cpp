@@ -9,9 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include "thirdparty/half/include/half.hpp"
-
 #include <cinttypes>
+#include <fstream>
+#include <future>
 #include <string>
 
 #include <rex/assert.h>
@@ -33,7 +33,6 @@
 #include <rex/system.h>
 #include <rex/system/kernel_state.h>
 #include <rex/thread.h>
-#include <rex/ui/file_picker.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/presenter.h>
@@ -44,7 +43,19 @@
 
 #include <imgui.h>
 
-DEFINE_string(target_trace_file, "", "Specifies the trace file to load.", "GPU");
+REXCVAR_DEFINE_STRING(target_trace_file, "", "GPU", "Specifies the trace file to load.");
+REXCVAR_DEFINE_BOOL(trace_replay_on_load, false, "GPU",
+                    "Replay the final captured frame immediately after loading a trace.");
+REXCVAR_DEFINE_INT32(trace_replay_command, -1, "GPU",
+                     "Command to replay on load, or -1 for the final command.");
+REXCVAR_DEFINE_BOOL(trace_host_capture_on_load, false, "GPU",
+                    "Capture host GPU commands while replaying a trace on load.");
+REXCVAR_DEFINE_BOOL(trace_exit_after_replay, false, "GPU",
+                    "Exit the diagnostic viewer after replaying the requested commands.");
+REXCVAR_DEFINE_STRING(trace_output_path, "", "GPU",
+                      "Save the replayed guest output as a PPM image, without viewer UI.");
+REXCVAR_DEFINE_STRING(trace_state_output_directory, "", "GPU",
+                      "Export replayed GPU memory/EDRAM to a new diagnostic directory.");
 
 namespace rex::graphics {
 
@@ -62,31 +73,12 @@ TraceViewer::TraceViewer(rex::ui::WindowedAppContext& app_context, const std::st
 TraceViewer::~TraceViewer() = default;
 
 bool TraceViewer::OnInitialize() {
-  std::string path = REXCVAR_GET(target_trace_file);
-
-  // If no path passed, ask the user.
-  // On Android, however, there's no synchronous file picker, and the trace file
-  // must be picked externally and provided to the trace viewer activity via the
-  // intent.
-#if !REX_PLATFORM_ANDROID
-  if (path.empty()) {
-    auto file_picker = rex::ui::FilePicker::Create();
-    file_picker->set_mode(ui::FilePicker::Mode::kOpen);
-    file_picker->set_type(ui::FilePicker::Type::kFile);
-    file_picker->set_multi_selection(false);
-    file_picker->set_title("Select Trace File");
-    file_picker->set_extensions({
-        {"Supported Files", "*.xtr"},
-        {"All Files (*.*)", "*.*"},
-    });
-    if (file_picker->Show()) {
-      auto selected_files = file_picker->selected_files();
-      if (!selected_files.empty()) {
-        path = rex::path_to_utf8(selected_files[0]);
-      }
-    }
+  std::string path;
+  if (auto positional_path = GetArgument("target_trace_file")) {
+    path = std::move(*positional_path);
+  } else {
+    path = REXCVAR_GET(target_trace_file);
   }
-#endif  // !REX_PLATFORM_ANDROID
 
   if (path.empty()) {
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Warning, "No trace file specified");
@@ -101,6 +93,74 @@ bool TraceViewer::OnInitialize() {
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error,
                               "Unable to load trace file; not found?");
     return false;
+  }
+  if (REXCVAR_GET(trace_replay_on_load)) {
+    app_context().CallInUIThreadDeferred([this]() {
+      int last_frame_index = player_->frame_count() - 1;
+      if (last_frame_index < 0) {
+        return;
+      }
+      const bool capture_host_commands = REXCVAR_GET(trace_host_capture_on_load);
+      if (capture_host_commands) {
+        BeginHostCapture();
+      }
+      if (player_->current_frame_index() != last_frame_index) {
+        player_->SeekFrame(last_frame_index);
+        player_->WaitOnPlayback();
+      }
+      const TraceReader::Frame* frame = player_->current_frame();
+      if (frame && !frame->commands.empty()) {
+        int command_index = REXCVAR_GET(trace_replay_command);
+        if (command_index < 0 || command_index >= int(frame->commands.size())) {
+          command_index = int(frame->commands.size()) - 1;
+        }
+        if (player_->current_command_index() != command_index) {
+          player_->SeekCommand(command_index);
+          player_->WaitOnPlayback();
+        }
+      }
+      if (capture_host_commands) {
+        EndHostCapture();
+      }
+      const auto output_path = REXCVAR_GET(trace_output_path);
+      if (!output_path.empty()) {
+        ui::RawImage image;
+        auto* presenter = graphics_system_->presenter();
+        if (!presenter || !presenter->CaptureGuestOutput(image) || !image.width ||
+            !image.height || image.stride < size_t(image.width) * 4 ||
+            image.data.size() < size_t(image.height - 1) * image.stride + size_t(image.width) * 4) {
+          REXGPU_ERROR("Trace replay has no complete guest image to save");
+        } else {
+          std::ofstream output(output_path, std::ios::binary);
+          output << "P6\n" << image.width << ' ' << image.height << "\n255\n";
+          for (uint32_t y = 0; y < image.height; ++y) {
+            for (uint32_t x = 0; x < image.width; ++x) {
+              output.write(reinterpret_cast<const char*>(image.data.data() +
+                  size_t(y) * image.stride + size_t(x) * 4), 3);
+            }
+          }
+          if (output) {
+            REXGPU_INFO("Saved replayed guest image {}x{} to {}", image.width, image.height,
+                        output_path);
+          } else {
+            REXGPU_ERROR("Cannot save replayed guest image to {}", output_path);
+          }
+        }
+      }
+      const auto state_directory=REXCVAR_GET(trace_state_output_directory);
+      if(!state_directory.empty()) {
+        auto* processor=graphics_system_->command_processor();
+        std::promise<bool> completion;auto result=completion.get_future();
+        const uint32_t title_id=player_->header()->title_id;
+        processor->CallInThread([processor,state_directory,title_id,&completion] {
+          completion.set_value(processor->ExportDiagnosticSnapshot(state_directory,title_id));
+        });
+        if(!result.get())REXGPU_ERROR("Cannot export replayed diagnostic GPU state");
+      }
+      if (REXCVAR_GET(trace_exit_after_replay)) {
+        app_context().QuitFromUIThread();
+      }
+    });
   }
   return true;
 }
@@ -121,16 +181,17 @@ bool TraceViewer::Setup() {
     return false;
   }
 
-  // Create the emulator but don't initialize so we can setup the window.
-  emulator_ = std::make_unique<Emulator>("", "", "", "");
-  X_STATUS result = emulator_->Setup(
-      window_.get(), nullptr, false, nullptr, [this]() { return CreateGraphicsSystem(); }, nullptr);
+  emulator_ = std::make_unique<Runtime>("", "", "", "");
+  emulator_->set_app_context(&app_context());
+  RuntimeConfig runtime_config;
+  runtime_config.graphics = CreateGraphicsSystem();
+  X_STATUS result = emulator_->Setup(std::move(runtime_config));
   if (XFAILED(result)) {
     REXGPU_ERROR("Failed to setup emulator: {:08X}", result);
     return false;
   }
   memory_ = emulator_->memory();
-  graphics_system_ = emulator_->graphics_system();
+  graphics_system_ = static_cast<GraphicsSystem*>(emulator_->graphics_system());
 
   player_ = std::make_unique<TracePlayer>(graphics_system_);
 
@@ -789,8 +850,8 @@ void TraceViewer::DrawVertexFetcher(Shader* shader, const Shader::VertexBinding&
   }
   ImGui::BeginChild("#indices", ImVec2(0, 300));
   ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10, 0));
-  int display_start, display_end;
-  ImGui::CalcListClipping(vertex_count, ImGui::GetTextLineHeight(), &display_start, &display_end);
+  int display_start = 0;
+  int display_end = int(vertex_count);
   ImGui::Dummy(ImVec2(0, (display_start)*ImGui::GetTextLineHeight()));
   ImGui::Columns(column_count);
   if (display_start <= 1) {
@@ -870,9 +931,9 @@ void TraceViewer::DrawVertexFetcher(Shader* shader, const Shader::VertexBinding&
         } break;
         case xenos::VertexFormat::k_16_16_FLOAT: {
           auto e0 = LOADEL(uint32_t, 0);
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 16) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float((e0 >> 16) & 0xFFFF));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 0) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float((e0 >> 0) & 0xFFFF));
           ImGui::NextColumn();
         } break;
         case xenos::VertexFormat::k_32_32:
@@ -944,13 +1005,13 @@ void TraceViewer::DrawVertexFetcher(Shader* shader, const Shader::VertexBinding&
         case xenos::VertexFormat::k_16_16_16_16_FLOAT: {
           auto e0 = LOADEL(uint32_t, 0);
           auto e1 = LOADEL(uint32_t, 1);
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 16) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float((e0 >> 16) & 0xFFFF));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 0) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float((e0 >> 0) & 0xFFFF));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e1 >> 16) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float((e1 >> 16) & 0xFFFF));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e1 >> 0) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float((e1 >> 0) & 0xFFFF));
           ImGui::NextColumn();
         } break;
         case xenos::VertexFormat::k_32_32_32_32_FLOAT:
@@ -1306,6 +1367,9 @@ void TraceViewer::DrawStateUI() {
   uint32_t surface_pitch = rb_surface_info & 0x3FFF;
   auto surface_msaa = static_cast<xenos::MsaaSamples>((rb_surface_info >> 16) & 0x3);
 
+  if (REXCVAR_GET(trace_replay_on_load)) {
+    ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+  }
   if (ImGui::CollapsingHeader("Color Targets")) {
     if (enable_mode != EdramMode::kDepthOnly) {
       // Alpha testing -- ALPHAREF, ALPHAFUNC, ALPHATESTENABLE
@@ -1327,7 +1391,7 @@ void TraceViewer::DrawStateUI() {
                         blend_color.z, blend_color.w);
       ImGui::SameLine();
       // TODO small_height (was true) parameter was removed
-      ImGui::ColorButton(nullptr, blend_color);
+      ImGui::ColorButton("##blend_color", blend_color);
 
       uint32_t rb_color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
       uint32_t color_info[4] = {
@@ -1566,9 +1630,8 @@ void TraceViewer::DrawStateUI() {
 
       ImGui::BeginChild("#vsvertices", ImVec2(0, 300));
 
-      int display_start, display_end;
-      ImGui::CalcListClipping(int(vertices.size() / 4), ImGui::GetTextLineHeight(), &display_start,
-                              &display_end);
+      int display_start = 0;
+      int display_end = int(vertices.size() / 4);
       ImGui::Dummy(ImVec2(0, (display_start)*ImGui::GetTextLineHeight()));
 
       ImGui::Columns(int(el_size), "#vsvertices", true);
@@ -1628,9 +1691,8 @@ void TraceViewer::DrawStateUI() {
       }
       ImGui::BeginChild("#indices", ImVec2(0, 300));
       ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
-      int display_start, display_end;
-      ImGui::CalcListClipping(1 + draw_info.index_count, ImGui::GetTextLineHeight(), &display_start,
-                              &display_end);
+      int display_start = 0;
+      int display_end = int(1 + draw_info.index_count);
       ImGui::Dummy(ImVec2(0, (display_start)*ImGui::GetTextLineHeight()));
       ImGui::Columns(2, "#indices", true);
       ImGui::SetColumnOffset(1, 60);

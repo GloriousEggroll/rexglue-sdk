@@ -88,6 +88,10 @@ class VulkanTextureCache final : public TextureCache {
 
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension, bool is_signed);
+  void TraceActiveBinding(uint32_t fetch_constant_index,
+                          xenos::FetchOpDimension dimension, bool is_signed,
+                          uint64_t frame, uint32_t binding_index,
+                          const memory::Memory& memory) const;
 
   SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
 

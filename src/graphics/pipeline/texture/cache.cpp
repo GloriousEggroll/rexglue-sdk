@@ -49,6 +49,11 @@ REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(gpu_texture_trace_address, 0, "GPU",
+                     "Guest physical address to trace through texture upload and invalidation")
+    .range(0, INT32_MAX)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
                      "Forces anisotropic filtering for eligible textures.\n"
                      "Higher values keep textures sharper at oblique angles, but increase texture "
@@ -126,6 +131,19 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 //     "GPU");
 
 namespace rex::graphics {
+
+namespace {
+
+bool TextureTraceAddressInRange(uint32_t start, uint32_t length) {
+  const int32_t trace_address_cvar = REXCVAR_GET(gpu_texture_trace_address);
+  if (trace_address_cvar <= 0 || !length) {
+    return false;
+  }
+  const uint32_t trace_address = uint32_t(trace_address_cvar);
+  return trace_address >= start && uint64_t(trace_address) < uint64_t(start) + length;
+}
+
+}  // namespace
 
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
     // k8bpb
@@ -385,12 +403,25 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
     return false;
   }
 
+  const TextureKey texture_key = texture.key();
+  const uint32_t base_start = texture_key.base_page << 12;
+  const uint32_t base_length = texture.GetGuestBaseSize();
+  const uint32_t mips_start = texture_key.mip_page << 12;
+  const uint32_t mips_length = texture.GetGuestMipsSize();
+  if (TextureTraceAddressInRange(base_start, base_length) ||
+      TextureTraceAddressInRange(mips_start, mips_length)) {
+    REXGPU_INFO(
+        "GPU texture trace: prepare base={:08X}+{:08X} mips={:08X}+{:08X} "
+        "outdated_mask={:X} load_base={} load_mips={}",
+        base_start, base_length, mips_start, mips_length, outdated_mask, base_outdated,
+        mips_outdated);
+  }
+
   pending_load_out.texture = &texture;
   pending_load_out.load_base = base_outdated;
   pending_load_out.load_mips = mips_outdated;
   pending_range_count_out = 0;
 
-  TextureKey texture_key = texture.key();
   if (base_outdated) {
     PendingSharedMemoryRange pending_range;
     pending_range.start = texture_key.base_page << 12;
@@ -416,6 +447,16 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   Texture& texture = *pending_load.texture;
   TextureKey texture_key = texture.key();
+  const uint32_t base_start = texture_key.base_page << 12;
+  const uint32_t base_length = texture.GetGuestBaseSize();
+  const uint32_t mips_start = texture_key.mip_page << 12;
+  const uint32_t mips_length = texture.GetGuestMipsSize();
+  const bool trace_texture = TextureTraceAddressInRange(base_start, base_length) ||
+                             TextureTraceAddressInRange(mips_start, mips_length);
+  if (trace_texture) {
+    REXGPU_INFO("GPU texture trace: commit base={:08X} load_base={} load_mips={}", base_start,
+                pending_load.load_base, pending_load.load_mips);
+  }
   if (texture_key.scaled_resolve) {
     // Make sure all the scaled resolve memory is resident and accessible from
     // the shader, including any possible padding that hasn't yet been touched
@@ -433,14 +474,31 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
                                              pending_load.load_mips)) {
+    if (trace_texture) {
+      REXGPU_ERROR("GPU texture trace: Vulkan resident-memory load failed base={:08X}",
+                   base_start);
+    }
     return false;
+  }
+  if (trace_texture) {
+    REXGPU_INFO("GPU texture trace: Vulkan resident-memory load submitted base={:08X}",
+                base_start);
   }
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
   // resolves as well to detect when the CPU wants to reuse the memory for a
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
-  texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  if (!texture.MakeUpToDateAndWatch(global_critical_region_.Acquire())) {
+    if (trace_texture) {
+      REXGPU_WARN("GPU texture trace: watch installation deferred base={:08X}", base_start);
+    }
+    return false;
+  }
+  if (trace_texture) {
+    REXGPU_INFO("GPU texture trace: upload committed and watch installed base={:08X}",
+                base_start);
+  }
   texture.LogAction("Loaded");
 
   return true;
@@ -488,6 +546,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     TextureBinding& binding = texture_bindings_[index];
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
+    uint32_t old_integer_scale_bits = binding.integer_scale_bits;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
     texture_bindings_in_sync_ |= index_bit;
@@ -500,6 +559,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     uint32_t old_host_swizzle = binding.host_swizzle;
     binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+    binding.integer_scale_bits =
+        GetIntegerScaleBits(fetch.format, fetch.num_format, binding.host_swizzle,
+                            binding.swizzled_signs);
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for
@@ -509,7 +571,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     bool any_sign_was_signed = texture_util::IsAnySignSigned(old_swizzled_signs);
     bool any_sign_is_not_signed = texture_util::IsAnySignNotSigned(binding.swizzled_signs);
     bool any_sign_is_signed = texture_util::IsAnySignSigned(binding.swizzled_signs);
-    if (key_changed || binding.host_swizzle != old_host_swizzle ||
+    if (key_changed || binding.integer_scale_bits != old_integer_scale_bits ||
+        binding.host_swizzle != old_host_swizzle ||
         any_sign_is_not_signed != any_sign_was_not_signed ||
         any_sign_is_signed != any_sign_was_signed) {
       bindings_changed |= index_bit;
@@ -682,23 +745,58 @@ TextureCache::Texture::~Texture() {
   texture_cache_.UpdateTexturesTotalHostMemoryUsage(0, host_memory_usage_);
 }
 
-void TextureCache::Texture::MakeUpToDateAndWatch(
+bool TextureCache::Texture::MakeUpToDateAndWatch(
     const std::unique_lock<std::recursive_mutex>& global_lock) {
   SharedMemory& shared_memory = texture_cache().shared_memory();
-  if (base_outdated_) {
-    assert_not_zero(GetGuestBaseSize());
-    base_outdated_ = false;
-    base_watch_handle_ = shared_memory.WatchMemoryRange(
-        key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
-    outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+  const bool watch_base = base_outdated_;
+  const bool watch_mips = mips_outdated_;
+  const uint32_t base_start = key().base_page << 12;
+  const uint32_t base_length = GetGuestBaseSize();
+  const uint32_t mips_start = key().mip_page << 12;
+  const uint32_t mips_length = GetGuestMipsSize();
+  const bool trace_base = watch_base && TextureTraceAddressInRange(base_start, base_length);
+  const bool trace_mips = watch_mips && TextureTraceAddressInRange(mips_start, mips_length);
+  assert_true(global_lock.owns_lock());
+  if (watch_base &&
+      !shared_memory.IsRangeValid(base_start,
+                                  static_cast<uint32_t>(rex::align(base_length, UINT32_C(16))))) {
+    if (trace_base) {
+      REXGPU_INFO("GPU texture trace: base range not valid yet {:08X}+{:08X}", base_start,
+                  base_length);
+    }
+    return false;
   }
-  if (mips_outdated_) {
-    assert_not_zero(GetGuestMipsSize());
+  if (watch_mips &&
+      !shared_memory.IsRangeValid(mips_start,
+                                  static_cast<uint32_t>(rex::align(mips_length, UINT32_C(16))))) {
+    if (trace_mips) {
+      REXGPU_INFO("GPU texture trace: mip range not valid yet {:08X}+{:08X}", mips_start,
+                  mips_length);
+    }
+    return false;
+  }
+
+  if (watch_base) {
+    assert_not_zero(base_length);
+    base_outdated_ = false;
+    base_watch_handle_ = shared_memory.WatchMemoryRange(base_start, base_length,
+                                                       TextureCache::WatchCallback, this, nullptr, 0);
+    outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+    if (trace_base) {
+      REXGPU_INFO("GPU texture trace: base watch active {:08X}+{:08X}", base_start, base_length);
+    }
+  }
+  if (watch_mips) {
+    assert_not_zero(mips_length);
     mips_outdated_ = false;
     mips_watch_handle_ = shared_memory.WatchMemoryRange(
-        key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback, this, nullptr, 1);
+        mips_start, mips_length, TextureCache::WatchCallback, this, nullptr, 1);
     outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
+    if (trace_mips) {
+      REXGPU_INFO("GPU texture trace: mip watch active {:08X}+{:08X}", mips_start, mips_length);
+    }
   }
+  return true;
 }
 
 void TextureCache::Texture::MarkAsUsed() {
@@ -747,7 +845,15 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
-  texture.WatchCallback(global_lock, argument != 0);
+  const bool is_mip = argument != 0;
+  const uint32_t start = (is_mip ? texture.key().mip_page : texture.key().base_page) << 12;
+  const uint32_t length =
+      is_mip ? texture.GetGuestMipsSize() : texture.GetGuestBaseSize();
+  if (TextureTraceAddressInRange(start, length)) {
+    REXGPU_INFO("GPU texture trace: {} watch fired {:08X}+{:08X} invalidated_by_gpu={}",
+                is_mip ? "mip" : "base", start, length, invalidated_by_gpu);
+  }
+  texture.WatchCallback(global_lock, is_mip);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
 }
 
@@ -874,6 +980,38 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
   return texture;
+}
+
+uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format, uint32_t num_format,
+                                           uint32_t host_swizzle, uint8_t swizzled_signs) {
+  const FormatInfo& format_info = *FormatInfo::Get(guest_format);
+  uint32_t scale_bits = 0;
+
+  if (!num_format || !format_info.fixed) {
+    return 0;
+  }
+
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint32_t source_component = (host_swizzle >> (i * 3)) & 0b111;
+    if (source_component >= xenos::XE_GPU_TEXTURE_SWIZZLE_0) {
+      continue;
+    }
+
+    xenos::TextureSign sign =
+        xenos::TextureSign((swizzled_signs >> (i * 2)) & 0b11);
+    uint8_t width = format_info.component_bits[source_component];
+    if (!width || width > 16 || sign == xenos::TextureSign::kGamma) {
+      continue;
+    }
+
+    uint32_t component_scale = uint32_t(width - 1);
+    if (sign == xenos::TextureSign::kSigned) {
+      component_scale |= UINT32_C(1) << 4;
+    }
+    scale_bits |= component_scale << (i * 5);
+  }
+
+  return scale_bits;
 }
 
 bool TextureCache::LoadTextureData(Texture& texture) {

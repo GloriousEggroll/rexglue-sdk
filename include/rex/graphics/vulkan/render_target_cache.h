@@ -114,6 +114,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool InitializeTraceSubmitDownloads();
   void InitializeTraceCompleteDownloads();
   void RestoreEdramSnapshot(const void* snapshot);
+  // Same-queue external packed EDRAM transfer, restricted to unscaled FSI.
+  bool PrepareNativeStateTransfer(bool write);
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
