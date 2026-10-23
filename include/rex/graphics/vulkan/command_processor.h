@@ -51,6 +51,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/system/kernel_state.h>
+#include <rex/ui/vulkan/temporal_upscale.h>
 #include <rex/ui/vulkan/linked_type_descriptor_set_allocator.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
@@ -160,6 +161,7 @@ class VulkanCommandProcessor : public CommandProcessor {
                             const std::function<void(VkBuffer,VkBuffer)>& copy);
   bool InitializeNativeEdram(const std::function<void(VkBuffer)>& copy);
 
+  void UpdateAntiLag(bool present, uint64_t frame_index) override;
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
         ->vulkan_device();
@@ -182,6 +184,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t height = 0;
     xenos::TextureFormat format = xenos::TextureFormat::k_8_8_8_8;
     std::shared_ptr<const void> keep_alive;
+    // Optional scene inputs for temporal upscaling and frame generation.
+    std::shared_ptr<const ui::vulkan::TemporalUpscaleInputs> temporal;
   };
   using NativeSwapSourceProvider = std::function<std::optional<NativeSwapSource>(
       uint32_t api_frame, uint32_t frontbuffer, uint32_t width, uint32_t height)>;

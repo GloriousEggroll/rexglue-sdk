@@ -104,7 +104,8 @@ if(REXGLUE_USE_VULKAN AND REXGLUE_USE_D3D12)
 endif()
 
 # ── Build FidelityFX ─────────────────────────────────────────────────────
-set(FFX_API_ENABLE_FRAMEGEN_PROVIDER OFF CACHE BOOL "" FORCE)
+option(REXGLUE_FIDELITYFX_FRAMEGEN "Build FidelityFX frame generation (FSR 3.1 frame interpolation)" ON)
+set(FFX_API_ENABLE_FRAMEGEN_PROVIDER ${REXGLUE_FIDELITYFX_FRAMEGEN} CACHE BOOL "" FORCE)
 if(WIN32)
     set(FFX_API_AUTO_COMPILE_SHADERS ON CACHE BOOL "" FORCE)
 else()

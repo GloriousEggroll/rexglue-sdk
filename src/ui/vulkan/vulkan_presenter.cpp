@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -30,6 +31,7 @@
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 #include <ffx_api/ffx_api.h>
+#include <ffx_api/ffx_framegeneration.h>
 #include <ffx_api/ffx_upscale.h>
 #include <ffx_api/vk/ffx_api_vk.h>
 #endif
@@ -45,6 +47,9 @@
 #endif
 
 REXCVAR_DECLARE(bool, vsync);
+REXCVAR_DEFINE_BOOL(present_frame_generation, false, "UI/Presenter",
+                    "FSR 3.1 frame generation: show a generated frame between game frames. "
+                    "Needs present_effect=fsr3 and a renderer that supplies scene inputs");
 REXCVAR_DEFINE_BOOL(present_gpu_timestamps, false, "UI/Presenter",
                     "Observe existing paint GPU duration without additional waits")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -129,6 +134,7 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/guest_output_ffx_fsr_easu_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_ffx_fsr_rcas_dither_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_ffx_fsr_rcas_ps.h"
+#include "../shaders/vulkan_spirv/frame_generation_hud_cs.h"
 #endif
 #include "../shaders/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
@@ -201,7 +207,21 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
   return true;
 }
 
+void VulkanPresenter::ReleaseGpuEffects() {
+  Presenter::ReleaseGpuEffects();
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if (temporal_upscaler_context_ || frame_generation_context_) {
+    paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+    REXLOG_INFO("VulkanPresenter: releasing FidelityFX contexts");
+    DestroyFrameGeneration();
+    DestroyTemporalUpscalerContext();
+  }
+#endif
+}
+
 VulkanPresenter::~VulkanPresenter() {
+  // The pacer paints through this object; stop it before anything goes away.
+  StopFrameGenerationPacer();
   // Destroy the swapchain after its images are not used for drawing anymore.
   // This is a confusing part in Vulkan, as vkQueuePresentKHR doesn't signal a
   // fence clearly indicating when it's safe to destroy a swapchain, so we
@@ -220,6 +240,7 @@ VulkanPresenter::~VulkanPresenter() {
   ui_submission_tracker_.Shutdown();
   guest_output_image_refresher_submission_tracker_.Shutdown();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  DestroyFrameGeneration();
   DestroyTemporalUpscalerContext();
 #endif
 
@@ -288,7 +309,9 @@ bool VulkanPresenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint3
     ffxCreateContextDescUpscale create_desc = {};
     create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     create_desc.header.pNext = nullptr;
-    create_desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    // The guest output is display-referred (after tonemapping and the gamma
+    // ramp). Scene depth is reverse-Z with an infinite far plane.
+    create_desc.flags = FFX_UPSCALE_ENABLE_DEPTH_INVERTED | FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
     create_desc.maxRenderSize.width = render_width;
     create_desc.maxRenderSize.height = render_height;
     create_desc.maxUpscaleSize.width = output_width;
@@ -347,89 +370,381 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
                                                uint32_t input_width, uint32_t input_height,
                                                VkImage output_image, uint32_t output_width,
                                                uint32_t output_height,
-                                               const GuestOutputPaintConfig& config) {
+                                               const GuestOutputPaintConfig& config,
+                                               const TemporalUpscaleInputs& inputs) {
   if (command_buffer == VK_NULL_HANDLE || input_image == VK_NULL_HANDLE ||
       output_image == VK_NULL_HANDLE || !input_width || !input_height || !output_width ||
-      !output_height) {
+      !output_height || inputs.width != input_width || inputs.height != input_height ||
+      !inputs.depth.image || !inputs.motion_vectors.image) {
+    static std::atomic<bool> logged = false;
+    if (!logged.exchange(true)) {
+      REXLOG_WARN("VulkanPresenter: temporal upscaler inputs rejected: input {}x{}, scene inputs "
+                  "{}x{}, depth {}, motion {}", input_width, input_height, inputs.width,
+                  inputs.height, inputs.depth.image != VK_NULL_HANDLE,
+                  inputs.motion_vectors.image != VK_NULL_HANDLE);
+    }
     return false;
   }
   if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
     return false;
   }
 
-  VkImageCreateInfo source_image_create_info = {};
-  source_image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-  source_image_create_info.imageType = VK_IMAGE_TYPE_2D;
-  source_image_create_info.format = kGuestOutputFormat;
-  source_image_create_info.extent.width = input_width;
-  source_image_create_info.extent.height = input_height;
-  source_image_create_info.extent.depth = 1;
-  source_image_create_info.mipLevels = 1;
-  source_image_create_info.arrayLayers = 1;
-  source_image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
-  source_image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  source_image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
-  source_image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  source_image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  auto describe = [](VkImage image, VkFormat format, uint32_t width, uint32_t height,
+                     uint32_t usage) {
+    VkImageCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {width, height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    return ffxApiGetImageResourceDescriptionVK(image, info, usage);
+  };
+  auto read_only = [&](const TemporalUpscaleImage& source, uint32_t usage) {
+    if (!source.image) return FfxApiResource{};
+    return ffxApiGetResourceVK(
+        reinterpret_cast<void*>(source.image),
+        describe(source.image, source.format, input_width, input_height, usage),
+        FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+  };
 
-  FfxApiResourceDescription source_desc = ffxApiGetImageResourceDescriptionVK(
-      input_image, source_image_create_info, FFX_API_RESOURCE_USAGE_READ_ONLY);
-  FfxApiResource source = ffxApiGetResourceVK(reinterpret_cast<void*>(input_image), source_desc,
-                                              FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-  FfxApiResource depth =
-      ffxApiGetResourceVK(reinterpret_cast<void*>(input_image),
-                          ffxApiGetImageResourceDescriptionVK(input_image, source_image_create_info,
-                                                              FFX_API_RESOURCE_USAGE_DEPTHTARGET),
-                          FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-  FfxApiResource motion_vectors = source;
-
-  VkImageCreateInfo output_image_create_info = source_image_create_info;
-  output_image_create_info.extent.width = output_width;
-  output_image_create_info.extent.height = output_height;
-  FfxApiResourceDescription output_desc = ffxApiGetImageResourceDescriptionVK(
-      output_image, output_image_create_info,
-      FFX_API_RESOURCE_USAGE_UAV | FFX_API_RESOURCE_USAGE_READ_ONLY);
-  FfxApiResource output = ffxApiGetResourceVK(reinterpret_cast<void*>(output_image), output_desc,
-                                              FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+  const FfxApiResource color = ffxApiGetResourceVK(
+      reinterpret_cast<void*>(input_image),
+      describe(input_image, kGuestOutputFormat, input_width, input_height,
+               FFX_API_RESOURCE_USAGE_READ_ONLY),
+      FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+  const FfxApiResource output = ffxApiGetResourceVK(
+      reinterpret_cast<void*>(output_image),
+      describe(output_image, kGuestOutputFormat, output_width, output_height,
+               FFX_API_RESOURCE_USAGE_UAV | FFX_API_RESOURCE_USAGE_READ_ONLY),
+      FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
 
   ffxDispatchDescUpscale dispatch_desc = {};
   dispatch_desc.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-  dispatch_desc.header.pNext = nullptr;
   dispatch_desc.commandList = command_buffer;
-  dispatch_desc.color = source;
-  dispatch_desc.depth = depth;
-  dispatch_desc.motionVectors = motion_vectors;
+  dispatch_desc.color = color;
+  dispatch_desc.depth = read_only(inputs.depth, FFX_API_RESOURCE_USAGE_READ_ONLY);
+  dispatch_desc.motionVectors = read_only(inputs.motion_vectors, FFX_API_RESOURCE_USAGE_READ_ONLY);
   dispatch_desc.exposure = {};
-  dispatch_desc.reactive = {};
+  dispatch_desc.reactive = read_only(inputs.reactive, FFX_API_RESOURCE_USAGE_READ_ONLY);
   dispatch_desc.transparencyAndComposition = {};
   dispatch_desc.output = output;
-  dispatch_desc.jitterOffset.x = 0.0f;
-  dispatch_desc.jitterOffset.y = 0.0f;
-  dispatch_desc.motionVectorScale.x = float(input_width);
-  dispatch_desc.motionVectorScale.y = float(input_height);
+  dispatch_desc.jitterOffset.x = inputs.jitter_x;
+  dispatch_desc.jitterOffset.y = inputs.jitter_y;
+  // Motion vectors are already in render-resolution pixels.
+  dispatch_desc.motionVectorScale.x = 1.0f;
+  dispatch_desc.motionVectorScale.y = 1.0f;
   dispatch_desc.renderSize.width = input_width;
   dispatch_desc.renderSize.height = input_height;
   dispatch_desc.upscaleSize.width = output_width;
   dispatch_desc.upscaleSize.height = output_height;
-  dispatch_desc.enableSharpening = true;
+  // RCAS follows in the paint chain with the user's sharpness.
+  dispatch_desc.enableSharpening = false;
   dispatch_desc.sharpness = std::clamp(1.0f - config.GetFsrSharpnessReduction() * 0.5f, 0.0f, 1.0f);
-  dispatch_desc.reset = true;
-  dispatch_desc.frameTimeDelta = 16.666f;
+  dispatch_desc.reset = inputs.reset || inputs.frame_id != temporal_upscaler_last_frame_id_ + 1;
+  dispatch_desc.frameTimeDelta = inputs.frame_time_ms;
   dispatch_desc.preExposure = 1.0f;
-  dispatch_desc.cameraNear = 0.1f;
-  dispatch_desc.cameraFar = 1000.0f;
-  dispatch_desc.cameraFovAngleVertical = 1.0472f;
-  dispatch_desc.viewSpaceToMetersFactor = 1.0f;
+  dispatch_desc.cameraNear = inputs.camera_near;
+  dispatch_desc.cameraFar = inputs.camera_far;
+  dispatch_desc.cameraFovAngleVertical = inputs.fov_y_radians;
+  dispatch_desc.viewSpaceToMetersFactor = inputs.view_space_to_meters;
   dispatch_desc.flags = 0;
 
   ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
-  if (ffxDispatch(context, &dispatch_desc.header) != FFX_API_RETURN_OK) {
+  if (const ffxReturnCode_t result = ffxDispatch(context, &dispatch_desc.header);
+      result != FFX_API_RETURN_OK) {
+    static std::atomic<bool> logged = false;
+    if (!logged.exchange(true)) {
+      REXLOG_WARN("VulkanPresenter: FSR 3 dispatch failed ({})", uint32_t(result));
+    }
     return false;
+  }
+  temporal_upscaler_last_frame_id_ = inputs.frame_id;
+  return true;
+}
+
+void VulkanPresenter::DestroyFrameGeneration() {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  if (frame_generation_context_) {
+    ffxContext* context = reinterpret_cast<ffxContext*>(&frame_generation_context_);
+    ffxDestroyContext(context, nullptr);
+    frame_generation_context_ = nullptr;
+  }
+  frame_generation_real_.reset();
+  frame_generation_real_pending_ = false;
+  frame_generation_history_ = false;
+  frame_generation_render_width_ = frame_generation_render_height_ = 0;
+  frame_generation_display_width_ = frame_generation_display_height_ = 0;
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, frame_generation_hud_pipeline_);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device, frame_generation_hud_layout_);
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device, frame_generation_hud_pool_);
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                             frame_generation_hud_set_layout_);
+  frame_generation_hud_sets_ = {};
+}
+
+bool VulkanPresenter::EnsureFrameGeneration(uint32_t render_width, uint32_t render_height,
+                                            uint32_t display_width, uint32_t display_height) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  if (frame_generation_context_ && frame_generation_render_width_ == render_width &&
+      frame_generation_render_height_ == render_height &&
+      frame_generation_display_width_ == display_width &&
+      frame_generation_display_height_ == display_height) {
+    return true;
+  }
+  // Size changes recreate everything; the paint submissions that used the old
+  // objects are awaited first.
+  paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+  DestroyFrameGeneration();
+
+  // HUD composite pipeline.
+  VkDescriptorSetLayoutBinding bindings[4] = {};
+  const VkDescriptorType types[4] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                     VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                     VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER};
+  const VkSampler linear =
+      ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
+  for (uint32_t i = 0; i < 4; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType = types[i];
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[i].pImmutableSamplers = i == 3 ? &linear : nullptr;
+  }
+  VkDescriptorSetLayoutCreateInfo set_layout_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  set_layout_info.bindingCount = 4;
+  set_layout_info.pBindings = bindings;
+  VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+  VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  layout_info.setLayoutCount = 1;
+  layout_info.pSetLayouts = &frame_generation_hud_set_layout_;
+  layout_info.pushConstantRangeCount = 1;
+  layout_info.pPushConstantRanges = &push;
+  VkShaderModuleCreateInfo module_info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  module_info.codeSize = sizeof(shaders::frame_generation_hud_cs);
+  module_info.pCode = shaders::frame_generation_hud_cs;
+  VkShaderModule module = VK_NULL_HANDLE;
+  const VkDescriptorPoolSize pool_sizes[] = {
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 6},
+      {VK_DESCRIPTOR_TYPE_SAMPLER, 3}};
+  VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pool_info.maxSets = 3;
+  pool_info.poolSizeCount = 3;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                      &frame_generation_hud_set_layout_) != VK_SUCCESS ||
+      dfn.vkCreatePipelineLayout(device, &layout_info, nullptr, &frame_generation_hud_layout_) !=
+          VK_SUCCESS ||
+      dfn.vkCreateShaderModule(device, &module_info, nullptr, &module) != VK_SUCCESS ||
+      dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &frame_generation_hud_pool_) !=
+          VK_SUCCESS) {
+    if (module) dfn.vkDestroyShaderModule(device, module, nullptr);
+    DestroyFrameGeneration();
+    return false;
+  }
+  VkComputePipelineCreateInfo pipeline_info = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  pipeline_info.stage.module = module;
+  pipeline_info.stage.pName = "main";
+  pipeline_info.layout = frame_generation_hud_layout_;
+  const VkResult pipeline_result = dfn.vkCreateComputePipelines(
+      device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &frame_generation_hud_pipeline_);
+  dfn.vkDestroyShaderModule(device, module, nullptr);
+  std::array<VkDescriptorSetLayout, 3> set_layouts;
+  set_layouts.fill(frame_generation_hud_set_layout_);
+  VkDescriptorSetAllocateInfo allocate_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  allocate_info.descriptorPool = frame_generation_hud_pool_;
+  allocate_info.descriptorSetCount = 3;
+  allocate_info.pSetLayouts = set_layouts.data();
+  if (pipeline_result != VK_SUCCESS ||
+      dfn.vkAllocateDescriptorSets(device, &allocate_info, frame_generation_hud_sets_.data()) !=
+          VK_SUCCESS) {
+    DestroyFrameGeneration();
+    return false;
+  }
+
+  frame_generation_real_ = GuestOutputImage::Create(vulkan_device_, display_width, display_height);
+  if (!frame_generation_real_) {
+    DestroyFrameGeneration();
+    return false;
+  }
+
+  ffxCreateContextDescFrameGeneration create_desc = {};
+  create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+  create_desc.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED |
+                      FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
+  create_desc.displaySize = {display_width, display_height};
+  create_desc.maxRenderSize = {render_width, render_height};
+  create_desc.backBufferFormat = FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM;
+  ffxCreateBackendVKDesc backend_desc = {};
+  backend_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+  backend_desc.vkDevice = device;
+  backend_desc.vkPhysicalDevice = vulkan_device_->physical_device();
+  PFN_vkGetDeviceProcAddr vk_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+      vulkan_device_->vulkan_instance()->functions().vkGetInstanceProcAddr(
+          vulkan_device_->vulkan_instance()->instance(), "vkGetDeviceProcAddr"));
+  if (!vk_device_proc_addr) {
+    DestroyFrameGeneration();
+    return false;
+  }
+  g_ffx_vk_get_device_proc_addr.store(vk_device_proc_addr, std::memory_order_relaxed);
+  backend_desc.vkDeviceProcAddr = FfxVkGetDeviceProcAddrCompat;
+  create_desc.header.pNext = &backend_desc.header;
+  ffxContext* context = reinterpret_cast<ffxContext*>(&frame_generation_context_);
+  if (ffxCreateContext(context, &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
+    frame_generation_context_ = nullptr;
+    REXLOG_WARN("VulkanPresenter: Failed to create the FidelityFX frame generation context");
+    DestroyFrameGeneration();
+    return false;
+  }
+  ffxConfigureDescFrameGeneration configure = {};
+  configure.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+  configure.frameGenerationEnabled = true;
+  configure.frameID = frame_generation_frame_id_;
+  ffxConfigure(context, &configure.header);
+  frame_generation_render_width_ = render_width;
+  frame_generation_render_height_ = render_height;
+  frame_generation_display_width_ = display_width;
+  frame_generation_display_height_ = display_height;
+  if (!frame_generation_logged_) {
+    frame_generation_logged_ = true;
+    REXLOG_INFO("VulkanPresenter: FSR 3.1 frame generation {}x{} -> {}x{}", render_width,
+                render_height, display_width, display_height);
+  }
+  return true;
+}
+
+bool VulkanPresenter::DispatchFrameGeneration(VkCommandBuffer command_buffer,
+                                              const GuestOutputImage& real,
+                                              const GuestOutputImage& output,
+                                              const TemporalUpscaleInputs& inputs,
+                                              size_t descriptor_slot) {
+  ffxContext* context = reinterpret_cast<ffxContext*>(&frame_generation_context_);
+  if (!frame_generation_context_ || !inputs.depth.image || !inputs.motion_vectors.image) {
+    return false;
+  }
+  auto describe = [](VkImage image, VkFormat format, uint32_t width, uint32_t height,
+                     uint32_t usage, uint32_t state) {
+    VkImageCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {width, height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    return ffxApiGetResourceVK(reinterpret_cast<void*>(image),
+                               ffxApiGetImageResourceDescriptionVK(image, info, usage), state);
+  };
+  const uint64_t frame_id = ++frame_generation_frame_id_;
+
+  ffxDispatchDescFrameGenerationPrepare prepare = {};
+  prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
+  prepare.frameID = frame_id;
+  prepare.commandList = command_buffer;
+  prepare.renderSize = {inputs.width, inputs.height};
+  prepare.jitterOffset = {inputs.jitter_x, inputs.jitter_y};
+  prepare.motionVectorScale = {1.0f, 1.0f};
+  prepare.frameTimeDelta = inputs.frame_time_ms;
+  prepare.cameraNear = inputs.camera_near;
+  prepare.cameraFar = inputs.camera_far;
+  prepare.cameraFovAngleVertical = inputs.fov_y_radians;
+  prepare.viewSpaceToMetersFactor = inputs.view_space_to_meters;
+  prepare.depth = describe(inputs.depth.image, inputs.depth.format, inputs.width, inputs.height,
+                           FFX_API_RESOURCE_USAGE_READ_ONLY,
+                           FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+  prepare.motionVectors =
+      describe(inputs.motion_vectors.image, inputs.motion_vectors.format, inputs.width,
+               inputs.height, FFX_API_RESOURCE_USAGE_READ_ONLY,
+               FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+  if (ffxDispatch(context, &prepare.header) != FFX_API_RETURN_OK) {
+    frame_generation_history_ = false;
+    return false;
+  }
+
+  const VkExtent2D extent = output.extent();
+  ffxDispatchDescFrameGeneration dispatch = {};
+  dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
+  dispatch.commandList = command_buffer;
+  dispatch.presentColor =
+      describe(real.image(), kGuestOutputFormat, extent.width, extent.height,
+               FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+  dispatch.outputs[0] =
+      describe(output.image(), kGuestOutputFormat, extent.width, extent.height,
+               FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+  dispatch.numGeneratedFrames = 1;
+  dispatch.reset = inputs.reset || !frame_generation_history_;
+  dispatch.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+  dispatch.minMaxLuminance[0] = 0.0f;
+  dispatch.minMaxLuminance[1] = 1.0f;
+  dispatch.frameID = frame_id;
+  if (ffxDispatch(context, &dispatch.header) != FFX_API_RETURN_OK) {
+    frame_generation_history_ = false;
+    return false;
+  }
+  frame_generation_history_ = true;
+
+  // Restore the HUD of the real frame over the generated one.
+  if (inputs.reactive.view) {
+    const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+    const VkDescriptorSet set = frame_generation_hud_sets_[descriptor_slot % 3];
+    VkDescriptorImageInfo images[3] = {
+        {VK_NULL_HANDLE, output.view(), VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, real.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {VK_NULL_HANDLE, inputs.reactive.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkWriteDescriptorSet writes[3] = {};
+    for (uint32_t i = 0; i < 3; ++i) {
+      writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      writes[i].dstSet = set;
+      writes[i].dstBinding = i;
+      writes[i].descriptorCount = 1;
+      writes[i].descriptorType =
+          i ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      writes[i].pImageInfo = &images[i];
+    }
+    dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 3, writes, 0, nullptr);
+    VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0,
+                             nullptr);
+    dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          frame_generation_hud_pipeline_);
+    dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                frame_generation_hud_layout_, 0, 1, &set, 0, nullptr);
+    const uint32_t size[2] = {extent.width, extent.height};
+    dfn.vkCmdPushConstants(command_buffer, frame_generation_hud_layout_,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(size), size);
+    dfn.vkCmdDispatch(command_buffer, (extent.width + 7) / 8, (extent.height + 7) / 8, 1);
   }
   return true;
 }
 #endif
+
+namespace {
+std::mutex temporal_upscale_request_mutex;
+TemporalUpscaleRequest temporal_upscale_request;
+}  // namespace
+
+void SetTemporalUpscaleRequest(const TemporalUpscaleRequest& request) {
+  std::lock_guard lock(temporal_upscale_request_mutex);
+  temporal_upscale_request = request;
+}
+
+TemporalUpscaleRequest GetTemporalUpscaleRequest() {
+  std::lock_guard lock(temporal_upscale_request_mutex);
+  return temporal_upscale_request;
+}
 
 Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
     const VulkanInstance::Extensions& instance_extensions) {
@@ -1135,6 +1450,8 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   bool refresher_succeeded = refresher(context);
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
+    image_instance.temporal_inputs = context.temporal_inputs();
+    image_instance.refresh_serial = guest_output_refresh_next_serial_++;
   }
   // Even if the refresher has returned false, it still might have submitted
   // some commands referencing the image. It's better to put an excessive
@@ -1741,6 +2058,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   GuestOutputProperties guest_output_properties;
   GuestOutputPaintConfig guest_output_paint_config;
   std::shared_ptr<GuestOutputImage> guest_output_image;
+  std::shared_ptr<const TemporalUpscaleInputs> guest_output_temporal_inputs;
+  uint64_t guest_output_refresh_serial = 0;
   {
     uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
@@ -1748,6 +2067,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     if (guest_output_mailbox_index != UINT32_MAX) {
       assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
+      guest_output_temporal_inputs = guest_output_images_[guest_output_mailbox_index].temporal_inputs;
+      guest_output_refresh_serial = guest_output_images_[guest_output_mailbox_index].refresh_serial;
     }
     // Incremented the reference count of the guest output image - safe to leave
     // the consumer critical section now as everything here either will be using
@@ -1985,6 +2306,22 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         temporal_effect_selected =
             guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
             guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
+        {
+          // Ask the producer for jitter and scene inputs. FidelityFX's phase
+          // count: 8 * (display / render)^2 along one axis.
+          TemporalUpscaleRequest request;
+          request.active = temporal_effect_selected;
+          if (guest_output_image && guest_output_image->extent().height) {
+            const float ratio = float(paint_context_.swapchain_extent.height) /
+                                float(guest_output_image->extent().height);
+            request.jitter_phase_count =
+                uint32_t(std::clamp(8.0f * ratio * ratio, 8.0f, 128.0f));
+          }
+          SetTemporalUpscaleRequest(request);
+          const uint64_t completed = paint_context_.submission_tracker.UpdateAndGetCompletedSubmission();
+          std::erase_if(temporal_inputs_in_flight_,
+                        [&](const auto& entry) { return entry.first <= completed; });
+        }
 #endif
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
@@ -2013,55 +2350,128 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             guest_output_flow.letterbox_clear_rectangle_count = 0;
           }
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-          bool use_temporal_upscaler =
-              temporal_effect_selected && effect == GuestOutputPaintEffect::kFsrEasu;
+          bool use_temporal_upscaler = temporal_effect_selected &&
+                                       effect == GuestOutputPaintEffect::kFsrEasu &&
+                                       guest_output_temporal_inputs;
+          if (temporal_effect_selected && effect == GuestOutputPaintEffect::kFsrEasu &&
+              !guest_output_temporal_inputs) {
+            static std::atomic<bool> logged = false;
+            if (!logged.exchange(true)) {
+              REXLOG_INFO("VulkanPresenter: no scene inputs for this frame (menus, movies, "
+                          "loading); FSR 3 uses spatial FSR 1 until a scene frame arrives");
+            }
+          }
           if (use_temporal_upscaler && !is_final_effect) {
             VkImage source_image =
                 i ? paint_context_.guest_output_intermediate_images[i - 1]->image()
                   : guest_output_image->image();
-            VkImage output_image = paint_context_.guest_output_intermediate_images[i]->image();
-
-            VkImageMemoryBarrier barrier_to_uav = {};
-            barrier_to_uav.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier_to_uav.srcAccessMask = 0;
-            barrier_to_uav.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            barrier_to_uav.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier_to_uav.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barrier_to_uav.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier_to_uav.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier_to_uav.image = output_image;
-            barrier_to_uav.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier_to_uav.subresourceRange.baseMipLevel = 0;
-            barrier_to_uav.subresourceRange.levelCount = 1;
-            barrier_to_uav.subresourceRange.baseArrayLayer = 0;
-            barrier_to_uav.subresourceRange.layerCount = 1;
-            dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
-                                     nullptr, 1, &barrier_to_uav);
+            const GuestOutputImage& output = *paint_context_.guest_output_intermediate_images[i];
+            VkImage output_image = output.image();
+            temporal_inputs_in_flight_.emplace_back(current_paint_submission_index,
+                                                    guest_output_temporal_inputs);
+            auto image_barrier = [&](VkImage image, VkImageLayout old_layout,
+                                     VkImageLayout new_layout, VkAccessFlags src_access,
+                                     VkAccessFlags dst_access, VkPipelineStageFlags src_stage,
+                                     VkPipelineStageFlags dst_stage) {
+              VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+              barrier.srcAccessMask = src_access;
+              barrier.dstAccessMask = dst_access;
+              barrier.oldLayout = old_layout;
+              barrier.newLayout = new_layout;
+              barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              barrier.image = image;
+              barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+              dfn.vkCmdPipelineBarrier(draw_command_buffer, src_stage, dst_stage, 0, 0, nullptr,
+                                       0, nullptr, 1, &barrier);
+            };
+            constexpr VkPipelineStageFlags kReadStages =
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            // Shows the real frame after a generated one: copy it into the
+            // image the rest of the chain reads.
+            auto restore_real_frame = [&]() {
+              const VkExtent2D extent = frame_generation_real_->extent();
+              image_barrier(frame_generation_real_->image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                            VK_ACCESS_TRANSFER_READ_BIT, kReadStages, VK_PIPELINE_STAGE_TRANSFER_BIT);
+              image_barrier(output_image, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                            kReadStages, VK_PIPELINE_STAGE_TRANSFER_BIT);
+              VkImageCopy copy = {};
+              copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+              copy.dstSubresource = copy.srcSubresource;
+              copy.extent = {extent.width, extent.height, 1};
+              dfn.vkCmdCopyImage(draw_command_buffer, frame_generation_real_->image(),
+                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, output_image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+              image_barrier(frame_generation_real_->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, kReadStages);
+              image_barrier(output_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                            VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, kReadStages);
+            };
+            if (guest_output_refresh_serial == temporal_upscaler_last_serial_ &&
+                output_image == temporal_upscaler_last_output_) {
+              // A repaint of the frame already upscaled into this image: the
+              // paced real frame after a generated one, or a plain repaint.
+              if (frame_generation_real_pending_ && frame_generation_real_) {
+                restore_real_frame();
+                frame_generation_real_pending_ = false;
+              }
+              continue;
+            }
 
             uint32_t effect_input_width = 0, effect_input_height = 0;
             guest_output_flow.GetEffectInputSize(i, effect_input_width, effect_input_height);
+            const bool frame_generation =
+                REXCVAR_GET(present_frame_generation) &&
+                EnsureFrameGeneration(effect_input_width, effect_input_height,
+                                      effect_rect_size.first, effect_rect_size.second);
+            if (!REXCVAR_GET(present_frame_generation) && frame_generation_context_) {
+              paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+              DestroyFrameGeneration();
+            }
+            // With frame generation the upscaler writes the real frame aside
+            // and the chain's image receives the generated frame.
+            VkImage upscale_image = frame_generation ? frame_generation_real_->image() : output_image;
+            image_barrier(upscale_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                          VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            temporal_upscaler_last_serial_ = 0;
+            frame_generation_real_pending_ = false;
             if (DispatchTemporalUpscaler(draw_command_buffer, source_image, effect_input_width,
-                                         effect_input_height, output_image, effect_rect_size.first,
-                                         effect_rect_size.second, guest_output_paint_config)) {
-              VkImageMemoryBarrier barrier_to_shader_read = {};
-              barrier_to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-              barrier_to_shader_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-              barrier_to_shader_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-              barrier_to_shader_read.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-              barrier_to_shader_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-              barrier_to_shader_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-              barrier_to_shader_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-              barrier_to_shader_read.image = output_image;
-              barrier_to_shader_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-              barrier_to_shader_read.subresourceRange.baseMipLevel = 0;
-              barrier_to_shader_read.subresourceRange.levelCount = 1;
-              barrier_to_shader_read.subresourceRange.baseArrayLayer = 0;
-              barrier_to_shader_read.subresourceRange.layerCount = 1;
-              dfn.vkCmdPipelineBarrier(
-                  draw_command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                  0, nullptr, 0, nullptr, 1, &barrier_to_shader_read);
+                                         effect_input_height, upscale_image, effect_rect_size.first,
+                                         effect_rect_size.second, guest_output_paint_config,
+                                         *guest_output_temporal_inputs)) {
+              temporal_upscaler_last_serial_ = guest_output_refresh_serial;
+              temporal_upscaler_last_output_ = output_image;
+              image_barrier(upscale_image, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            kReadStages);
+              if (frame_generation) {
+                image_barrier(output_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                              VK_ACCESS_SHADER_WRITE_BIT, kReadStages,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                if (DispatchFrameGeneration(draw_command_buffer, *frame_generation_real_, output,
+                                            *guest_output_temporal_inputs,
+                                            size_t(current_paint_submission_index))) {
+                  image_barrier(output_image, VK_IMAGE_LAYOUT_GENERAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kReadStages);
+                  // Real frame halfway to the next game frame.
+                  frame_generation_real_pending_ = true;
+                  const float half_ms =
+                      std::clamp(guest_output_temporal_inputs->frame_time_ms * 0.5f, 1.0f, 50.0f);
+                  ScheduleFrameGenerationRepaint(
+                      std::chrono::steady_clock::now() +
+                      std::chrono::microseconds(int64_t(half_ms * 1000.0f)));
+                } else {
+                  restore_real_frame();
+                }
+              }
               continue;
             }
           }

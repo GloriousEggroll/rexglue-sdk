@@ -25,6 +25,7 @@
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/presenter_gpu_timing.h>
 #include <rex/ui/vulkan/submission_tracker.h>
+#include <rex/ui/vulkan/temporal_upscale.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 
 namespace rex {
@@ -102,8 +103,17 @@ class VulkanPresenter final : public Presenter {
     uint64_t image_version() const { return image_version_; }
     // Whether a proper barrier must be done to acquire the image.
     bool image_ever_written_previously() const { return image_ever_written_previously_; }
+    // Scene inputs for temporal upscaling of this refresh, if the producer
+    // has them. Without them a temporal effect falls back to spatial.
+    void SetTemporalInputs(std::shared_ptr<const TemporalUpscaleInputs> inputs) {
+      temporal_inputs_ = std::move(inputs);
+    }
+    const std::shared_ptr<const TemporalUpscaleInputs>& temporal_inputs() const {
+      return temporal_inputs_;
+    }
 
    private:
+    std::shared_ptr<const TemporalUpscaleInputs> temporal_inputs_;
     VkImage image_;
     VkImageView image_view_;
     uint64_t image_version_;
@@ -148,6 +158,7 @@ class VulkanPresenter final : public Presenter {
                               bool& is_8bpc_out_ref) override;
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+  void ReleaseGpuEffects() override;
 
  private:
   // Usable for both the guest output image itself and for intermediate images.
@@ -203,12 +214,17 @@ class VulkanPresenter final : public Presenter {
     // whether the image has previously been written. If an image is active
     // after a refresh, it can be assumed that this is true.
     bool ever_successfully_refreshed = false;
+    // Inputs and serial of the latest successful refresh; the serial lets the
+    // painter run a temporal pass once per guest frame however often it paints.
+    std::shared_ptr<const TemporalUpscaleInputs> temporal_inputs;
+    uint64_t refresh_serial = 0;
 
     void SetToNewImage(const std::shared_ptr<GuestOutputImage>& new_image, uint64_t new_version) {
       image = new_image;
       version = new_version;
       last_refresher_submission = 0;
       ever_successfully_refreshed = false;
+      temporal_inputs.reset();
     }
   };
 
@@ -452,8 +468,20 @@ class VulkanPresenter final : public Presenter {
   bool DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VkImage input_image,
                                 uint32_t input_width, uint32_t input_height, VkImage output_image,
                                 uint32_t output_width, uint32_t output_height,
-                                const GuestOutputPaintConfig& config);
+                                const GuestOutputPaintConfig& config,
+                                const TemporalUpscaleInputs& inputs);
   void DestroyTemporalUpscalerContext();
+  // Frame generation (FSR 3.1 frame interpolation, dispatched directly; the
+  // presenter paces the generated and real presents itself).
+  bool EnsureFrameGeneration(uint32_t render_width, uint32_t render_height,
+                             uint32_t display_width, uint32_t display_height);
+  void DestroyFrameGeneration();
+  // Generates the frame between the previous and `real` (FSR output) into
+  // `output`, then restores the HUD from `real`. `real` is in
+  // SHADER_READ_ONLY_OPTIMAL and `output` in GENERAL.
+  bool DispatchFrameGeneration(VkCommandBuffer command_buffer, const GuestOutputImage& real,
+                               const GuestOutputImage& output, const TemporalUpscaleInputs& inputs,
+                               size_t descriptor_slot);
 #endif
 
   const VulkanDevice* vulkan_device_;
@@ -481,6 +509,7 @@ class VulkanPresenter final : public Presenter {
   // actually different objects without the refresher being aware of the
   // destruction.
   uint64_t guest_output_image_next_version_ = 0;
+  uint64_t guest_output_refresh_next_serial_ = 1;
   std::array<GuestOutputImageInstance, kGuestOutputMailboxSize> guest_output_images_;
   VulkanSubmissionTracker guest_output_image_refresher_submission_tracker_;
 
@@ -501,6 +530,30 @@ class VulkanPresenter final : public Presenter {
   uint32_t temporal_upscaler_max_output_width_ = 0;
   uint32_t temporal_upscaler_max_output_height_ = 0;
   bool temporal_upscaler_provider_logged_ = false;
+  // The guest refresh last upscaled and the image it went to; repaints of the
+  // same guest frame reuse that output instead of accumulating it twice.
+  uint64_t temporal_upscaler_last_serial_ = 0;
+  VkImage temporal_upscaler_last_output_ = VK_NULL_HANDLE;
+  uint64_t temporal_upscaler_last_frame_id_ = UINT64_MAX;
+  // Producer images referenced by queued paint submissions.
+  std::vector<std::pair<uint64_t, std::shared_ptr<const TemporalUpscaleInputs>>>
+      temporal_inputs_in_flight_;
+
+  void* frame_generation_context_ = nullptr;
+  uint32_t frame_generation_render_width_ = 0, frame_generation_render_height_ = 0;
+  uint32_t frame_generation_display_width_ = 0, frame_generation_display_height_ = 0;
+  uint64_t frame_generation_frame_id_ = 0;
+  bool frame_generation_history_ = false;
+  // The upscaled real frame while frame generation is on; the paint chain's
+  // FSR output image holds the generated frame until the paced repaint.
+  std::unique_ptr<GuestOutputImage> frame_generation_real_;
+  bool frame_generation_real_pending_ = false;
+  VkDescriptorSetLayout frame_generation_hud_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout frame_generation_hud_layout_ = VK_NULL_HANDLE;
+  VkPipeline frame_generation_hud_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool frame_generation_hud_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, 3> frame_generation_hud_sets_{};
+  bool frame_generation_logged_ = false;
 #endif
 };
 

@@ -52,6 +52,8 @@
 
 REXCVAR_DECLARE(bool, gpu_command_summary);
 REXCVAR_DECLARE(bool, gpu_native_submit_completion_markers);
+REXCVAR_DEFINE_BOOL(present_anti_lag, false, "UI/Presenter",
+                    "AMD Anti-Lag (VK_AMD_anti_lag) when the driver provides it");
 REXCVAR_DEFINE_BOOL(gpu_native_marker_operands, false, "GPU diagnostics",
                     "Observe decoded native marker shapes; requires gpu_command_summary; never defers stores")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -2541,6 +2543,12 @@ void VulkanCommandProcessor::LogNativeSceneStatistics() {
       c[0],c[1],c[2],c[3],c[4],c[5],native_scene_authority_.rejected());
 }
 
+void VulkanCommandProcessor::UpdateAntiLag(bool present, uint64_t frame_index) {
+  if (const ui::vulkan::VulkanDevice* device = GetVulkanDevice()) {
+    device->UpdateAntiLag(true, 0, present, frame_index);
+  }
+}
+
 void VulkanCommandProcessor::SetNativeSwapSourceProvider(NativeSwapSourceProvider provider) {
   CallInThread([this, provider = std::move(provider)]() mutable {
     native_scene_authority_.ProviderChange("SetNativeSwapSourceProvider after exclusive native installation");
@@ -3323,6 +3331,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
+  if (REXCVAR_GET(present_anti_lag)) {
+    UpdateAntiLag(true, external_frame_number_);
+  }
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view, native_source,
@@ -3343,11 +3354,27 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                  VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
                                  VK_QUEUE_FAMILY_IGNORED, false);
+          if (const auto& temporal = native_source->temporal) {
+            // Make the producer's writes visible to the presenter's later
+            // submissions (temporal upscaling runs while painting).
+            for (const auto* input : {&temporal->depth, &temporal->motion_vectors,
+                                      &temporal->reactive, &temporal->hudless_color}) {
+              if (!input->image) continue;
+              PushImageMemoryBarrier(input->image, range, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                     VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                     VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+            }
+          }
         }
 
         auto& vulkan_context =
             static_cast<ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext&>(context);
         uint64_t guest_output_image_version = vulkan_context.image_version();
+        vulkan_context.SetTemporalInputs(native_source ? native_source->temporal : nullptr);
 
         const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
         const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();

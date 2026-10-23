@@ -86,6 +86,8 @@ enum class GammaRampType {
 class CommandProcessor {
   ShaderStorageProgress shader_storage_progress_;
   FrameLimiter frame_limiter_;
+  // Set while the application paces frames on the guest thread instead.
+  std::atomic<bool> guest_thread_frame_limiter_{false};
 
  public:
   enum class SwapPostEffect {
@@ -127,6 +129,15 @@ class CommandProcessor {
   // work. Returning false posts the item immediately as usual.
   using DirectSwapRouter = std::function<bool(std::function<void()>&)>;
   void SetDirectSwapRouter(DirectSwapRouter router);
+  // Low-latency pacing: the application applies framerate_limit on the guest
+  // thread before the next frame samples input, so the GPU thread does not
+  // also hold finished frames back.
+  // Anti-lag markers (VK_AMD_anti_lag on Vulkan): `present == false` before
+  // the frame reads input, true before it is presented. No-op by default.
+  virtual void UpdateAntiLag(bool present, uint64_t frame_index) {}
+  void SetGuestThreadFrameLimiter(bool enabled) {
+    guest_thread_frame_limiter_.store(enabled, std::memory_order_relaxed);
+  }
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();

@@ -195,6 +195,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
   }
 
+  if (get_physical_device_properties2_supported) {
+    // #477. Also exposed by Mesa's anti-lag layer.
+    XE_UI_VULKAN_STRUCT_EXTENSION(AMD_anti_lag)
+  }
   if (with_swapchain) {
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_hdr_metadata)
     // #2.
@@ -333,6 +337,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
+  VulkanFeatures<VkPhysicalDeviceAntiLagFeaturesAMD,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD>
+      features_AMD_anti_lag;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -373,6 +380,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_AMD_anti_lag) {
+      features_AMD_anti_lag.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -739,6 +749,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  if (device->extensions_.ext_AMD_anti_lag) {
+    features_AMD_anti_lag.enabled.antiLag = features_AMD_anti_lag.supported.antiLag;
+    device->extensions_.ext_AMD_anti_lag = features_AMD_anti_lag.supported.antiLag;
+    if (device->extensions_.ext_AMD_anti_lag) {
+      REXLOG_INFO("* antiLag");
+    }
+  }
+
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT
 #undef XE_UI_VULKAN_FEATURE
@@ -810,6 +828,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_KHR_swapchain) {
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
   }
+  if (device->extensions_.ext_AMD_anti_lag) {
+#include <rex/ui/vulkan/functions/device_amd_anti_lag.inc>
+  }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
 #undef XE_UI_VULKAN_FUNCTION
@@ -861,6 +882,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
 VulkanDevice::~VulkanDevice() {
   if (device_) {
+    REXLOG_INFO("Vulkan device destroyed");
     vulkan_instance_->functions().vkDestroyDevice(device_, nullptr);
   }
 }
@@ -870,6 +892,21 @@ VulkanDevice::VulkanDevice(const VulkanInstance* const vulkan_instance,
     : vulkan_instance_(vulkan_instance), physical_device_(physical_device) {
   assert_not_null(vulkan_instance);
   assert_not_null(physical_device);
+}
+
+void VulkanDevice::UpdateAntiLag(bool enabled, uint32_t max_fps, bool present,
+                                 uint64_t frame_index) const {
+  if (!extensions_.ext_AMD_anti_lag || !functions_.vkAntiLagUpdateAMD) {
+    return;
+  }
+  VkAntiLagPresentationInfoAMD presentation = {VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD};
+  presentation.stage = present ? VK_ANTI_LAG_STAGE_PRESENT_AMD : VK_ANTI_LAG_STAGE_INPUT_AMD;
+  presentation.frameIndex = frame_index;
+  VkAntiLagDataAMD data = {VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD};
+  data.mode = enabled ? VK_ANTI_LAG_MODE_ON_AMD : VK_ANTI_LAG_MODE_OFF_AMD;
+  data.maxFPS = max_fps;
+  data.pPresentationInfo = enabled ? &presentation : nullptr;
+  functions_.vkAntiLagUpdateAMD(device_, &data);
 }
 
 }  // namespace vulkan

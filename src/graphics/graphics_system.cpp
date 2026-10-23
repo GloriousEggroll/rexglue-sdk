@@ -201,7 +201,10 @@ void GraphicsSystem::Shutdown() {
 
   if (presenter_) {
     if (app_context_) {
-      app_context_->CallInUIThreadSynchronous([this]() { presenter_.reset(); });
+      app_context_->CallInUIThreadSynchronous([this]() {
+        presenter_->ReleaseGpuEffects();
+        presenter_.reset();
+      });
     }
     // If there's no app context (thus the presenter is owned by the thread that
     // initialized the GraphicsSystem) or can't be queueing UI thread calls

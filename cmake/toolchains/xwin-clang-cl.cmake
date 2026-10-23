@@ -58,6 +58,13 @@ set(CMAKE_C_COMPILER_TARGET x86_64-pc-windows-msvc)
 set(CMAKE_CXX_COMPILER_TARGET x86_64-pc-windows-msvc)
 set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
 
+# llvm-rc does not take /winsysroot; give it the SDK headers resource
+# scripts include (winresrc.h and friends).
+get_filename_component(XWIN_SDK_VERSION "${XWIN_SDK_LIB_DIR}" NAME)
+set(XWIN_SDK_INCLUDE_DIR "${XWIN_ROOT}/Windows Kits/10/Include/${XWIN_SDK_VERSION}")
+set(CMAKE_RC_FLAGS_INIT
+    "/I \"${XWIN_SDK_INCLUDE_DIR}/um\" /I \"${XWIN_SDK_INCLUDE_DIR}/shared\" /I \"${XWIN_SDK_INCLUDE_DIR}/ucrt\"")
+
 set(CMAKE_C_FLAGS_INIT "/winsysroot\"${XWIN_ROOT}\"")
 set(CMAKE_CXX_FLAGS_INIT "/winsysroot\"${XWIN_ROOT}\"")
 

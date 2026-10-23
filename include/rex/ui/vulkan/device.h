@@ -213,11 +213,18 @@ class VulkanDevice {
     bool ext_1_3_KHR_maintenance4 = false;  // #414
     // Has optional features not implied by this being true.
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
+    // With the antiLag feature (else false).
+    bool ext_AMD_anti_lag = false;  // #477
   };
 
   const Extensions& extensions() const { return extensions_; }
 
   VkDevice device() const { return device_; }
+
+  // VK_AMD_anti_lag: call with `present == false` just before the frame
+  // samples input and with `present == true` just before it is presented.
+  // Does nothing without the extension.
+  void UpdateAntiLag(bool enabled, uint32_t max_fps, bool present, uint64_t frame_index) const;
 
   struct Functions {
 #define XE_UI_VULKAN_FUNCTION(name) PFN_##name name = nullptr;
@@ -226,6 +233,8 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_1_0.inc>
     // VK_KHR_swapchain (#2)
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
+    // VK_AMD_anti_lag (#477)
+#include <rex/ui/vulkan/functions/device_amd_anti_lag.inc>
     // VK_KHR_get_memory_requirements2 (#147, promoted to 1.1)
 #include <rex/ui/vulkan/functions/device_1_1_khr_get_memory_requirements2.inc>
     // VK_KHR_bind_memory2 (#158, promoted to 1.1)

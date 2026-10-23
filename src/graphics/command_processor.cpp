@@ -589,7 +589,8 @@ void CommandProcessor::PostDirectSwap(uint32_t frontbuffer_ptr, uint32_t width, 
   std::function<void()> swap = [this, frontbuffer_ptr, width, height, api_frame] {
     rex::perf::Profiler::Flip();
     external_frame_number_ = api_frame;
-    frame_limiter_.Wait(REXCVAR_GET(framerate_limit));
+    if (!guest_thread_frame_limiter_.load(std::memory_order_relaxed))
+      frame_limiter_.Wait(REXCVAR_GET(framerate_limit));
     IssueSwap(frontbuffer_ptr, width, height);
     command_summary_ = {};
     ++counter_;
@@ -1565,7 +1566,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   const bool timing_enabled = REXCVAR_GET(gpu_command_summary);
   const auto limiter_start = timing_enabled ? std::chrono::steady_clock::now()
                                             : std::chrono::steady_clock::time_point{};
-  frame_limiter_.Wait(REXCVAR_GET(framerate_limit));
+  if (!guest_thread_frame_limiter_.load(std::memory_order_relaxed))
+      frame_limiter_.Wait(REXCVAR_GET(framerate_limit));
   const auto swap_start = timing_enabled ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);

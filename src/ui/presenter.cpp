@@ -294,6 +294,7 @@ Presenter::~Presenter() {
   // No intrusive lifetime management must be performed from UI drawers - defer
   // it if needed.
   assert_false(is_executing_ui_drawers_);
+  StopFrameGenerationPacer();
 
 #if REX_PLATFORM_WIN32
   if (dxgi_ui_tick_thread_.joinable()) {
@@ -1416,6 +1417,78 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
   if (update_paint_mode_to_desired) {
     SetPaintModeFromUIThread(GetDesiredPaintModeFromUIThread(
         surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable));
+  }
+}
+
+void Presenter::ScheduleFrameGenerationRepaint(std::chrono::steady_clock::time_point when) {
+  std::lock_guard lock(frame_generation_pacer_mutex_);
+  if (frame_generation_pacer_stop_) {
+    return;
+  }
+  if (!frame_generation_pacer_thread_.joinable()) {
+    frame_generation_pacer_thread_ = std::thread([this] { FrameGenerationPacerThread(); });
+  }
+  frame_generation_pacer_deadline_ = when;
+  frame_generation_pacer_pending_ = true;
+  frame_generation_pacer_wake_.notify_one();
+}
+
+void Presenter::StopFrameGenerationPacer() {
+  {
+    std::lock_guard lock(frame_generation_pacer_mutex_);
+    frame_generation_pacer_stop_ = true;
+    frame_generation_pacer_pending_ = false;
+  }
+  frame_generation_pacer_wake_.notify_one();
+  if (frame_generation_pacer_thread_.joinable()) {
+    frame_generation_pacer_thread_.join();
+  }
+}
+
+void Presenter::FrameGenerationPacerThread() {
+  std::unique_lock lock(frame_generation_pacer_mutex_);
+  while (!frame_generation_pacer_stop_) {
+    if (!frame_generation_pacer_pending_) {
+      frame_generation_pacer_wake_.wait(lock);
+      continue;
+    }
+    const auto deadline = frame_generation_pacer_deadline_;
+    if (frame_generation_pacer_wake_.wait_until(lock, deadline, [&] {
+          return frame_generation_pacer_stop_ || frame_generation_pacer_deadline_ != deadline;
+        })) {
+      continue;  // Stopped or rescheduled.
+    }
+    frame_generation_pacer_pending_ = false;
+    lock.unlock();
+    PaintResult paint_result = PaintResult::kNotPresented;
+    {
+      // Same access rules as the guest output thread's immediate painting.
+      std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
+      switch (paint_mode_) {
+        case PaintMode::kNone:
+          break;
+        case PaintMode::kUIThreadOnRequest:
+          RequestPaintOrConnectionRecoveryViaWindow(true);
+          break;
+        case PaintMode::kGuestOutputThreadImmediately:
+          if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
+            paint_result = PaintAndPresent(false);
+            if (surface_paint_connection_state_ ==
+                SurfacePaintConnectionState::kConnectedOutdated) {
+              RequestPaintOrConnectionRecoveryViaWindow(true);
+            }
+          }
+          break;
+      }
+    }
+    if (host_gpu_loss_callback_) {
+      if (paint_result == PaintResult::kGpuLostResponsible) {
+        host_gpu_loss_callback_(true, false);
+      } else if (paint_result == PaintResult::kGpuLostExternally) {
+        host_gpu_loss_callback_(false, false);
+      }
+    }
+    lock.lock();
   }
 }
 
