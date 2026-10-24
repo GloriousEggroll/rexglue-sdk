@@ -24,6 +24,7 @@
 #include <rex/perf/counter.h>
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/system/xam/network.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/shader/shader.h>
@@ -590,7 +591,7 @@ void CommandProcessor::PostDirectSwap(uint32_t frontbuffer_ptr, uint32_t width, 
     rex::perf::Profiler::Flip();
     external_frame_number_ = api_frame;
     if (!guest_thread_frame_limiter_.load(std::memory_order_relaxed))
-      frame_limiter_.Wait(REXCVAR_GET(framerate_limit));
+      frame_limiter_.Wait(system::xam::Network::FrameRateLimit(REXCVAR_GET(framerate_limit)));
     IssueSwap(frontbuffer_ptr, width, height);
     command_summary_ = {};
     ++counter_;
@@ -1567,7 +1568,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   const auto limiter_start = timing_enabled ? std::chrono::steady_clock::now()
                                             : std::chrono::steady_clock::time_point{};
   if (!guest_thread_frame_limiter_.load(std::memory_order_relaxed))
-      frame_limiter_.Wait(REXCVAR_GET(framerate_limit));
+      frame_limiter_.Wait(system::xam::Network::FrameRateLimit(REXCVAR_GET(framerate_limit)));
   const auto swap_start = timing_enabled ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);

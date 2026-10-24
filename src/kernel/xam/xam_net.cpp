@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
+#include <cerrno>
 #include <cstring>
 
 #include <rex/chrono/clock.h>
@@ -29,11 +31,13 @@
 #include <rex/system/xsocket.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+#include <rex/system/xam/network.h>
 
 #if REX_PLATFORM_WIN32
 // NOTE: must be included last as it expects windows.h to already be included.
 #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
 #include <winsock2.h>                    // NOLINT(build/include_order)
+#include <ws2tcpip.h>
 #elif REX_PLATFORM_LINUX
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -56,6 +60,26 @@ constexpr u32 kWsaNoProtoOpt = 0x273A;
 u32 SetSocketError(u32 error) {
   XThread::SetLastError(error);
   return u32(-1);
+}
+
+// The last host socket error as a Winsock code, which is what titles expect.
+uint32_t LastSocketError() {
+#if REX_PLATFORM_WIN32
+  return WSAGetLastError();
+#else
+  switch (errno) {
+    case EWOULDBLOCK: return 10035;   // WSAEWOULDBLOCK (EAGAIN is the same value)
+    case EINPROGRESS: return 10036;   // WSAEINPROGRESS
+    case EMSGSIZE: return 10040;      // WSAEMSGSIZE
+    case EADDRINUSE: return 10048;    // WSAEADDRINUSE
+    case ENETUNREACH: return 10051;   // WSAENETUNREACH
+    case ECONNRESET: return 10054;    // WSAECONNRESET
+    case ENOTCONN: return 10057;      // WSAENOTCONN
+    case ECONNREFUSED: return 10061;  // WSAECONNREFUSED
+    case EHOSTUNREACH: return 10065;  // WSAEHOSTUNREACH
+    default: return 10022;            // WSAEINVAL
+  }
+#endif
 }
 
 // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
@@ -239,10 +263,8 @@ u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
 }
 
 u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
-  // For now, constant values.
-  // This makes replicating things easier.
-  std::memset(buffer_ptr, 0xBB, length);
-
+  // Session IDs and keys come from here; they must differ between players.
+  Network::Get().Random(buffer_ptr, length);
   return 0;
 }
 
@@ -462,27 +484,12 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
     return XnAddrStatus::XNET_GET_XNADDR_NONE;
   }
 
-  // Just return a loopback address atm.
-  addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
-  addr_ptr->inaOnline.s_addr = 0;
-  addr_ptr->wPortOnline = 0;
-
-  // TODO(gibbed): A proper mac address.
-  // RakNet's 360 version appears to depend on abEnet to create "random" 64-bit
-  // numbers. A zero value will cause RakPeer::Startup to fail. This causes
-  // 58411436 to crash on startup.
-  // The 360-specific code is scrubbed from the RakNet repo, but there's still
-  // traces of what it's doing which match the game code.
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L382
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4527
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4467
-  // "Mac address is a poor solution because you can't have multiple connections
-  // from the same system"
-  std::memset(addr_ptr->abEnet, 0xCC, 6);
-
-  std::memset(addr_ptr->abOnline, 0, 20);
-
-  return XnAddrStatus::XNET_GET_XNADDR_STATIC;
+  // The host's address; abEnet is unique per player (RakNet's 360 version, for
+  // one, seeds IDs from it and fails on zero).
+  const auto address = Network::Get().local_xnaddr();
+  std::memcpy(addr_ptr.host_address(), address.bytes.data(), address.bytes.size());
+  return XnAddrStatus::XNET_GET_XNADDR_DHCP | XnAddrStatus::XNET_GET_XNADDR_GATEWAY |
+         XnAddrStatus::XNET_GET_XNADDR_DNS;
 }
 
 u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -503,24 +510,78 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
 }
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for
-// subsequent socket calls (like a handle to a XNet address)
-u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
+// subsequent socket calls (like a handle to a XNet address). Here it is the
+// peer's real address.
+u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, mapped_void xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
-  return 1;
+  if (!xn_addr || !in_addr) return X_E_INVALIDARG;
+  XNetAddress address;
+  std::memcpy(address.bytes.data(), xn_addr, address.bytes.size());
+  if (!address.ip()) return X_E_INVALIDARG;
+  Network::Get().RememberPeer(address);
+  std::memcpy(in_addr, address.bytes.data(), 4);  // ina, network order
+  REXKRNL_INFO("XNetXnAddrToInAddr: {}.{}.{}.{}", address.bytes[0], address.bytes[1],
+               address.bytes[2], address.bytes[3]);
+  return 0;
 }
 
 // Does the reverse of the above.
-// FIXME: Arguments may not be correct.
-u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
-                                    mapped_void xid) {
-  return 1;
+u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, u32 ina, mapped_void xn_addr, mapped_void xid) {
+  const auto address = Network::Get().FindPeer(ina);
+  if (!address) return X_E_INVALIDARG;
+  if (xn_addr) std::memcpy(xn_addr, address->bytes.data(), address->bytes.size());
+  if (xid) std::memset(xid, 0, 8);
+  return 0;
 }
+
+uint32_t system_link_port = 0;
 
 // https://www.google.com/patents/WO2008112448A1?cl=en
 // Reserves a port for use by system link
 u32 NetDll_XNetSetSystemLinkPort_entry(u32 caller, u32 port) {
-  return 1;
+  system_link_port = port & 0xFFFF;
+  REXKRNL_INFO("XNetSetSystemLinkPort({})", system_link_port);
+  return 0;
 }
+
+u32 NetDll_XNetGetSystemLinkPort_entry(u32 caller, mapped_u16 port) {
+  if (!port) return X_E_INVALIDARG;
+  *port = uint16_t(system_link_port);
+  return 0;
+}
+
+u32 NetDll_XNetRegisterKey_entry(u32 caller, mapped_void kid, mapped_void key) {
+  if (!kid || !key) return X_E_INVALIDARG;
+  XNetKid id;
+  XNetKey value;
+  std::memcpy(id.ab.data(), kid, id.ab.size());
+  std::memcpy(value.ab.data(), key, value.ab.size());
+  Network::Get().RegisterKey(id, value);
+  return 0;
+}
+
+u32 NetDll_XNetUnregisterKey_entry(u32 caller, mapped_void kid) {
+  if (!kid) return X_E_INVALIDARG;
+  XNetKid id;
+  std::memcpy(id.ab.data(), kid, id.ab.size());
+  Network::Get().UnregisterKey(id);
+  return 0;
+}
+
+u32 NetDll_XNetCreateKey_entry(u32 caller, mapped_void kid, mapped_void key) {
+  if (!kid || !key) return X_E_INVALIDARG;
+  const auto id = Network::Get().CreateSystemLinkKid();
+  std::memcpy(kid, id.ab.data(), id.ab.size());
+  Network::Get().Random(key, 16);
+  return 0;
+}
+
+// Security associations are implicit: traffic is plain UDP/TCP.
+u32 NetDll_XNetConnect_entry(u32 caller, u32 ina) { return 0; }
+u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 ina) {
+  return 2;  // XNET_CONNECT_STATUS_CONNECTED
+}
+u32 NetDll_XNetUnregisterInAddr_entry(u32 caller, u32 ina) { return 0; }
 
 // https://github.com/ILOVEPIE/Cxbx-Reloaded/blob/master/src/CxbxKrnl/EmuXOnline.h#L39
 struct XEthernetStatus {
@@ -532,7 +593,9 @@ struct XEthernetStatus {
 };
 
 u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
-  return 0;
+  if (!REXCVAR_GET(network_enabled)) return 0;
+  return XEthernetStatus::XNET_ETHERNET_LINK_ACTIVE | XEthernetStatus::XNET_ETHERNET_LINK_100MBPS |
+         XEthernetStatus::XNET_ETHERNET_LINK_FULL_DUPLEX;
 }
 
 u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
@@ -585,7 +648,9 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
 
 u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                u32 flags) {
-  return X_ERROR_FUNCTION_FAILED;
+  // Probes are not answered yet; System Link discovery does not use them.
+  REXKRNL_INFO("XNetQosListen(data {} bytes, flags {:08X})", data_size, flags);
+  return 0;
 }
 
 u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
@@ -649,14 +714,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
   }
 
   auto ret = socket->Shutdown(how);
-  if (ret == -1) {
-#if REX_PLATFORM_WIN32
-    uint32_t error_code = WSAGetLastError();
-    XThread::SetLastError(error_code);
-#else
-    XThread::SetLastError(0x0);
-#endif
-  }
+  if (ret == -1) XThread::SetLastError(LastSocketError());
   return ret;
 }
 
@@ -906,7 +964,9 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
-  return socket->Recv(buf_ptr, buf_len, flags);
+  const int ret = socket->Recv(buf_ptr, buf_len, flags);
+  if (ret == -1) XThread::SetLastError(LastSocketError());
+  return ret;
 }
 
 u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
@@ -936,15 +996,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
     *fromlen_ptr = native_fromlen;
   }
 
-  if (ret == -1) {
-// TODO: Better way of getting the error code
-#if REX_PLATFORM_WIN32
-    uint32_t error_code = WSAGetLastError();
-    XThread::SetLastError(error_code);
-#else
-    XThread::SetLastError(0x0);
-#endif
-  }
+  if (ret == -1) XThread::SetLastError(LastSocketError());
 
   return ret;
 }
@@ -970,7 +1022,9 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
-  return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  const int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  if (ret == -1) XThread::SetLastError(LastSocketError());
+  return ret;
 }
 
 u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
@@ -980,6 +1034,39 @@ u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
       return 1;
     }
   }
+  return 0;
+}
+
+i32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name,
+                             mapped_u32 name_length) {
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) return static_cast<i32>(SetSocketError(0x2736));  // WSAENOTSOCK
+  if (!name || !name_length || *name_length < sizeof(XSOCKADDR_IN))
+    return static_cast<i32>(SetSocketError(10014));  // WSAEFAULT
+  sockaddr_in local{};
+  socklen_t length = sizeof(local);
+#if REX_PLATFORM_WIN32
+  const auto native = static_cast<SOCKET>(socket->native_handle());
+#else
+  const auto native = static_cast<int>(socket->native_handle());
+#endif
+  if (::getsockname(native, reinterpret_cast<sockaddr*>(&local), &length) != 0)
+    return static_cast<i32>(SetSocketError(0x2726));  // WSAEINVAL
+  name->sin_family = AF_INET;
+  if (Network::Get().tunnel_enabled() && socket->bound_port()) {
+    // Tunnel sockets: the guest port and virtual address, not the host's.
+    name->sin_port = socket->bound_port();
+    name->sin_addr = Network::Get().local_address();
+    std::memset(name->x_sin_zero, 0, sizeof(name->x_sin_zero));
+    *name_length = sizeof(XSOCKADDR_IN);
+    return 0;
+  }
+  name->sin_port = Network::GuestPort(ntohs(local.sin_port));
+  // Report the address peers reach this machine at, not "any".
+  name->sin_addr = local.sin_addr.s_addr ? ntohl(local.sin_addr.s_addr)
+                                         : Network::Get().local_address();
+  std::memset(name->x_sin_zero, 0, sizeof(name->x_sin_zero));
+  *name_length = sizeof(XSOCKADDR_IN);
   return 0;
 }
 
@@ -1040,6 +1127,14 @@ REX_EXPORT(__imp__NetDll_send, rex::kernel::xam::NetDll_send_entry)
 REX_EXPORT(__imp__NetDll_sendto, rex::kernel::xam::NetDll_sendto_entry)
 REX_EXPORT(__imp__NetDll___WSAFDIsSet, rex::kernel::xam::NetDll___WSAFDIsSet_entry)
 REX_EXPORT(__imp__NetDll_WSASetLastError, rex::kernel::xam::NetDll_WSASetLastError_entry)
+REX_EXPORT(__imp__NetDll_getsockname, rex::kernel::xam::NetDll_getsockname_entry)
+REX_EXPORT(__imp__NetDll_XNetUnregisterKey, rex::kernel::xam::NetDll_XNetUnregisterKey_entry)
+REX_EXPORT(__imp__NetDll_XNetUnregisterInAddr, rex::kernel::xam::NetDll_XNetUnregisterInAddr_entry)
+REX_EXPORT(__imp__NetDll_XNetRegisterKey, rex::kernel::xam::NetDll_XNetRegisterKey_entry)
+REX_EXPORT(__imp__NetDll_XNetGetSystemLinkPort, rex::kernel::xam::NetDll_XNetGetSystemLinkPort_entry)
+REX_EXPORT(__imp__NetDll_XNetGetConnectStatus, rex::kernel::xam::NetDll_XNetGetConnectStatus_entry)
+REX_EXPORT(__imp__NetDll_XNetCreateKey, rex::kernel::xam::NetDll_XNetCreateKey_entry)
+REX_EXPORT(__imp__NetDll_XNetConnect, rex::kernel::xam::NetDll_XNetConnect_entry)
 
 REX_EXPORT_STUB(__imp__NetDll_UpnpActionCalculateWorkBufferSize);
 REX_EXPORT_STUB(__imp__NetDll_UpnpActionCreate);
@@ -1085,25 +1180,18 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
 REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
 REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
 REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
-REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
-REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetConnectStatus);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
-REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
 REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
@@ -1153,4 +1241,3 @@ REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
 REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
 REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
 REX_EXPORT_STUB(__imp__NetDll_getpeername);
-REX_EXPORT_STUB(__imp__NetDll_getsockname);

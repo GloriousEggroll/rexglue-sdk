@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include <rex/cvar.h>
+#include <atomic>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -22,6 +23,7 @@
 #include <rex/types.h>
 #include <rex/string/util.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xam/network.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xio.h>
@@ -29,6 +31,8 @@
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+
+REXCVAR_DECLARE(bool, network_enabled);
 
 namespace rex {
 namespace kernel {
@@ -382,8 +386,13 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // Live-only privileges stay denied so titles do not try Live services.
+  // System Link play needs multiplayer sessions (254) and communications
+  // (252), which local profiles had on the console.
+  const bool allowed = REXCVAR_GET(network_enabled) && (mask == 254 || mask == 252);
+  static std::atomic<uint32_t> logged{0};
+  if (logged++ < 32) REXKRNL_INFO("XamUserCheckPrivilege({}, {}) -> {}", user_index, mask, allowed);
+  *out_value = allowed ? 1 : 0;
   return X_ERROR_SUCCESS;
 }
 
@@ -682,15 +691,14 @@ u32 XamWriteGamerTile_entry(u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 arg5, u3
 }
 
 u32 XamSessionCreateHandle_entry(mapped_u32 handle_ptr) {
-  *handle_ptr = 0xCAFEDEAD;
+  *handle_ptr = rex::system::xam::Network::Get().CreateSessionHandle();
   return X_ERROR_SUCCESS;
 }
 
 u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
-  assert_true(handle == 0xCAFEDEAD);
-  // TODO(PermaNull): Implement this properly,
-  // For the time being returning 0xDEADF00D will prevent crashing.
-  *obj_ptr = 0xDEADF00D;
+  const uint32_t object = rex::system::xam::Network::Get().SessionObject(handle);
+  if (!object) return X_ERROR_INVALID_HANDLE;
+  *obj_ptr = object;
   return X_ERROR_SUCCESS;
 }
 

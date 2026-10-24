@@ -13,9 +13,16 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
+
+REXCVAR_DEFINE_STRING(user_gamertag, "User", "Profile",
+                      "Gamertag shown to other players (1-15 characters)");
+REXCVAR_DEFINE_STRING(user_xuid, "", "Profile",
+                      "Profile ID as 16 hex digits; must be unique per player for multiplayer. "
+                      "Empty uses the built-in default");
 
 namespace rex {
 namespace system {
@@ -26,7 +33,24 @@ UserProfile::UserProfile() {
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
   xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  const std::string xuid = REXCVAR_GET(user_xuid);
+  if (!xuid.empty()) {
+    try {
+      size_t used = 0;
+      const uint64_t value = std::stoull(xuid, &used, 16);
+      if (used == xuid.size() && value && !(value & 0x00C0000000000000ull)) {
+        xuid_ = value;
+      } else {
+        REXSYS_WARN("Ignoring invalid user_xuid {}", xuid);
+      }
+    } catch (const std::exception&) {
+      REXSYS_WARN("Ignoring invalid user_xuid {}", xuid);
+    }
+  }
+  name_ = REXCVAR_GET(user_gamertag);
+  if (name_.empty()) name_ = "User";
+  if (name_.size() > 15) name_.resize(15);
+  REXSYS_INFO("Profile: {} ({:016X})", name_, xuid_);
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py

@@ -125,8 +125,11 @@ class XSocket : public XObject {
     uint8_t data[1];
   };
 
-  // Queue a packet into our internal buffer.
+  // Queue a packet into our internal buffer (lobby tunnel deliveries).
   bool QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len);
+  bool HasQueuedPackets();
+  // Size of the next queued packet, or zero.
+  uint32_t QueuedBytes();
 
  private:
   XSocket(KernelState* kernel_state, uint64_t native_handle);
@@ -141,6 +144,11 @@ class XSocket : public XObject {
   uint16_t bound_port_ = 0;
 
   bool broadcast_socket_ = false;
+  bool nonblocking_ = false;
+  // Pops one queued packet into the caller's buffer; -1 when none is queued.
+  int PopPacket(uint8_t* buf, uint32_t buf_len, N_XSOCKADDR_IN* from, uint32_t* from_len);
+  // Binds to an ephemeral port so tunnel replies have somewhere to go.
+  bool EnsureBound();
 
   std::unique_ptr<rex::thread::Event> event_;
   std::mutex incoming_packet_mutex_;

@@ -16,7 +16,7 @@
 #include <rex/platform.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xsocket.h>
-// #include <rex/system/xnet.h>
+#include <rex/system/xam/network.h>
 
 #include <rex/net/socket.h>
 #include <rex/memory/utils.h>
@@ -92,6 +92,7 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 }
 
 X_STATUS XSocket::Close() {
+  if (bound_) xam::Network::Get().UnregisterSocket(bound_port_, handle());
   int ret = rex::net::socket_close(native_handle_);
   if (ret != 0) {
     return X_STATUS_UNSUCCESSFUL;
@@ -165,18 +166,32 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
     default: return X_STATUS_NOT_SUPPORTED;
   }
   uint32_t value = memory::load_and_swap<uint32_t>(arg_ptr);
+  if (cmd == 0x8004667e) nonblocking_ = value != 0;
   int ret = rex::net::socket_ioctl(native_handle_, native_cmd,
                                  reinterpret_cast<uint8_t*>(&value));
   if (ret < 0) {
     // TODO: Get last error
     return X_STATUS_UNSUCCESSFUL;
   }
+  // Queued tunnel packets are readable too; report the next one's size.
+  if (cmd == 0x4004667f && HasQueuedPackets()) value = QueuedBytes();
 
   memory::store_and_swap<uint32_t>(arg_ptr, value);
   return X_STATUS_SUCCESS;
 }
 
 X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
+  sockaddr_in host_name{};
+  if (name && name->address_family == AF_INET && name_len >= int(sizeof(sockaddr_in))) {
+    // sa_data: port (network order), then the IPv4 address (network order).
+    uint16_t port;
+    std::memcpy(&port, name->sa_data, 2);
+    host_name.sin_family = AF_INET;
+    host_name.sin_port = htons(xam::Network::HostPort(ntohs(port)));
+    std::memcpy(&host_name.sin_addr, name->sa_data + 2, 4);
+    name = reinterpret_cast<N_XSOCKADDR*>(&host_name);
+    name_len = sizeof(host_name);
+  }
   int ret = connect(native_handle_, (sockaddr*)name, name_len);
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
@@ -189,25 +204,49 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   if (!name || name_len != sizeof(N_XSOCKADDR_IN)) {
     return X_STATUS_INVALID_PARAMETER;
   }
-  auto host_name = *name;
   const uint16_t guest_port = name->sin_port;
-#if !REX_PLATFORM_WIN32
-  // Match the local Xenia build's low-port mapping. Single-player titles can
-  // create local sessions on ports such as 1000, which require privileges on
-  // Linux. Preserve zero so the OS can still choose an ephemeral port.
-  if (guest_port != 0 && guest_port < 1024) {
-    host_name.sin_port = guest_port + 10000;
+  // Low guest ports map to 10000 + port on every OS (see xam/network.h); zero
+  // still lets the OS choose.
+  sockaddr_in host_name{};
+  host_name.sin_family = AF_INET;
+  host_name.sin_port = htons(xam::Network::HostPort(guest_port));
+  host_name.sin_addr.s_addr = htonl(uint32_t(name->sin_addr));
+  auto& network = xam::Network::Get();
+  if (network.tunnel_enabled()) {
+    // Game traffic arrives through the tunnel by guest port; the host socket
+    // only needs to receive wake datagrams, so several instances can share a
+    // machine.
+    host_name.sin_port = 0;
+    host_name.sin_addr.s_addr = htonl(0x7F000001);
+  } else if (!host_name.sin_addr.s_addr && network.bind_local_address()) {
+    host_name.sin_addr.s_addr = htonl(network.local_address());
   }
-#endif
-  int ret = bind(native_handle_, reinterpret_cast<sockaddr*>(&host_name), name_len);
+  int ret = bind(native_handle_, reinterpret_cast<sockaddr*>(&host_name), sizeof(host_name));
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }
 
   bound_ = true;
   bound_port_ = guest_port;
+  if (!bound_port_ && network.tunnel_enabled()) bound_port_ = network.AllocateTunnelPort();
+  if (!bound_port_) {
+    sockaddr_in local{};
+    socklen_t length = sizeof(local);
+    if (getsockname(native_handle_, reinterpret_cast<sockaddr*>(&local), &length) == 0)
+      bound_port_ = xam::Network::GuestPort(ntohs(local.sin_port));
+  }
+  network.RegisterSocket(bound_port_, handle());
 
   return X_STATUS_SUCCESS;
+}
+
+bool XSocket::EnsureBound() {
+  if (bound_) return true;
+  N_XSOCKADDR_IN any{};
+  any.sin_family = AF_INET;
+  any.sin_port = 0;
+  any.sin_addr = 0;
+  return XSUCCEEDED(Bind(&any, sizeof(any)));
 }
 
 X_STATUS XSocket::Listen(int backlog) {
@@ -259,30 +298,68 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
   return recv(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags);
 }
 
+int XSocket::PopPacket(uint8_t* buf, uint32_t buf_len, N_XSOCKADDR_IN* from,
+                      uint32_t* from_len) {
+  std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
+  if (incoming_packets_.empty()) return -1;
+  packet* pkt = reinterpret_cast<packet*>(incoming_packets_.front());
+  const int data_len = pkt->data_len;
+  if (auto writer = memory()->BeginExternalHostWrite(buf, buf_len))
+    std::memcpy(buf, pkt->data, std::min(uint32_t(data_len), buf_len));
+  if (from) {
+    from->sin_family = AF_INET;
+    from->sin_addr = uint32_t(pkt->src_ip);
+    from->sin_port = uint16_t(pkt->src_port);
+    std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
+  }
+  if (from_len) *from_len = sizeof(N_XSOCKADDR_IN);
+  incoming_packets_.pop();
+  delete[] reinterpret_cast<uint8_t*>(pkt);
+  return data_len;
+}
+
+bool XSocket::HasQueuedPackets() {
+  std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
+  return !incoming_packets_.empty();
+}
+
+uint32_t XSocket::QueuedBytes() {
+  std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
+  return incoming_packets_.empty() ? 0
+                                   : reinterpret_cast<packet*>(incoming_packets_.front())->data_len;
+}
+
 int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* from,
                       uint32_t* from_len) {
-  // Pop from secure packets first
-  // TODO(DrChat): Enable when I commit XNet
-  /*
-  {
-    std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
-    if (incoming_packets_.size()) {
-      packet* pkt = (packet*)incoming_packets_.front();
-      int data_len = pkt->data_len;
-      std::memcpy(buf, pkt->data, std::min((uint32_t)pkt->data_len, buf_len));
-
-      from->sin_family = 2;
-      from->sin_addr = pkt->src_ip;
-      from->sin_port = pkt->src_port;
-
-      incoming_packets_.pop();
-      uint8_t* pkt_ui8 = (uint8_t*)pkt;
-      delete[] pkt_ui8;
-
-      return data_len;
+  // Lobby tunnel packets first; each is announced by a loopback wake datagram,
+  // which is discarded here.
+  for (;;) {
+    if (const int queued = PopPacket(buf, buf_len, from, from_len); queued >= 0) return queued;
+    sockaddr_in wake_from{};
+    socklen_t wake_length = sizeof(wake_from);
+    uint8_t probe;
+    const int peeked = recvfrom(native_handle_, reinterpret_cast<char*>(&probe), 1, MSG_PEEK,
+                                reinterpret_cast<sockaddr*>(&wake_from), &wake_length);
+    if (peeked < 0 && !nonblocking_) {
+      // Blocking socket with nothing to peek: fall through to the real read.
+      break;
     }
+    if (peeked >= 0 &&
+        xam::Network::Get().IsWake(ntohl(wake_from.sin_addr.s_addr), ntohs(wake_from.sin_port))) {
+      recvfrom(native_handle_, reinterpret_cast<char*>(&probe), 1, 0, nullptr, nullptr);
+      if (const int queued = PopPacket(buf, buf_len, from, from_len); queued >= 0) return queued;
+      if (nonblocking_) {
+#if REX_PLATFORM_WIN32
+        WSASetLastError(WSAEWOULDBLOCK);
+#else
+        errno = EWOULDBLOCK;
+#endif
+        return -1;
+      }
+      continue;
+    }
+    break;
   }
-  */
 
   auto byte_writer=memory()->BeginExternalHostWrite(buf,buf_len);
   if(!byte_writer){
@@ -297,10 +374,11 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
   socklen_t nfromlen = sizeof(sockaddr_in);
   int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
                      (sockaddr*)&nfrom, &nfromlen);
+  if (ret > 0) xam::Network::Get().NoteTraffic(ntohl(nfrom.sin_addr.s_addr));
   if (from) {
     from->sin_family = nfrom.sin_family;
     from->sin_addr = ntohl(nfrom.sin_addr.s_addr);  // BE <- BE
-    from->sin_port = nfrom.sin_port;
+    from->sin_port = xam::Network::GuestPort(ntohs(nfrom.sin_port));
     std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
   }
 
@@ -328,11 +406,33 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
   }
   */
 
-  sockaddr_in nto;
+  // Virtual addresses and broadcasts go through the lobby tunnel.
+  auto& network = xam::Network::Get();
+  if (to && network.TunnelDestination(uint32_t(to->sin_addr))) {
+    if (!EnsureBound()) return -1;
+    network.TunnelSend(bound_port_, uint32_t(to->sin_addr), to->sin_port, buf, buf_len);
+    return int(buf_len);
+  }
+
+  sockaddr_in nto{};
   if (to) {
-    nto.sin_addr.s_addr = to->sin_addr;
+    nto.sin_addr.s_addr = htonl(uint32_t(to->sin_addr));
     nto.sin_family = to->sin_family;
-    nto.sin_port = to->sin_port;
+    nto.sin_port = htons(xam::Network::HostPort(to->sin_port));
+    to_len = sizeof(nto);
+  }
+  // Broadcasts go to the configured peers instead when there are any.
+  if (to && (uint32_t(to->sin_addr) == 0xFFFFFFFFu || broadcast_socket_)) {
+    const auto peers = xam::Network::Get().broadcast_peers();
+    if (!peers.empty() && uint32_t(to->sin_addr) == 0xFFFFFFFFu) {
+      int ret = -1;
+      for (const uint32_t peer : peers) {
+        nto.sin_addr.s_addr = htonl(peer);
+        ret = sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
+                     (sockaddr*)&nto, to_len);
+      }
+      return ret < 0 ? ret : int(buf_len);
+    }
   }
 
   return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,

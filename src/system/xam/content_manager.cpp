@@ -442,11 +442,12 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
 
 std::filesystem::path ContentManager::ResolveGameUserContentPath() {
   auto title_id = fmt::format("{:08X}", kernel_state_->title_id());
-  auto user_name = rex::to_path(kernel_state_->user_profile()->name());
+  // Keyed by XUID, so a gamertag can change without losing settings.
+  auto xuid = fmt::format("{:016X}", kernel_state_->user_profile()->xuid());
 
   // Per-game per-profile data location:
-  // content_root/title_id/profile/user_name
-  return root_path_ / title_id / kGameUserContentDirName / user_name;
+  // content_root/title_id/profile/xuid
+  return root_path_ / title_id / kGameUserContentDirName / xuid;
 }
 
 std::unordered_map<string::string_key_case, ContentPackage*,

@@ -30,6 +30,8 @@ set(REXSYSTEM_SOURCES
     xam/app_manager.cpp
     xam/content_manager.cpp
     xam/user_profile.cpp
+    xam/network.cpp
+    xam/network_tunnel.cpp
 
     ppc_types.cpp
     elf_module.cpp
