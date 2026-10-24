@@ -834,7 +834,9 @@ bool VulkanPresenter::DispatchFrameGeneration(VkCommandBuffer command_buffer,
       describe(output.image(), kGuestOutputFormat, extent.width, extent.height,
                FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
   dispatch.numGeneratedFrames = 1;
-  dispatch.reset = inputs.reset || !frame_generation_history_;
+  const bool consecutive = inputs.frame_id == frame_generation_last_input_ + 1;
+  frame_generation_last_input_ = inputs.frame_id;
+  dispatch.reset = inputs.reset || !frame_generation_history_ || !consecutive;
   dispatch.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
   dispatch.minMaxLuminance[0] = 0.0f;
   dispatch.minMaxLuminance[1] = 1.0f;

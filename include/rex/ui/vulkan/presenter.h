@@ -565,6 +565,9 @@ class VulkanPresenter final : public Presenter {
   uint32_t frame_generation_display_width_ = 0, frame_generation_display_height_ = 0;
   uint64_t frame_generation_frame_id_ = 0;
   bool frame_generation_history_ = false;
+  // Scene frame of the last interpolated real frame: frame generation's
+  // motion vectors span exactly one scene frame.
+  uint64_t frame_generation_last_input_ = UINT64_MAX;
   // The upscaled real frame while frame generation is on; the paint chain's
   // FSR output image holds the generated frame until the paced repaint.
   std::unique_ptr<GuestOutputImage> frame_generation_real_;

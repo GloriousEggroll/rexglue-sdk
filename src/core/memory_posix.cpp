@@ -486,21 +486,20 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   if (ret < 0) {
     return kFileMappingHandleInvalid;
   }
+  // Nothing reopens the mapping by name, and the descriptor keeps it alive, so
+  // remove the name now: a crashed or killed process would otherwise leave
+  // gigabytes behind in /dev/shm.
+  shm_unlink(full_path.c_str());
   if (ftruncate64(ret, static_cast<off_t>(length)) != 0) {
     close(ret);
-    shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
   return static_cast<FileMappingHandle>(ret);
 #endif
 }
 
-void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& /*path*/) {
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
-  auto full_path = MakeShmName(path);
-  shm_unlink(full_path.c_str());
-#endif
 }
 
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,
