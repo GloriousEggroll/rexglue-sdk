@@ -1422,7 +1422,8 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
   }
 }
 
-void Presenter::ScheduleFrameGenerationRepaint(std::chrono::steady_clock::time_point when) {
+void Presenter::ScheduleFrameGenerationRepaint(uint64_t generated_submission,
+                                               std::chrono::steady_clock::duration delay) {
   std::lock_guard lock(frame_generation_pacer_mutex_);
   if (frame_generation_pacer_stop_) {
     return;
@@ -1430,7 +1431,9 @@ void Presenter::ScheduleFrameGenerationRepaint(std::chrono::steady_clock::time_p
   if (!frame_generation_pacer_thread_.joinable()) {
     frame_generation_pacer_thread_ = std::thread([this] { FrameGenerationPacerThread(); });
   }
-  frame_generation_pacer_deadline_ = when;
+  ++frame_generation_pacer_sequence_;
+  frame_generation_pacer_submission_ = generated_submission;
+  frame_generation_pacer_delay_ = delay;
   frame_generation_pacer_pending_ = true;
   frame_generation_pacer_wake_.notify_one();
 }
@@ -1454,9 +1457,23 @@ void Presenter::FrameGenerationPacerThread() {
       frame_generation_pacer_wake_.wait(lock);
       continue;
     }
-    const auto deadline = frame_generation_pacer_deadline_;
+    const uint64_t sequence = frame_generation_pacer_sequence_;
+    const uint64_t submission = frame_generation_pacer_submission_;
+    const auto delay = frame_generation_pacer_delay_;
+    lock.unlock();
+    // The generated frame is on screen once its submission has completed
+    // (presentation is immediate or mailbox): time the real frame from there.
+    // The painting lock also guarantees the submission has been made.
+    {
+      std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
+      if (paint_mode_ == PaintMode::kGuestOutputThreadImmediately) {
+        AwaitPaintSubmission(submission);
+      }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + delay;
+    lock.lock();
     if (frame_generation_pacer_wake_.wait_until(lock, deadline, [&] {
-          return frame_generation_pacer_stop_ || frame_generation_pacer_deadline_ != deadline;
+          return frame_generation_pacer_stop_ || frame_generation_pacer_sequence_ != sequence;
         })) {
       continue;  // Stopped or rescheduled.
     }

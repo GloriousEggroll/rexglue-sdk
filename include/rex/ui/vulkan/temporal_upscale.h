@@ -25,7 +25,9 @@ struct TemporalUpscaleInputs {
   TemporalUpscaleImage depth;
   // Two channels in pixels: (previous position - current position).
   TemporalUpscaleImage motion_vectors;
-  // One channel 0..1; 1 where the image must not accumulate history (HUD).
+  // Red 0..1: how much to favour this frame over history (moving surfaces
+  // without motion vectors, HUD). Green: HUD coverage, composited after
+  // upscaling from the guest output.
   TemporalUpscaleImage reactive;
   // Optional: the frame before the HUD, same format as the guest output.
   TemporalUpscaleImage hudless_color;
@@ -46,6 +48,10 @@ struct TemporalUpscaleInputs {
 struct TemporalUpscaleRequest {
   bool active = false;
   uint32_t jitter_phase_count = 8;
+  // Lowest reactive value to write everywhere: shortens the upscaler's
+  // history for surfaces that animate without motion vectors, at the cost of
+  // more shimmer.
+  float reactive_floor = 0;
 };
 
 void SetTemporalUpscaleRequest(const TemporalUpscaleRequest& request);

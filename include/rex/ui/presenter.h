@@ -706,12 +706,18 @@ class Presenter {
   // For calling from the painting implementations if requested.
   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
 
-  // Frame generation: after presenting a generated frame, paint again at
-  // `when` so the real frame follows it. A newer request replaces an older
+  // Frame generation: after presenting a generated frame in paint submission
+  // `generated_submission`, paint again `delay` after the GPU has finished
+  // that submission, so the real frame follows the generated one on screen
+  // rather than queueing right behind it. A newer request replaces an older
   // one. The implementation must stop the pacer in its destructor, before
   // painting state is destroyed.
-  void ScheduleFrameGenerationRepaint(std::chrono::steady_clock::time_point when);
+  void ScheduleFrameGenerationRepaint(uint64_t generated_submission,
+                                      std::chrono::steady_clock::duration delay);
   void StopFrameGenerationPacer();
+  // Blocks until a paint submission has completed on the GPU. Called by the
+  // frame generation pacer with the painting lock held.
+  virtual void AwaitPaintSubmission(uint64_t /* submission */) {}
 
  private:
   enum class PaintMode {
@@ -895,7 +901,10 @@ class Presenter {
   std::thread frame_generation_pacer_thread_;
   bool frame_generation_pacer_stop_ = false;
   bool frame_generation_pacer_pending_ = false;
-  std::chrono::steady_clock::time_point frame_generation_pacer_deadline_{};
+  // Incremented by every request, so a waiting pacer notices a newer one.
+  uint64_t frame_generation_pacer_sequence_ = 0;
+  uint64_t frame_generation_pacer_submission_ = 0;
+  std::chrono::steady_clock::duration frame_generation_pacer_delay_{};
 
   // These fields can be accessed _exclusively_ by either the UI thread or the
   // guest output thread, depending on paint_mode_.

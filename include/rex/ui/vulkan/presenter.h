@@ -160,6 +160,7 @@ class VulkanPresenter final : public Presenter {
                               bool& is_8bpc_out_ref) override;
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+  void AwaitPaintSubmission(uint64_t submission) override;
   void ReleaseGpuEffects() override;
 
  private:
@@ -484,14 +485,17 @@ class VulkanPresenter final : public Presenter {
   // generated frames.
   bool EnsureHudComposite();
   void DestroyHudComposite();
+  // With `hudless`, instead writes the temporal upscaler's input to `target`
+  // at render resolution: `source` with the HUD replaced by `hudless`.
   void RecordHudComposite(VkCommandBuffer command_buffer, VkImageView target, VkExtent2D extent,
-                          VkImageView source, VkImageView mask, size_t set_index);
+                          VkImageView source, VkImageView mask, size_t set_index,
+                          VkImageView hudless = VK_NULL_HANDLE);
   // Generates the frame between the previous and `real` (FSR output) into
   // `output`, then restores the HUD from `real`. `real` is in
   // SHADER_READ_ONLY_OPTIMAL and `output` in GENERAL.
   bool DispatchFrameGeneration(VkCommandBuffer command_buffer, const GuestOutputImage& real,
                                const GuestOutputImage& output, const TemporalUpscaleInputs& inputs,
-                               size_t descriptor_slot);
+                               VkImageView hud_source, size_t descriptor_slot);
 #endif
 
   const VulkanDevice* vulkan_device_;
@@ -539,6 +543,10 @@ class VulkanPresenter final : public Presenter {
   uint32_t temporal_upscaler_max_render_height_ = 0;
   uint32_t temporal_upscaler_max_output_width_ = 0;
   uint32_t temporal_upscaler_max_output_height_ = 0;
+  // FSR accumulation per frame last configured; negative when not yet set.
+  float temporal_upscaler_accumulation_ = -1.0f;
+  // present_fsr3_ghosting_reduction, clamped to 0..1.
+  static float TemporalGhostingReduction();
   bool temporal_upscaler_provider_logged_ = false;
   // The guest refresh last upscaled and the image it went to; repaints of the
   // same guest frame reuse that output instead of accumulating it twice.
@@ -561,11 +569,18 @@ class VulkanPresenter final : public Presenter {
   // FSR output image holds the generated frame until the paced repaint.
   std::unique_ptr<GuestOutputImage> frame_generation_real_;
   bool frame_generation_real_pending_ = false;
+  // Smoothed interval between game frames painted with frame generation; the
+  // real frame is shown half of it after the generated one.
+  std::chrono::steady_clock::time_point frame_generation_last_paint_{};
+  std::chrono::duration<float, std::milli> frame_generation_interval_{};
   VkDescriptorSetLayout frame_generation_hud_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout frame_generation_hud_layout_ = VK_NULL_HANDLE;
   VkPipeline frame_generation_hud_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool frame_generation_hud_pool_ = VK_NULL_HANDLE;
-  std::array<VkDescriptorSet, 6> frame_generation_hud_sets_{};
+  // Three per paint submission: upscaler input, HUD composite, generated frame.
+  std::array<VkDescriptorSet, 9> frame_generation_hud_sets_{};
+  // The guest frame without its HUD, fed to the temporal upscaler.
+  std::unique_ptr<GuestOutputImage> temporal_upscaler_input_;
   bool frame_generation_logged_ = false;
 #endif
 };

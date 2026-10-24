@@ -50,6 +50,13 @@ REXCVAR_DECLARE(bool, vsync);
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 REXCVAR_DECLARE(std::string, present_effect);
 #endif
+REXCVAR_DEFINE_BOOL(present_temporal_debug_view, false, "UI/Presenter",
+                    "Diagnostics: tint pixels the temporal upscaler treats as reactive red "
+                    "and HUD green");
+REXCVAR_DEFINE_DOUBLE(present_fsr3_ghosting_reduction, 1.0, "UI/Presenter",
+                      "FSR 3.1: shorten the history from 0 (AMD default, sharpest when still) to "
+                      "1 (default: least ghosting on animation without motion vectors, more "
+                      "shimmer)");
 REXCVAR_DEFINE_BOOL(present_frame_generation, false, "UI/Presenter",
                     "FSR 3.1 frame generation: show a generated frame between game frames. "
                     "Needs present_effect=fsr3 and a renderer that supplies scene inputs");
@@ -213,12 +220,14 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
 void VulkanPresenter::ReleaseGpuEffects() {
   Presenter::ReleaseGpuEffects();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-  if (temporal_upscaler_context_ || frame_generation_context_ || vendor_upscaler_) {
+  if (temporal_upscaler_context_ || frame_generation_context_ || vendor_upscaler_ ||
+      temporal_upscaler_input_) {
     paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
     REXLOG_INFO("VulkanPresenter: releasing upscaler contexts");
     vendor_upscaler_.reset();
     DestroyFrameGeneration();
     DestroyTemporalUpscalerContext();
+    temporal_upscaler_input_.reset();
   }
   DestroyHudComposite();
 #endif
@@ -356,6 +365,7 @@ bool VulkanPresenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint3
     temporal_upscaler_max_output_width_ = output_width;
     temporal_upscaler_max_output_height_ = output_height;
     temporal_upscaler_provider_logged_ = false;
+    temporal_upscaler_accumulation_ = -1.0f;
   }
 
   if (!temporal_upscaler_provider_logged_) {
@@ -513,6 +523,20 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
   dispatch_desc.flags = 0;
 
   ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
+  // With the producer's reactive floor (see the request), less accumulation
+  // per frame where reactive > 0: AMD's advice against ghosting.
+  const float accumulation =
+      0.333f - 0.233f * TemporalGhostingReduction();
+  if (accumulation != temporal_upscaler_accumulation_) {
+    ffxConfigureDescUpscaleKeyValue key = {};
+    key.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+    key.key = FFX_API_CONFIGURE_UPSCALE_KEY_FACCUMULATIONADDEDPERFRAME;
+    float value = accumulation;
+    key.ptr = &value;
+    if (ffxConfigure(context, &key.header) == FFX_API_RETURN_OK) {
+      temporal_upscaler_accumulation_ = accumulation;
+    }
+  }
   if (const ffxReturnCode_t result = ffxDispatch(context, &dispatch_desc.header);
       result != FFX_API_RETURN_OK) {
     static std::atomic<bool> logged = false;
@@ -557,13 +581,14 @@ bool VulkanPresenter::EnsureHudComposite() {
   }
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
-  VkDescriptorSetLayoutBinding bindings[4] = {};
-  const VkDescriptorType types[4] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+  VkDescriptorSetLayoutBinding bindings[5] = {};
+  const VkDescriptorType types[5] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                      VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                                     VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER};
+                                     VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER,
+                                     VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE};
   const VkSampler linear =
       ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
-  for (uint32_t i = 0; i < 4; ++i) {
+  for (uint32_t i = 0; i < 5; ++i) {
     bindings[i].binding = i;
     bindings[i].descriptorType = types[i];
     bindings[i].descriptorCount = 1;
@@ -571,9 +596,9 @@ bool VulkanPresenter::EnsureHudComposite() {
     bindings[i].pImmutableSamplers = i == 3 ? &linear : nullptr;
   }
   VkDescriptorSetLayoutCreateInfo set_layout_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  set_layout_info.bindingCount = 4;
+  set_layout_info.bindingCount = 5;
   set_layout_info.pBindings = bindings;
-  VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+  VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
   VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   layout_info.setLayoutCount = 1;
   layout_info.pSetLayouts = &frame_generation_hud_set_layout_;
@@ -584,10 +609,10 @@ bool VulkanPresenter::EnsureHudComposite() {
   module_info.pCode = shaders::frame_generation_hud_cs;
   VkShaderModule module = VK_NULL_HANDLE;
   const VkDescriptorPoolSize pool_sizes[] = {
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 12},
-      {VK_DESCRIPTOR_TYPE_SAMPLER, 6}};
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 27},
+      {VK_DESCRIPTOR_TYPE_SAMPLER, 9}};
   VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-  pool_info.maxSets = 6;
+  pool_info.maxSets = 9;
   pool_info.poolSizeCount = 3;
   pool_info.pPoolSizes = pool_sizes;
   if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
@@ -610,7 +635,7 @@ bool VulkanPresenter::EnsureHudComposite() {
   const VkResult pipeline_result = dfn.vkCreateComputePipelines(
       device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &frame_generation_hud_pipeline_);
   dfn.vkDestroyShaderModule(device, module, nullptr);
-  std::array<VkDescriptorSetLayout, 6> set_layouts;
+  std::array<VkDescriptorSetLayout, 9> set_layouts;
   set_layouts.fill(frame_generation_hud_set_layout_);
   VkDescriptorSetAllocateInfo allocate_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
   allocate_info.descriptorPool = frame_generation_hud_pool_;
@@ -627,23 +652,27 @@ bool VulkanPresenter::EnsureHudComposite() {
 
 void VulkanPresenter::RecordHudComposite(VkCommandBuffer command_buffer, VkImageView target,
                                          VkExtent2D extent, VkImageView source,
-                                         VkImageView mask, size_t set_index) {
+                                         VkImageView mask, size_t set_index,
+                                         VkImageView hudless) {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDescriptorSet set = frame_generation_hud_sets_[set_index % frame_generation_hud_sets_.size()];
-  VkDescriptorImageInfo images[3] = {
+  // Binding 3 is the immutable sampler; binding 4 is read only in input mode.
+  VkDescriptorImageInfo images[4] = {
       {VK_NULL_HANDLE, target, VK_IMAGE_LAYOUT_GENERAL},
       {VK_NULL_HANDLE, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-      {VK_NULL_HANDLE, mask, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
-  VkWriteDescriptorSet writes[3] = {};
-  for (uint32_t i = 0; i < 3; ++i) {
+      {VK_NULL_HANDLE, mask, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+      {VK_NULL_HANDLE, hudless ? hudless : source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+  const uint32_t binding_of[4] = {0, 1, 2, 4};
+  VkWriteDescriptorSet writes[4] = {};
+  for (uint32_t i = 0; i < 4; ++i) {
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[i].dstSet = set;
-    writes[i].dstBinding = i;
+    writes[i].dstBinding = binding_of[i];
     writes[i].descriptorCount = 1;
     writes[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[i].pImageInfo = &images[i];
   }
-  dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 3, writes, 0, nullptr);
+  dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 4, writes, 0, nullptr);
   VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
   barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -654,9 +683,11 @@ void VulkanPresenter::RecordHudComposite(VkCommandBuffer command_buffer, VkImage
                         frame_generation_hud_pipeline_);
   dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                               frame_generation_hud_layout_, 0, 1, &set, 0, nullptr);
-  const uint32_t size[2] = {extent.width, extent.height};
+  const uint32_t constants[3] = {
+      extent.width, extent.height,
+      hudless ? 2u : uint32_t(REXCVAR_GET(present_temporal_debug_view))};
   dfn.vkCmdPushConstants(command_buffer, frame_generation_hud_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                         0, sizeof(size), size);
+                         0, sizeof(constants), constants);
   dfn.vkCmdDispatch(command_buffer, (extent.width + 7) / 8, (extent.height + 7) / 8, 1);
 }
 
@@ -737,10 +768,15 @@ bool VulkanPresenter::EnsureFrameGeneration(uint32_t render_width, uint32_t rend
   return true;
 }
 
+float VulkanPresenter::TemporalGhostingReduction() {
+  return float(std::clamp(REXCVAR_GET(present_fsr3_ghosting_reduction), 0.0, 1.0));
+}
+
 bool VulkanPresenter::DispatchFrameGeneration(VkCommandBuffer command_buffer,
                                               const GuestOutputImage& real,
                                               const GuestOutputImage& output,
                                               const TemporalUpscaleInputs& inputs,
+                                              VkImageView hud_source,
                                               size_t descriptor_slot) {
   ffxContext* context = reinterpret_cast<ffxContext*>(&frame_generation_context_);
   if (!frame_generation_context_ || !inputs.depth.image || !inputs.motion_vectors.image) {
@@ -809,10 +845,11 @@ bool VulkanPresenter::DispatchFrameGeneration(VkCommandBuffer command_buffer,
   }
   frame_generation_history_ = true;
 
-  // Restore the HUD of the real frame over the generated one.
+  // The real frame is interpolated without its HUD; put the HUD of the guest
+  // frame over the generated one.
   if (inputs.hudless_color.image && inputs.reactive.view) {
-    RecordHudComposite(command_buffer, output.view(), extent, real.view(), inputs.reactive.view,
-                       descriptor_slot * 2 + 1);
+    RecordHudComposite(command_buffer, output.view(), extent, hud_source, inputs.reactive.view,
+                       descriptor_slot * 3 + 1);
   }
   return true;
 }
@@ -2016,6 +2053,11 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   return true;
 }
 
+void VulkanPresenter::AwaitPaintSubmission(uint64_t submission) {
+  paint_context_.submission_tracker.AwaitSubmissionCompletion(
+      std::min(submission, paint_context_.submission_tracker.GetCurrentSubmission()));
+}
+
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
@@ -2398,6 +2440,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           // count: 8 * (display / render)^2 along one axis.
           TemporalUpscaleRequest request;
           request.active = temporal_effect_selected;
+          // DLSS and XeSS take no tuning; FSR 3.1 gets the reactive floor.
+          if (!vendor_upscaler_) {
+            request.reactive_floor = 0.6f * TemporalGhostingReduction();
+          }
           if (guest_output_image && guest_output_image->extent().height) {
             const float ratio = float(paint_context_.swapchain_extent.height) /
                                 float(guest_output_image->extent().height);
@@ -2532,7 +2578,41 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                   : guest_output_image->view();
             const VkImageView upscale_view =
                 frame_generation ? frame_generation_real_->view() : output.view();
-            if (DispatchTemporalUpscaler(draw_command_buffer, source_image, source_view,
+            // The upscaler gets the frame without its HUD: text in its history
+            // would smear with the scene's motion around the composited HUD.
+            VkImage upscale_source_image = source_image;
+            VkImageView upscale_source_view = source_view;
+            const TemporalUpscaleImage& hudless = guest_output_temporal_inputs->hudless_color;
+            if (hudless.view && guest_output_temporal_inputs->reactive.view &&
+                guest_output_temporal_inputs->width == effect_input_width &&
+                guest_output_temporal_inputs->height == effect_input_height &&
+                EnsureHudComposite()) {
+              if (!temporal_upscaler_input_ ||
+                  temporal_upscaler_input_->extent().width != effect_input_width ||
+                  temporal_upscaler_input_->extent().height != effect_input_height) {
+                paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+                temporal_upscaler_input_ =
+                    GuestOutputImage::Create(vulkan_device_, effect_input_width, effect_input_height);
+              }
+              if (temporal_upscaler_input_) {
+                image_barrier(temporal_upscaler_input_->image(), VK_IMAGE_LAYOUT_UNDEFINED,
+                              VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                RecordHudComposite(draw_command_buffer, temporal_upscaler_input_->view(),
+                                   {effect_input_width, effect_input_height}, source_view,
+                                   guest_output_temporal_inputs->reactive.view,
+                                   size_t(current_paint_submission_index) * 3 + 2, hudless.view);
+                image_barrier(temporal_upscaler_input_->image(), VK_IMAGE_LAYOUT_GENERAL,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                upscale_source_image = temporal_upscaler_input_->image();
+                upscale_source_view = temporal_upscaler_input_->view();
+              }
+            }
+            if (DispatchTemporalUpscaler(draw_command_buffer, upscale_source_image, upscale_source_view,
                                          effect_input_width, effect_input_height, upscale_image,
                                          upscale_view, effect_rect_size.first,
                                          effect_rect_size.second, guest_output_paint_config,
@@ -2540,13 +2620,21 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
               temporal_upscaler_last_serial_ = guest_output_refresh_serial;
               temporal_upscaler_last_output_ = output_image;
               // The HUD is not jittered: take it from the guest frame,
-              // scaled, rather than through the temporal upscaler.
-              if (guest_output_temporal_inputs->hudless_color.image &&
-                  guest_output_temporal_inputs->reactive.view && EnsureHudComposite()) {
+              // scaled, rather than through the temporal upscaler. With frame
+              // generation, only after the HUD-less real frame has been
+              // interpolated, so text is never warped.
+              const bool hud_composite =
+                  (guest_output_temporal_inputs->hudless_color.image ||
+                   REXCVAR_GET(present_temporal_debug_view)) &&
+                  guest_output_temporal_inputs->reactive.view && EnsureHudComposite();
+              auto composite_hud = [&] {
                 RecordHudComposite(draw_command_buffer, upscale_view,
                                    {effect_rect_size.first, effect_rect_size.second}, source_view,
                                    guest_output_temporal_inputs->reactive.view,
-                                   size_t(current_paint_submission_index) * 2);
+                                   size_t(current_paint_submission_index) * 3);
+              };
+              if (hud_composite && !frame_generation) {
+                composite_hud();
               }
               image_barrier(upscale_image, VK_IMAGE_LAYOUT_GENERAL,
                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
@@ -2556,19 +2644,47 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                 image_barrier(output_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
                               VK_ACCESS_SHADER_WRITE_BIT, kReadStages,
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                if (DispatchFrameGeneration(draw_command_buffer, *frame_generation_real_, output,
-                                            *guest_output_temporal_inputs,
-                                            size_t(current_paint_submission_index))) {
+                const bool generated = DispatchFrameGeneration(
+                    draw_command_buffer, *frame_generation_real_, output,
+                    *guest_output_temporal_inputs, source_view,
+                    size_t(current_paint_submission_index));
+                if (hud_composite) {
+                  image_barrier(upscale_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+                                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                  composite_hud();
+                  image_barrier(upscale_image, VK_IMAGE_LAYOUT_GENERAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kReadStages);
+                }
+                if (generated) {
                   image_barrier(output_image, VK_IMAGE_LAYOUT_GENERAL,
                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                 VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kReadStages);
-                  // Real frame halfway to the next game frame.
+                  // Real frame halfway to the next game frame, counted from
+                  // when the generated frame reaches the screen.
                   frame_generation_real_pending_ = true;
-                  const float half_ms =
-                      std::clamp(guest_output_temporal_inputs->frame_time_ms * 0.5f, 1.0f, 50.0f);
+                  const auto now = std::chrono::steady_clock::now();
+                  const std::chrono::duration<float, std::milli> interval =
+                      now - frame_generation_last_paint_;
+                  frame_generation_last_paint_ = now;
+                  if (interval.count() < 100.0f) {
+                    frame_generation_interval_ =
+                        frame_generation_interval_.count() > 0.0f
+                            ? frame_generation_interval_ * 0.9f + interval * 0.1f
+                            : interval;
+                  }
+                  const float half_ms = std::clamp(
+                      frame_generation_interval_.count() > 0.0f
+                          ? frame_generation_interval_.count() * 0.5f
+                          : guest_output_temporal_inputs->frame_time_ms * 0.5f,
+                      1.0f, 50.0f);
                   ScheduleFrameGenerationRepaint(
-                      std::chrono::steady_clock::now() +
+                      current_paint_submission_index,
                       std::chrono::microseconds(int64_t(half_ms * 1000.0f)));
                 } else {
                   restore_real_frame();
