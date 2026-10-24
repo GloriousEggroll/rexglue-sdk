@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <gtk/gtk.h>
 #include <gdk/gdkwayland.h>
+#include <dlfcn.h>
 #include <wayland-client.h>
 #include "wayland/viewporter-client.h"
 #include "wayland/fractional-scale-client.h"
@@ -23,6 +24,16 @@
 
 namespace rex {
 namespace ui {
+
+namespace {
+// GTK 3.24.25 added these; the Steam Runtime ships 3.24.24, so they are looked
+// up at run time. Without them GTK may keep stale geometry while a fullscreen
+// Vulkan surface covers its window until the next unrelated redraw.
+using FrameCallbackSurfaceFn = void (*)(GdkWindow*, wl_surface*);
+FrameCallbackSurfaceFn FrameCallbackFunction(const char* name) {
+  return reinterpret_cast<FrameCallbackSurfaceFn>(dlsym(RTLD_DEFAULT, name));
+}
+}  // namespace
 
 std::unique_ptr<WaylandWindowSurface> WaylandWindowSurface::Create(
     GtkWidget* widget, std::function<void()> changed) {
@@ -102,7 +113,8 @@ std::unique_ptr<WaylandWindowSurface> WaylandWindowSurface::Create(
     // Let Vulkan presentation also wake GTK's frame clock so parent geometry
     // and subsurface positions are committed together with the new layout.
     result->parent_window_ = GDK_WINDOW(g_object_ref(gtk_widget_get_window(top)));
-    gdk_wayland_window_add_frame_callback_surface(result->parent_window_, result->surface_);
+    if (const auto add = FrameCallbackFunction("gdk_wayland_window_add_frame_callback_surface"))
+      add(result->parent_window_, result->surface_);
     uint32_t width, height;
     result->GetSizeImpl(width, height);
     gtk_widget_queue_draw(top);
@@ -119,7 +131,8 @@ std::unique_ptr<WaylandWindowSurface> WaylandWindowSurface::Create(
 WaylandWindowSurface::~WaylandWindowSurface() {
   if (update_source_) g_source_remove(update_source_);
   if (parent_window_) {
-    gdk_wayland_window_remove_frame_callback_surface(parent_window_, surface_);
+    if (const auto remove = FrameCallbackFunction("gdk_wayland_window_remove_frame_callback_surface"))
+      remove(parent_window_, surface_);
     g_object_unref(parent_window_);
   }
   if (color_output_) wp_color_management_output_v1_destroy(color_output_);

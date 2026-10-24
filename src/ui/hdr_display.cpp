@@ -57,7 +57,19 @@ const wp_image_description_v1_listener image_listener = {
     wp_image_description_info_v1_add_listener(o.info, &info_listener, p);
   },
 };
-const wl_output_listener output_listener = {
+// wl_output_listener as of version 4. Declared here because headers older than
+// libwayland 1.20 lack the name and description events; libwayland dispatches
+// by index into this table either way.
+struct OutputListener {
+  void (*geometry)(void*, wl_output*, int32_t, int32_t, int32_t, int32_t, int32_t, const char*,
+                   const char*, int32_t);
+  void (*mode)(void*, wl_output*, uint32_t, int32_t, int32_t, int32_t);
+  void (*done)(void*, wl_output*);
+  void (*scale)(void*, wl_output*, int32_t);
+  void (*name)(void*, wl_output*, const char*);
+  void (*description)(void*, wl_output*, const char*);
+};
+const OutputListener output_listener = {
   .geometry = [](void*, wl_output*, int32_t, int32_t, int32_t, int32_t, int32_t, const char*, const char*, int32_t) {},
   .mode = [](void*, wl_output*, uint32_t, int32_t, int32_t, int32_t) {},
   .done = [](void*, wl_output*) {},
@@ -89,9 +101,13 @@ const wl_registry_listener registry_listener = {
       wp_color_manager_v1_add_listener(probe.manager, &manager_listener, p);
     } else if (!probe.specific_output && !std::strcmp(type, "wl_output")) {
       auto o = std::make_unique<Output>();
-      o->output = static_cast<wl_output*>(wl_registry_bind(registry, name, &wl_output_interface, std::min(version, 4u)));
+      // Never above what the loaded libwayland knows: events beyond its
+      // interface are a fatal protocol error.
+      const uint32_t bind_version =
+          std::min({version, 4u, uint32_t(wl_output_interface.version)});
+      o->output = static_cast<wl_output*>(wl_registry_bind(registry, name, &wl_output_interface, bind_version));
       o->own_output = true;
-      wl_output_add_listener(o->output, &output_listener, o.get());
+      wl_output_add_listener(o->output, reinterpret_cast<const wl_output_listener*>(&output_listener), o.get());
       probe.outputs.push_back(std::move(o));
     }
   },
