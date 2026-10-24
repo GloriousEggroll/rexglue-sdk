@@ -214,6 +214,11 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
       }
     } else if (disposition == kDispositionState::Open) {
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
+      if (content_data.content_type == XContentType::kMarketplaceContent) {
+        REXKRNL_INFO("Opened downloadable content {} as {}: {:08X}, licenses {:08X}",
+                     content_data.file_name(), root_name, result,
+                     content_license);
+      }
     }
 
     if (license_mask_ptr && XSUCCEEDED(result)) {
