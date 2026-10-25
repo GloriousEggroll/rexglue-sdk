@@ -12,6 +12,7 @@
 
 #include <rex/cvar.h>
 #include <rex/input/input.h>
+#include <rex/input/input_system.h>
 #include <rex/logging.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
@@ -19,6 +20,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <utility>
 #include <chrono>
 #include <string_view>
 #include <vector>
@@ -81,6 +84,22 @@ bool TakeMouseLook(uint32_t user_index, double& dx, double& dy) {
   return driver && driver->TakeMouseLook(user_index, dx, dy);
 }
 
+bool ShowKeyboardPrompts() {
+  auto* driver = instance.load(std::memory_order_acquire);
+  return driver && driver->IsEnabled() && LastInputWasKeyboardMouse();
+}
+
+std::string BoundKeyLabel(std::string_view bind) {
+  auto* driver = instance.load(std::memory_order_acquire);
+  return driver ? driver->BoundKeyLabel(bind) : std::string();
+}
+
+std::string MnkInputDriver::BoundKeyLabel(std::string_view bind) {
+  std::lock_guard lock(state_mutex_);
+  const auto it = binds_.find(bind);
+  return it == binds_.end() ? std::string() : it->second.label;
+}
+
 bool MnkInputDriver::MouseLooks() const {
   return mouse_look_supported_ && !mouse_as_stick_;
 }
@@ -95,6 +114,28 @@ constexpr const char* kBindNames[] = {
     "keybind_lstick_press", "keybind_rstick_up", "keybind_rstick_down", "keybind_rstick_left",
     "keybind_rstick_right", "keybind_rstick_press", "keybind_dpad_up", "keybind_dpad_down",
     "keybind_dpad_left", "keybind_dpad_right", "keybind_back", "keybind_start", "keybind_guide"};
+
+// How a key name reads in a button prompt.
+std::string PromptLabel(std::string_view key) {
+  static constexpr std::pair<std::string_view, std::string_view> kLabels[] = {
+      {"Return", "ENTER"},      {"Escape", "ESC"},          {"Control", "CTRL"},
+      {"Mouse4", "MOUSE 4"},    {"Mouse5", "MOUSE 5"},      {"WheelUp", "WHEEL UP"},
+      {"WheelDown", "WHEEL DOWN"}, {"PageUp", "PAGE UP"},   {"PageDown", "PAGE DOWN"},
+      {"CapsLock", "CAPS LOCK"}, {"LBracket", "["},         {"RBracket", "]"},
+      {"Backtick", "`"},        {"Minus", "-"},             {"Plus", "="},
+      {"Comma", ","},           {"Period", "."},            {"Semicolon", ";"},
+      {"Slash", "/"},           {"Backslash", "\\"},        {"Quote", "'"}};
+  for (const auto& [name, label] : kLabels) {
+    if (key == name) return std::string(label);
+  }
+  std::string label;
+  if (key.starts_with("Numpad")) {
+    label = "NUM ";
+    key.remove_prefix(6);
+  }
+  for (const char c : key) label += char(std::toupper(static_cast<unsigned char>(c)));
+  return label;
+}
 }  // namespace
 
 void MnkInputDriver::ApplySetting(std::string_view name, std::string_view value) {
@@ -116,6 +157,9 @@ void MnkInputDriver::ApplySetting(std::string_view name, std::string_view value)
     value = comma == std::string_view::npos ? std::string_view() : value.substr(comma + 1);
     while (!key.empty() && key.front() == ' ') key.remove_prefix(1);
     while (!key.empty() && key.back() == ' ') key.remove_suffix(1);
+    if (bind.label.empty() && (key == "WheelUp" || key == "WheelDown" ||
+                               rex::ui::ParseVirtualKey(key) != VirtualKey::kNone))
+      bind.label = PromptLabel(key);
     if (key == "WheelUp") {
       bind.wheel_up = true;
     } else if (key == "WheelDown") {
@@ -136,6 +180,7 @@ bool MnkInputDriver::TakeMouseLook(uint32_t user_index, double& dx, double& dy) 
     return false;
   dx = mouse_dx_ * sensitivity_;
   dy = mouse_dy_ * sensitivity_;
+  if (std::abs(mouse_dx_) + std::abs(mouse_dy_) > 2) NoteInputActivity(true);
   mouse_dx_ = 0;
   mouse_dy_ = 0;
   return dx != 0.0 || dy != 0.0;

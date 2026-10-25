@@ -10,7 +10,9 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 
 #include <rex/dbg.h>
 #include <rex/input/flags.h>
@@ -27,6 +29,28 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
 namespace rex::input {
+
+namespace {
+// 1 after a controller was used, 2 after the keyboard or mouse. Before either,
+// 0, or 3 while only a controller is connected.
+std::atomic<uint8_t> last_device{0};
+
+// Deliberate input, not stick drift or resting triggers.
+bool HasActivity(const X_INPUT_STATE& state) {
+  const auto& pad = state.gamepad;
+  return pad.buttons || pad.left_trigger > 64 || pad.right_trigger > 64 ||
+         std::abs(pad.thumb_lx) > 12000 || std::abs(pad.thumb_ly) > 12000 ||
+         std::abs(pad.thumb_rx) > 12000 || std::abs(pad.thumb_ry) > 12000;
+}
+}  // namespace
+
+void NoteInputActivity(bool keyboard_mouse) {
+  last_device.store(keyboard_mouse ? 2 : 1, std::memory_order_relaxed);
+}
+
+bool LastInputWasKeyboardMouse() {
+  return last_device.load(std::memory_order_relaxed) == 2;
+}
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
 
@@ -86,6 +110,8 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 
   bool any_connected = false;
   bool first_result = true;
+  bool controller_connected = false;
+  bool keyboard_mouse_connected = false;
   X_INPUT_STATE merged = {};
 
   for (auto& driver : drivers_) {
@@ -95,6 +121,8 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
       any_connected = true;
     }
     if (result == X_ERROR_SUCCESS) {
+      (driver->IsKeyboardMouse() ? keyboard_mouse_connected : controller_connected) = true;
+      if (HasActivity(state)) NoteInputActivity(driver->IsKeyboardMouse());
       if (first_result) {
         merged = state;
         first_result = false;
@@ -122,6 +150,14 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
       }
     }
   }
+
+  // Until either is used, an enabled keyboard and mouse counts as the device in
+  // use: players turn it on to play with it.
+  uint8_t device = last_device.load(std::memory_order_relaxed);
+  if (keyboard_mouse_connected && (device == 0 || device == 3))
+    last_device.compare_exchange_strong(device, 2, std::memory_order_relaxed);
+  else if (controller_connected && device == 0)
+    last_device.compare_exchange_strong(device, 3, std::memory_order_relaxed);
 
   if (first_result) {
     return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;

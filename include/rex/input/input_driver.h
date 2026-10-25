@@ -42,6 +42,9 @@ class InputDriver {
 
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
 
+  // Whether this driver turns a keyboard and mouse into a controller.
+  virtual bool IsKeyboardMouse() const { return false; }
+
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;
   }

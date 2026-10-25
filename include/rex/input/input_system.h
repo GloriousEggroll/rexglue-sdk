@@ -49,6 +49,11 @@ class InputSystem : public system::IInputSystem {
   std::vector<std::unique_ptr<InputDriver>> drivers_;
 };
 
+/// Records which kind of device was used last, by any player: a controller, or
+/// a keyboard and mouse. Games can show matching button prompts.
+void NoteInputActivity(bool keyboard_mouse);
+bool LastInputWasKeyboardMouse();
+
 /// Create a default InputSystem with SDL + NOP drivers.
 /// In tool mode, only the NOP driver is added.
 std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode);

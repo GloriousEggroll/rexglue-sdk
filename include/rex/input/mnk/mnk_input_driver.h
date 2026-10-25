@@ -30,6 +30,14 @@ namespace rex::input::mnk {
 // mnk_mouse_mode is "stick". Returns false when there is no motion to apply.
 bool TakeMouseLook(uint32_t user_index, double& dx, double& dy);
 
+// Whether keyboard and mouse is enabled and was used more recently than a
+// controller, so button prompts should name keys.
+bool ShowKeyboardPrompts();
+
+// How the first key bound to a keybind_* setting reads in a prompt, such as
+// "SPACE" or "LMB"; empty when nothing is bound.
+std::string BoundKeyLabel(std::string_view bind);
+
 class MnkInputDriver final : public InputDriver,
                              public rex::ui::WindowInputListener,
                              public rex::ui::WindowListener {
@@ -39,6 +47,8 @@ class MnkInputDriver final : public InputDriver,
 
   X_STATUS Setup() override;
   bool TakeMouseLook(uint32_t user_index, double& dx, double& dy);
+  std::string BoundKeyLabel(std::string_view bind);
+  bool IsKeyboardMouse() const override { return true; }
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                            X_INPUT_CAPABILITIES* out_caps) override;
@@ -64,6 +74,7 @@ class MnkInputDriver final : public InputDriver,
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
 
  private:
+  friend bool ShowKeyboardPrompts();
   uint32_t UserIndex() const;
   bool IsEnabled() const;
   void CenterCursor();
@@ -95,6 +106,7 @@ class MnkInputDriver final : public InputDriver,
   // Parsed settings, guarded by state_mutex_.
   struct Bind {
     std::vector<uint16_t> keys;
+    std::string label;
     bool wheel_up = false;
     bool wheel_down = false;
   };
