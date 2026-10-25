@@ -202,7 +202,9 @@ else()
     set(REX_SURFACE_PROTOCOL_HEADERS)
     set(REX_SURFACE_PROTOCOL_CODE)
     foreach(protocol "color-management-v1;color-management" "viewporter;viewporter"
-                     "fractional-scale;fractional-scale")
+                     "fractional-scale;fractional-scale"
+                     "pointer-constraints-unstable-v1;pointer-constraints"
+                     "relative-pointer-unstable-v1;relative-pointer")
         list(GET protocol 0 protocol_xml_name)
         list(GET protocol 1 protocol_name)
         rex_wayland_protocol(${protocol_xml_name} ${protocol_name} protocol_header protocol_code)

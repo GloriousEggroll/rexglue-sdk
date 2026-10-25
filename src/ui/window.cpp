@@ -635,6 +635,15 @@ void Window::OnMouseMove(MouseEvent& e, WindowDestructionReceiver& destruction_r
   }
 }
 
+void Window::OnRelativeMouseMove(MouseEvent& e, WindowDestructionReceiver& destruction_receiver) {
+  PropagateEventThroughInputListeners(
+      [&e](auto listener) {
+        listener->OnRelativeMouseMove(e);
+        return e.is_handled();
+      },
+      destruction_receiver);
+}
+
 void Window::OnMouseUp(MouseEvent& e, WindowDestructionReceiver& destruction_receiver) {
   PropagateEventThroughInputListeners(
       [&e](auto listener) {

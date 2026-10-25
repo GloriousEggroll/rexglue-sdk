@@ -48,7 +48,12 @@ class GTKWindow : public Window {
   void ApplyNewLogicalSize() override;
   void ApplyNewTitle() override;
   void ApplyNewMainMenu(MenuItem* old_main_menu) override;
-  // Mouse capture seems to happen implicitly compared to Windows.
+  // While captured the pointer is locked in place and its motion is reported
+  // through OnRelativeMouseMove: pointer constraints on Wayland, a grab and
+  // re-centering on X11.
+  void ApplyNewMouseCapture() override;
+  void ApplyNewMouseRelease() override;
+  void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
   void FocusImpl() override;
 
   std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
@@ -66,6 +71,9 @@ class GTKWindow : public Window {
 
   // Handling events related to the whole window.
   bool HandleMouse(GdkEvent* event, WindowDestructionReceiver& destruction_receiver);
+  void ApplyCursor();
+  void CenterX11Pointer();
+  void RelativeMotion(double dx, double dy);
   bool HandleKeyboard(GdkEventKey* event, WindowDestructionReceiver& destruction_receiver);
   gboolean WindowEventHandler(GdkEvent* event);
   static gboolean WindowEventHandlerThunk(GtkWidget* widget, GdkEvent* event, gpointer user_data);
@@ -90,6 +98,13 @@ class GTKWindow : public Window {
   // Weak identity prevents stale connector names if a monitor is unplugged.
   mutable GdkMonitor* output_name_monitor_ = nullptr;
   mutable std::string display_output_name_;
+  struct PointerLock;
+  std::unique_ptr<PointerLock> pointer_lock_;
+  bool x11_pointer_grabbed_ = false;
+  int32_t x11_center_x_ = 0;
+  int32_t x11_center_y_ = 0;
+  double motion_remainder_x_ = 0.0;
+  double motion_remainder_y_ = 0.0;
   bool restore_windowed_size_ = false;
   guint native_paint_timer_ = 0;
   guint size_update_source_ = 0;

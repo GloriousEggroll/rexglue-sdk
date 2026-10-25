@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <string_view>
 #include <vector>
 #include <string>
@@ -22,6 +23,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/hdr_display.h>
 #include <rex/ui/surface_gnulinux.h>
 #include <rex/ui/virtual_key.h>
 #include <rex/ui/window_gtk.h>
@@ -30,7 +32,10 @@
 #include <X11/Xlib-xcb.h>
 #include <gdk/gdkx.h>
 #include <gdk/gdkwayland.h>
+#include <wayland-client.h>
 #include <xcb/xcb.h>
+#include "wayland/pointer-constraints-client.h"
+#include "wayland/relative-pointer-client.h"
 
 namespace {
 
@@ -400,11 +405,85 @@ std::string GTKWindow::GetDisplayOutputName() const {
   return display_output_name_;
 }
 
+// Wayland pointer lock and unaccelerated relative motion for a captured mouse.
+// The objects live on GTK's default queue, so GTK's main loop delivers motion.
+struct GTKWindow::PointerLock {
+  zwp_pointer_constraints_v1* constraints = nullptr;
+  zwp_relative_pointer_manager_v1* relative_manager = nullptr;
+  zwp_locked_pointer_v1* locked = nullptr;
+  zwp_relative_pointer_v1* relative = nullptr;
+
+  static std::unique_ptr<PointerLock> Create(wl_display* display) {
+    auto lock = std::make_unique<PointerLock>();
+    auto* queue = wl_display_create_queue(display);
+    auto* wrapper = static_cast<wl_display*>(wl_proxy_create_wrapper(display));
+    wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(wrapper), queue);
+    auto* registry = wl_display_get_registry(wrapper);
+    wl_proxy_wrapper_destroy(wrapper);
+    static const wl_registry_listener listener = {
+        [](void* p, wl_registry* r, uint32_t id, const char* type, uint32_t) {
+          auto& l = *static_cast<PointerLock*>(p);
+          if (!std::strcmp(type, "zwp_pointer_constraints_v1"))
+            l.constraints = static_cast<zwp_pointer_constraints_v1*>(
+                wl_registry_bind(r, id, &zwp_pointer_constraints_v1_interface, 1));
+          if (!std::strcmp(type, "zwp_relative_pointer_manager_v1"))
+            l.relative_manager = static_cast<zwp_relative_pointer_manager_v1*>(
+                wl_registry_bind(r, id, &zwp_relative_pointer_manager_v1_interface, 1));
+        },
+        [](void*, wl_registry*, uint32_t) {}};
+    wl_registry_add_listener(registry, &listener, lock.get());
+    WaylandRoundtrip(display, queue);
+    wl_registry_destroy(registry);
+    for (auto* proxy : {reinterpret_cast<wl_proxy*>(lock->constraints),
+                        reinterpret_cast<wl_proxy*>(lock->relative_manager)}) {
+      if (proxy) wl_proxy_set_queue(proxy, nullptr);
+    }
+    wl_event_queue_destroy(queue);
+    if (!lock->constraints || !lock->relative_manager) {
+      REXLOG_WARN("The compositor cannot lock the pointer; mouse look may stop at the window edge");
+    }
+    return lock;
+  }
+
+  ~PointerLock() {
+    Unlock();
+    if (relative_manager) zwp_relative_pointer_manager_v1_destroy(relative_manager);
+    if (constraints) zwp_pointer_constraints_v1_destroy(constraints);
+  }
+
+  bool Lock(GTKWindow* window, wl_surface* surface, wl_pointer* pointer) {
+    if (!constraints || !relative_manager || !surface || !pointer) return false;
+    if (!locked) {
+      locked = zwp_pointer_constraints_v1_lock_pointer(
+          constraints, surface, pointer, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
+    }
+    if (!relative) {
+      relative = zwp_relative_pointer_manager_v1_get_relative_pointer(relative_manager, pointer);
+      static const zwp_relative_pointer_v1_listener listener = {
+          [](void* p, zwp_relative_pointer_v1*, uint32_t, uint32_t, wl_fixed_t, wl_fixed_t,
+             wl_fixed_t dx_unaccel, wl_fixed_t dy_unaccel) {
+            static_cast<GTKWindow*>(p)->RelativeMotion(wl_fixed_to_double(dx_unaccel),
+                                                       wl_fixed_to_double(dy_unaccel));
+          }};
+      zwp_relative_pointer_v1_add_listener(relative, &listener, window);
+    }
+    return true;
+  }
+
+  void Unlock() {
+    if (relative) zwp_relative_pointer_v1_destroy(relative);
+    if (locked) zwp_locked_pointer_v1_destroy(locked);
+    relative = nullptr;
+    locked = nullptr;
+  }
+};
+
 GTKWindow::GTKWindow(WindowedAppContext& app_context, const std::string_view title,
                      uint32_t desired_logical_width, uint32_t desired_logical_height)
     : Window(app_context, title, desired_logical_width, desired_logical_height) {}
 
 GTKWindow::~GTKWindow() {
+  pointer_lock_.reset();
   if (output_name_monitor_) {
     g_object_remove_weak_pointer(G_OBJECT(output_name_monitor_),
         reinterpret_cast<gpointer*>(&output_name_monitor_));
@@ -703,6 +782,73 @@ void GTKWindow::ApplyNewLogicalSize() {
   ScheduleSizeUpdate();
 }
 
+void GTKWindow::ApplyNewMouseCapture() {
+  if (!window_ || !drawing_area_) return;
+  GdkDisplay* display = gtk_widget_get_display(window_);
+  GdkDevice* pointer = gdk_seat_get_pointer(gdk_display_get_default_seat(display));
+  motion_remainder_x_ = motion_remainder_y_ = 0.0;
+  if (native_wayland_) {
+    if (!pointer_lock_) pointer_lock_ = PointerLock::Create(gdk_wayland_display_get_wl_display(display));
+    pointer_lock_->Lock(this, gdk_wayland_window_get_wl_surface(gtk_widget_get_window(window_)),
+                        pointer ? gdk_wayland_device_get_wl_pointer(pointer) : nullptr);
+    return;
+  }
+  GdkWindow* area = gtk_widget_get_window(drawing_area_);
+  if (!area || !pointer) return;
+  if (!x11_pointer_grabbed_) {
+    x11_pointer_grabbed_ =
+        gdk_seat_grab(gdk_display_get_default_seat(display), area, GDK_SEAT_CAPABILITY_POINTER,
+                      TRUE, nullptr, nullptr, nullptr, nullptr) == GDK_GRAB_SUCCESS;
+  }
+  CenterX11Pointer();
+}
+
+void GTKWindow::ApplyNewMouseRelease() {
+  if (pointer_lock_) pointer_lock_->Unlock();
+  if (x11_pointer_grabbed_ && window_) {
+    gdk_seat_ungrab(gdk_display_get_default_seat(gtk_widget_get_display(window_)));
+  }
+  x11_pointer_grabbed_ = false;
+}
+
+void GTKWindow::CenterX11Pointer() {
+  GdkWindow* area = drawing_area_ ? gtk_widget_get_window(drawing_area_) : nullptr;
+  if (!area) return;
+  GdkDisplay* display = gtk_widget_get_display(window_);
+  GdkDevice* pointer = gdk_seat_get_pointer(gdk_display_get_default_seat(display));
+  x11_center_x_ = gdk_window_get_width(area) / 2;
+  x11_center_y_ = gdk_window_get_height(area) / 2;
+  int root_x = 0, root_y = 0;
+  gdk_window_get_root_coords(area, x11_center_x_, x11_center_y_, &root_x, &root_y);
+  if (pointer) gdk_device_warp(pointer, gdk_window_get_screen(area), root_x, root_y);
+}
+
+void GTKWindow::RelativeMotion(double dx, double dy) {
+  if (!IsMouseCaptureRequested()) return;
+  dx += motion_remainder_x_;
+  dy += motion_remainder_y_;
+  const int32_t x = int32_t(dx), y = int32_t(dy);
+  motion_remainder_x_ = dx - x;
+  motion_remainder_y_ = dy - y;
+  if (!x && !y) return;
+  WindowDestructionReceiver destruction_receiver(this);
+  MouseEvent e(this, MouseEvent::Button::kNone, x, y);
+  OnRelativeMouseMove(e, destruction_receiver);
+}
+
+void GTKWindow::ApplyNewCursorVisibility(CursorVisibility) { ApplyCursor(); }
+
+void GTKWindow::ApplyCursor() {
+  GdkWindow* area = drawing_area_ ? gtk_widget_get_window(drawing_area_) : nullptr;
+  if (!area) return;
+  GdkCursor* cursor = nullptr;
+  if (GetCursorVisibility() != CursorVisibility::kVisible) {
+    cursor = gdk_cursor_new_for_display(gtk_widget_get_display(window_), GDK_BLANK_CURSOR);
+  }
+  gdk_window_set_cursor(area, cursor);
+  if (cursor) g_object_unref(cursor);
+}
+
 void GTKWindow::FocusImpl() {
   gtk_window_activate_focus(GTK_WINDOW(window_));
 }
@@ -843,6 +989,15 @@ bool GTKWindow::HandleMouse(GdkEvent* event, WindowDestructionReceiver& destruct
       auto motion_event = reinterpret_cast<const GdkEventMotion*>(event);
       x = motion_event->x;
       y = motion_event->y;
+      if (x11_pointer_grabbed_) {
+        const int32_t dx = x - x11_center_x_, dy = y - x11_center_y_;
+        if (dx || dy) {
+          CenterX11Pointer();
+          MouseEvent relative(this, MouseEvent::Button::kNone, dx, dy);
+          OnRelativeMouseMove(relative, destruction_receiver);
+        }
+        return true;
+      }
     } break;
     case GDK_BUTTON_PRESS:
     case GDK_BUTTON_RELEASE: {
@@ -857,10 +1012,10 @@ bool GTKWindow::HandleMouse(GdkEvent* event, WindowDestructionReceiver& destruct
         case 3:
           button = MouseEvent::Button::kRight;
           break;
-        case 4:
+        case 8:
           button = MouseEvent::Button::kX1;
           break;
-        case 5:
+        case 9:
           button = MouseEvent::Button::kX2;
           break;
         default:
@@ -874,10 +1029,19 @@ bool GTKWindow::HandleMouse(GdkEvent* event, WindowDestructionReceiver& destruct
       auto scroll_event = reinterpret_cast<const GdkEventScroll*>(event);
       x = scroll_event->x;
       y = scroll_event->y;
-      scroll_x = scroll_event->delta_x * MouseEvent::kScrollPerDetent;
+      // Deltas are only set for smooth scrolling; wheels report a direction.
+      double delta_x = scroll_event->delta_x, delta_y = scroll_event->delta_y;
+      switch (scroll_event->direction) {
+        case GDK_SCROLL_UP: delta_y = -1.0; break;
+        case GDK_SCROLL_DOWN: delta_y = 1.0; break;
+        case GDK_SCROLL_LEFT: delta_x = -1.0; break;
+        case GDK_SCROLL_RIGHT: delta_x = 1.0; break;
+        default: break;
+      }
+      scroll_x = delta_x * MouseEvent::kScrollPerDetent;
       // In GDK, positive is towards the bottom of the screen, not forward from
       // the user.
-      scroll_y = -scroll_event->delta_y * MouseEvent::kScrollPerDetent;
+      scroll_y = -delta_y * MouseEvent::kScrollPerDetent;
     } break;
     default:
       return false;
@@ -913,7 +1077,13 @@ bool GTKWindow::HandleKeyboard(GdkEventKey* event,
   bool alt_pressed = modifiers & (GDK_MOD1_MASK | GDK_META_MASK);
   bool super_pressed = modifiers & GDK_SUPER_MASK;
   uint32_t key_char = gdk_keyval_to_unicode(event->keyval);
-  KeyEvent e(this, TranslateGdkKeyvalToVirtualKey(event->keyval), 1, event->type == GDK_KEY_RELEASE,
+  // Identify the key without modifiers, so Shift+1 is still the 1 key, and a
+  // key released after a modifier changed matches the one pressed.
+  guint base_keyval = event->keyval;
+  gdk_keymap_translate_keyboard_state(gdk_keymap_get_for_display(gdk_window_get_display(event->window)),
+                                      event->hardware_keycode, GdkModifierType(0), event->group,
+                                      &base_keyval, nullptr, nullptr, nullptr);
+  KeyEvent e(this, TranslateGdkKeyvalToVirtualKey(base_keyval), 1, event->type == GDK_KEY_RELEASE,
              shift_pressed, ctrl_pressed, alt_pressed, super_pressed);
   switch (event->type) {
     case GDK_KEY_PRESS:

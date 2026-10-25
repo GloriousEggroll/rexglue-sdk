@@ -46,6 +46,9 @@ class WindowInputListener {
 
   virtual void OnMouseDown(MouseEvent&) {}
   virtual void OnMouseMove(MouseEvent&) {}
+  // Unaccelerated motion while the mouse is captured; x() and y() are deltas.
+  // Windows that deliver it do not move the cursor, so absolute moves stop.
+  virtual void OnRelativeMouseMove(MouseEvent&) {}
   virtual void OnMouseUp(MouseEvent&) {}
   virtual void OnMouseWheel(MouseEvent&) {}
 

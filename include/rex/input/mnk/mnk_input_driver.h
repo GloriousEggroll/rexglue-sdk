@@ -13,12 +13,22 @@
 #include <rex/input/input_driver.h>
 #include <rex/ui/window_listener.h>
 
+#include <chrono>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <queue>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace rex::input::mnk {
+
+// Mouse motion since the last call, in counts scaled by mnk_sensitivity, for a
+// game hook that feeds the game's own mouse look. A first call marks mouse look
+// as supported; afterwards the mouse no longer moves the right stick unless
+// mnk_mouse_mode is "stick". Returns false when there is no motion to apply.
+bool TakeMouseLook(uint32_t user_index, double& dx, double& dy);
 
 class MnkInputDriver final : public InputDriver,
                              public rex::ui::WindowInputListener,
@@ -28,6 +38,7 @@ class MnkInputDriver final : public InputDriver,
   ~MnkInputDriver() override;
 
   X_STATUS Setup() override;
+  bool TakeMouseLook(uint32_t user_index, double& dx, double& dy);
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                            X_INPUT_CAPABILITIES* out_caps) override;
@@ -44,6 +55,8 @@ class MnkInputDriver final : public InputDriver,
   void OnMouseDown(rex::ui::MouseEvent& e) override;
   void OnMouseUp(rex::ui::MouseEvent& e) override;
   void OnMouseMove(rex::ui::MouseEvent& e) override;
+  void OnRelativeMouseMove(rex::ui::MouseEvent& e) override;
+  void OnMouseWheel(rex::ui::MouseEvent& e) override;
 
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;
@@ -56,6 +69,12 @@ class MnkInputDriver final : public InputDriver,
   void CenterCursor();
   void UpdateMouseCapture();
   void SetKeyState(uint16_t vk, bool down);
+  bool IsBindPressed(std::string_view name) const;
+  void ApplySetting(std::string_view name, std::string_view value);
+  bool MouseLooks() const;
+
+  // Stick deflection per mouse count per second at sensitivity 1.
+  static constexpr double kMouseRateScale = 24.0;
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
 
   rex::ui::Window* attached_window_ = nullptr;
@@ -69,6 +88,24 @@ class MnkInputDriver final : public InputDriver,
   int32_t prev_mouse_x_ = 0;
   int32_t prev_mouse_y_ = 0;
   bool mouse_captured_ = false;
+  // The window reports captured motion as deltas instead of moving the cursor.
+  bool relative_motion_ = false;
+  bool mouse_look_supported_ = false;
+
+  // Parsed settings, guarded by state_mutex_.
+  struct Bind {
+    std::vector<uint16_t> keys;
+    bool wheel_up = false;
+    bool wheel_down = false;
+  };
+  std::map<std::string, Bind, std::less<>> binds_;
+  bool mouse_as_stick_ = false;
+  double sensitivity_ = 1.0;
+  std::chrono::steady_clock::time_point last_mouse_sample_{};
+  double mouse_rate_x_ = 0.0;
+  double mouse_rate_y_ = 0.0;
+  std::chrono::steady_clock::time_point wheel_up_until_{};
+  std::chrono::steady_clock::time_point wheel_down_until_{};
   bool has_focus_ = true;
 
   // Keystroke queue
