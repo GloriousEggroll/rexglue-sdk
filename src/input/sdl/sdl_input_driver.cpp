@@ -9,7 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <filesystem>
 
 #include <rex/assert.h>
@@ -23,7 +25,42 @@
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 
+// Gyro aiming for controllers with motion sensors, off by default. Otherwise
+// Steam Input's defaults: always on, turning with yaw.
+REXCVAR_DEFINE_STRING(gyro_mode, "off", "Input",
+                      "Controller gyro aiming. off; mouse: turns the camera like a mouse; "
+                      "joystick: moves the right stick")
+    .allowed({"off", "mouse", "joystick"});
+REXCVAR_DEFINE_STRING(gyro_turn_axis, "yaw", "Input",
+                      "yaw: turn the controller left and right to turn; roll: tilt it; player: "
+                      "either, relative to how the controller is held")
+    .allowed({"yaw", "roll", "player"});
+REXCVAR_DEFINE_STRING(gyro_activation, "always", "Input",
+                      "always, or aiming: only while the left trigger is held")
+    .allowed({"always", "aiming"});
+REXCVAR_DEFINE_BOOL(gyro_invert_y, false, "Input", "Invert gyro up and down");
+REXCVAR_DEFINE_DOUBLE(gyro_sensitivity, 1.0, "Input",
+                      "Degrees the camera turns per degree the controller turns")
+    .range(0.1, 10.0);
+REXCVAR_DEFINE_DOUBLE(gyro_stick_deadzone, 0.3, "Input",
+                      "With gyro_mode joystick, the stick deflection where the game's right "
+                      "stick dead zone ends")
+    .range(0.0, 0.9);
+
 namespace rex::input::sdl {
+
+namespace {
+std::atomic<SDLInputDriver*> instance{nullptr};
+
+constexpr const char* kGyroSettings[] = {"gyro_mode",        "gyro_turn_axis",
+                                         "gyro_activation",  "gyro_invert_y",
+                                         "gyro_sensitivity", "gyro_stick_deadzone"};
+}  // namespace
+
+bool TakeGyroLook(uint32_t user_index, double& dx, double& dy) {
+  auto* driver = instance.load(std::memory_order_acquire);
+  return driver && driver->TakeGyroLook(user_index, dx, dy);
+}
 
 SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order),
@@ -33,9 +70,90 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
       sdl_pumpevents_queued_(false),
       controllers_(),
       controllers_mutex_(),
-      keystroke_states_() {}
+      keystroke_states_() {
+  for (const char* name : kGyroSettings) {
+    ApplySetting(name, rex::cvar::GetFlagByName(name));
+    rex::cvar::RegisterChangeCallback(name, [this](std::string_view name, std::string_view value) {
+      std::lock_guard lock(controllers_mutex_);
+      ApplySetting(name, value);
+    });
+  }
+  instance.store(this, std::memory_order_release);
+}
 
-SDLInputDriver::~SDLInputDriver() {}
+SDLInputDriver::~SDLInputDriver() {
+  SDLInputDriver* self = this;
+  instance.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
+  for (const char* name : kGyroSettings) rex::cvar::UnregisterChangeCallbacks(name);
+}
+
+void SDLInputDriver::ApplySetting(std::string_view name, std::string_view value) {
+  const auto number = [&](double fallback, double low, double high) {
+    try {
+      return std::clamp(std::stod(std::string(value)), low, high);
+    } catch (const std::exception&) {
+      return fallback;
+    }
+  };
+  if (name == "gyro_mode") {
+    gyro_mode_ = value == "off"        ? GyroMode::kOff
+                 : value == "joystick" ? GyroMode::kJoystick
+                                       : GyroMode::kMouse;
+  } else if (name == "gyro_turn_axis") {
+    gyro_axis_ = value == "roll" ? GyroAxis::kRoll
+                 : value == "player" ? GyroAxis::kPlayer
+                                     : GyroAxis::kYaw;
+  } else if (name == "gyro_activation") {
+    gyro_while_aiming_ = value == "aiming";
+  } else if (name == "gyro_invert_y") {
+    gyro_invert_y_ = value == "true" || value == "1";
+  } else if (name == "gyro_sensitivity") {
+    gyro_sensitivity_ = number(gyro_sensitivity_, 0.1, 10.0);
+  } else if (name == "gyro_stick_deadzone") {
+    gyro_stick_deadzone_ = number(gyro_stick_deadzone_, 0.0, 0.9);
+  }
+  for (auto& controller : controllers_) {
+    controller.gyro.look_x = controller.gyro.look_y = 0.0;
+    controller.gyro.rate_x = controller.gyro.rate_y = 0.0;
+  }
+}
+
+bool SDLInputDriver::TakeGyroLook(uint32_t user_index, double& dx, double& dy) {
+  if (!attached_window_ || !sdl_events_initialized_ || !SDL_Gamepad_initialized_) return false;
+  auto guard = DrainAndLock();
+  gyro_look_supported_ = true;
+  auto* controller = GetControllerState(user_index);
+  if (!controller) return false;
+  auto& gyro = controller->gyro;
+  dx = gyro.look_x * gyro_sensitivity_;
+  dy = gyro.look_y * gyro_sensitivity_;
+  gyro.look_x = gyro.look_y = 0.0;
+  if (gyro_mode_ != GyroMode::kMouse || !is_active()) return false;
+  return dx != 0.0 || dy != 0.0;
+}
+
+bool SDLInputDriver::GyroAiming(const ControllerState& controller) const {
+  return controller.state.gamepad.left_trigger > HID_SDL_TRIGG_THRES;
+}
+
+void SDLInputDriver::ApplyGyroStick(ControllerState& controller, X_INPUT_GAMEPAD& pad) {
+  if (gyro_mode_ == GyroMode::kOff || (gyro_mode_ == GyroMode::kMouse && gyro_look_supported_))
+    return;
+  const double x = controller.gyro.rate_x * gyro_sensitivity_;
+  const double y = controller.gyro.rate_y * gyro_sensitivity_;
+  const double speed = std::hypot(x, y);
+  if (speed < 0.05) return;
+  // Full deflection at this turn rate, in degrees per second. Small rates start
+  // where the game's dead zone ends so that slow motion still turns.
+  constexpr double kFullSpeed = 360.0;
+  const double deflection =
+      gyro_stick_deadzone_ + (1.0 - gyro_stick_deadzone_) * std::min(1.0, speed / kFullSpeed);
+  const auto add = [](int16_t axis, double value) {
+    return int16_t(std::clamp(double(axis) + value * 32767.0, -32768.0, 32767.0));
+  };
+  pad.thumb_rx = add(pad.thumb_rx, x / speed * deflection);
+  pad.thumb_ry = add(pad.thumb_ry, -y / speed * deflection);
+}
 
 X_STATUS SDLInputDriver::Setup() {
   if (!TestSDLVersion()) {
@@ -204,6 +322,7 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     controller->state_changed = false;
   }
   std::memcpy(out_state, &controller->state, sizeof(*out_state));
+  if (is_active) ApplyGyroStick(*controller, out_state->gamepad);
   if (!REXCVAR_GET(guide_button)) out_state->gamepad.buttons = uint16_t(out_state->gamepad.buttons) & ~X_INPUT_GAMEPAD_GUIDE;
   if (!is_active) {
     // Simulate an "untouched" controller. When we become active again the
@@ -409,6 +528,9 @@ void SDLInputDriver::HandleEvent(const SDL_Event& event) {
   // This breaks the lock ordering inversion between controllers_mutex_ and
   // SDL's internal joystick lock that caused deadlocks.
   std::lock_guard<std::mutex> guard(event_queue_mutex_);
+  // Motion sensors report up to 1000 times a second; while the game is not
+  // polling, drop samples instead of growing the queue.
+  if (event.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE && pending_events_.size() >= 4096) return;
   pending_events_.push_back(event);
 }
 
@@ -439,6 +561,9 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
       OnControllerDeviceButtonChangedLocked(event);
+      break;
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+      OnControllerDeviceSensorLocked(event);
       break;
     default:
       break;
@@ -488,8 +613,14 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
     // XInput seems to start with packet_number = 1 .
     state.state_changed = true;
     UpdateXCapabilities(state);
+    state.gyro.gravity[1] = 1.0f;
+    state.gyro.present = SDL_GamepadHasSensor(controller, SDL_SENSOR_GYRO) &&
+                         SDL_SetGamepadSensorEnabled(controller, SDL_SENSOR_GYRO, true);
+    if (state.gyro.present && SDL_GamepadHasSensor(controller, SDL_SENSOR_ACCEL))
+      SDL_SetGamepadSensorEnabled(controller, SDL_SENSOR_ACCEL, true);
 
-    REXLOG_INFO("SDL OnControllerDeviceAdded: Added at index {}.", user_id);
+    REXLOG_INFO("SDL OnControllerDeviceAdded: Added at index {}{}.", user_id,
+                state.gyro.present ? ", with gyro" : "");
   } else {
     // No more controllers needed, close it.
     SDL_CloseGamepad(controller);
@@ -600,6 +731,86 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
   }
   controller.state.gamepad.buttons = xbuttons;
   controller.state_changed = true;
+}
+
+void SDLInputDriver::OnControllerDeviceSensorLocked(const SDL_Event& event) {
+  const auto idx = GetControllerIndexFromInstanceID(event.gsensor.which);
+  if (!idx) return;
+  auto& controller = controllers_.at(*idx);
+  auto& gyro = controller.gyro;
+  const float* data = event.gsensor.data;
+  if (event.gsensor.sensor == SDL_SENSOR_ACCEL) {
+    // Gravity points away from the floor; it orients the player turn axis and
+    // tells a resting controller apart from a moving one.
+    float change = 0.0f;
+    for (int i = 0; i < 3; ++i) change += std::abs(data[i] - gyro.last_accel[i]);
+    std::copy(data, data + 3, gyro.last_accel);
+    if (change > 0.5f) gyro.still_time = 0.0f;
+    const float length = std::sqrt(data[0] * data[0] + data[1] * data[1] + data[2] * data[2]);
+    if (length > 1.0f) {
+      for (int i = 0; i < 3; ++i) gyro.gravity[i] += (data[i] / length - gyro.gravity[i]) * 0.05f;
+    }
+    return;
+  }
+  if (event.gsensor.sensor != SDL_SENSOR_GYRO) return;
+  const uint64_t timestamp =
+      event.gsensor.sensor_timestamp ? event.gsensor.sensor_timestamp : event.gsensor.timestamp;
+  const double dt = gyro.last_timestamp && timestamp > gyro.last_timestamp
+                        ? std::min(double(timestamp - gyro.last_timestamp) * 1e-9, 0.05)
+                        : 0.0;
+  gyro.last_timestamp = timestamp;
+
+  constexpr float kDegrees = 57.2957795f;
+  float rate[3];
+  for (int i = 0; i < 3; ++i) rate[i] = data[i] * kDegrees - gyro.bias[i];
+
+  // Continuous calibration, like Steam Input: while the controller rests, what
+  // the gyro still reads is its bias. Until the first rest, larger readings
+  // count as rest so that a large bias is found.
+  const float rest = gyro.calibrated ? 1.5f : 5.0f;
+  const bool still =
+      std::abs(rate[0]) < rest && std::abs(rate[1]) < rest && std::abs(rate[2]) < rest;
+  gyro.still_time = still ? gyro.still_time + float(dt) : 0.0f;
+  if (gyro.still_time > 0.5f) {
+    const float k = std::min(1.0f, float(dt) * (gyro.calibrated ? 0.5f : 4.0f));
+    for (int i = 0; i < 3; ++i) {
+      gyro.bias[i] += rate[i] * k;
+      rate[i] -= rate[i] * k;
+    }
+    if (gyro.still_time > 1.0f) gyro.calibrated = true;
+  }
+
+  // Below half a degree per second the reading is mostly noise; scale it down
+  // smoothly rather than cutting it off.
+  const float magnitude = std::sqrt(rate[0] * rate[0] + rate[1] * rate[1] + rate[2] * rate[2]);
+  constexpr float kTighten = 0.5f;
+  if (magnitude < kTighten) {
+    for (float& r : rate) r *= magnitude / kTighten;
+  }
+
+  float turn = rate[1];
+  if (gyro_axis_ == GyroAxis::kRoll) {
+    turn = rate[2];
+  } else if (gyro_axis_ == GyroAxis::kPlayer) {
+    // Rotation about the vertical axis, whichever way the controller is held,
+    // allowing for some lean.
+    const float world = rate[1] * gyro.gravity[1] + rate[2] * gyro.gravity[2];
+    turn = std::copysign(std::min(std::abs(world) * 1.41f, std::hypot(rate[1], rate[2])), world);
+  }
+  const double turn_right = -turn;
+  const double look_down = gyro_invert_y_ ? rate[0] : -rate[0];
+
+  const bool enabled = gyro_mode_ != GyroMode::kOff && (!gyro_while_aiming_ || GyroAiming(controller));
+  const double k = std::min(1.0, dt / 0.02);
+  gyro.rate_x += ((enabled ? turn_right : 0.0) - gyro.rate_x) * k;
+  gyro.rate_y += ((enabled ? look_down : 0.0) - gyro.rate_y) * k;
+  if (!enabled) return;
+  if (gyro_mode_ == GyroMode::kMouse && gyro_look_supported_) {
+    gyro.look_x += turn_right * dt;
+    gyro.look_y += look_down * dt;
+  } else {
+    controller.state_changed = true;
+  }
 }
 
 std::optional<size_t> SDLInputDriver::GetControllerIndexFromInstanceID(SDL_JoystickID instance_id) {
