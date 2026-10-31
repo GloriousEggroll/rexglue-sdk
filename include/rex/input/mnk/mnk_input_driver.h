@@ -125,6 +125,10 @@ class MnkInputDriver final : public InputDriver,
   // Taken from the window when attached, then kept by focus events: a game
   // started in the background never gets the event that would clear it.
   bool has_focus_ = false;
+  // The mouse is grabbed only after a click in the window since focus was
+  // last lost (or with focus at start). Wine on Wayland can report the game
+  // focused again after alt-tab released on another window.
+  bool capture_armed_ = false;
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;

@@ -1237,6 +1237,13 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
       if (destruction_receiver.IsWindowDestroyedOrClosed()) {
         break;
       }
+      // Give the pointer back even while it stays over this window (another
+      // window focused without being raised above the game): unclip it and
+      // show it now, since WM_SETCURSOR is not handled without focus. Wine's
+      // Wayland driver keeps the pointer locked to a fullscreen window while
+      // its cursor is hidden.
+      ClipCursor(nullptr);
+      if (GetCursorVisibility() == CursorVisibility::kVisible) SetCursor(arrow_cursor_);
     } break;
 
     case WM_SETFOCUS: {

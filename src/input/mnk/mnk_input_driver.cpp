@@ -226,6 +226,7 @@ void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
     {
       std::lock_guard lock(state_mutex_);
       has_focus_ = window->HasFocus();
+      capture_armed_ = has_focus_;
     }
     REXLOG_INFO("MnK: attached to window, focus={}", has_focus_);
     window->AddInputListener(this, window_z_order());
@@ -482,15 +483,15 @@ void MnkInputDriver::UpdateMouseCapture() {
   if (!attached_window_)
     return;
 
-  bool should_capture = IsEnabled() && WindowFocused() && is_active();
+  bool should_capture = IsEnabled() && capture_armed_ && WindowFocused() && is_active();
 
   // The game polls from its own threads; windows are changed on the UI thread.
   // The UI thread applies the latest wanted state rather than the one at the
   // time of the request, so a capture queued just before a focus loss cannot
   // lock the mouse afterwards.
   if (should_capture != mouse_captured_) {
-    REXLOG_INFO("MnK: capture wanted={} (focus event={}, window focused={}, active={})", should_capture,
-                has_focus_, WindowFocused(), is_active());
+    REXLOG_INFO("MnK: capture wanted={} (focus event={}, window focused={}, clicked={}, active={})", should_capture,
+                has_focus_, WindowFocused(), capture_armed_, is_active());
     mouse_captured_ = should_capture;
     if (should_capture) {
       // Reset deltas to avoid a spike on capture start
@@ -555,6 +556,12 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
   if (!IsEnabled() || !has_focus_)
     return;
   std::lock_guard lock(state_mutex_);
+  if (!capture_armed_) {
+    // This click only takes the mouse back; it does not reach the game.
+    capture_armed_ = true;
+    REXLOG_INFO("MnK: click in window, mouse may be captured");
+    return;
+  }
   switch (e.button()) {
     case rex::ui::MouseEvent::Button::kLeft:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kLButton), true);
@@ -595,7 +602,8 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   std::lock_guard lock(state_mutex_);
   int32_t x = e.x();
   int32_t y = e.y();
-  if (!relative_motion_) {
+  // A free cursor over the window (not yet clicked back in) does not look.
+  if (!relative_motion_ && mouse_captured_) {
     mouse_dx_ += x - prev_mouse_x_;
     mouse_dy_ += y - prev_mouse_y_;
   }
@@ -608,6 +616,7 @@ void MnkInputDriver::OnRelativeMouseMove(rex::ui::MouseEvent& e) {
     return;
   std::lock_guard lock(state_mutex_);
   relative_motion_ = true;
+  if (!mouse_captured_) return;
   mouse_dx_ += e.x();
   mouse_dy_ += e.y();
 }
@@ -625,6 +634,7 @@ void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
 void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   std::lock_guard lock(state_mutex_);
   has_focus_ = false;
+  capture_armed_ = false;
   REXLOG_INFO("MnK: focus lost");
   std::memset(key_down_, 0, sizeof(key_down_));
   mouse_dx_ = 0;
