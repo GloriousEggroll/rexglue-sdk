@@ -1222,7 +1222,16 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
       }
     } break;
 
+    case WM_ACTIVATEAPP:
+    case WM_ACTIVATE:
+    case WM_CAPTURECHANGED:
+      REXLOG_INFO("Window message {}: wparam={:#x} foreground={}", message == WM_ACTIVATEAPP ? "WM_ACTIVATEAPP"
+                  : message == WM_ACTIVATE ? "WM_ACTIVATE" : "WM_CAPTURECHANGED",
+                  uint64_t(wParam), GetForegroundWindow() == hwnd_);
+      break;
+
     case WM_KILLFOCUS: {
+      REXLOG_INFO("Window lost keyboard focus (foreground={})", GetForegroundWindow() == hwnd_);
       WindowDestructionReceiver destruction_receiver(this);
       OnFocusUpdate(false, destruction_receiver);
       if (destruction_receiver.IsWindowDestroyedOrClosed()) {
@@ -1231,6 +1240,7 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
     } break;
 
     case WM_SETFOCUS: {
+      REXLOG_INFO("Window gained keyboard focus");
       WindowDestructionReceiver destruction_receiver(this);
       OnFocusUpdate(true, destruction_receiver);
       if (destruction_receiver.IsWindowDestroyedOrClosed()) {

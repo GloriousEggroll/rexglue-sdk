@@ -79,6 +79,10 @@ class MnkInputDriver final : public InputDriver,
   bool IsEnabled() const;
   void CenterCursor();
   void UpdateMouseCapture();
+  // On the UI thread: makes the window's capture match mouse_captured_.
+  void ApplyMouseCapture();
+  // Whether the game window is the one the user is typing into.
+  bool WindowFocused() const;
   void SetKeyState(uint16_t vk, bool down);
   bool IsBindPressed(std::string_view name) const;
   void ApplySetting(std::string_view name, std::string_view value);
@@ -118,7 +122,9 @@ class MnkInputDriver final : public InputDriver,
   double mouse_rate_y_ = 0.0;
   std::chrono::steady_clock::time_point wheel_up_until_{};
   std::chrono::steady_clock::time_point wheel_down_until_{};
-  bool has_focus_ = true;
+  // Taken from the window when attached, then kept by focus events: a game
+  // started in the background never gets the event that would clear it.
+  bool has_focus_ = false;
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;

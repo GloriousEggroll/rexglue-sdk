@@ -223,6 +223,11 @@ X_STATUS MnkInputDriver::Setup() {
 void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
   if (window) {
     attached_window_ = window;
+    {
+      std::lock_guard lock(state_mutex_);
+      has_focus_ = window->HasFocus();
+    }
+    REXLOG_INFO("MnK: attached to window, focus={}", has_focus_);
     window->AddInputListener(this, window_z_order());
     window->AddListener(this);
   }
@@ -445,7 +450,7 @@ void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
 }
 
 void MnkInputDriver::CenterCursor() {
-  if (!attached_window_)
+  if (!attached_window_ || !WindowFocused())
     return;
   int32_t cx = static_cast<int32_t>(attached_window_->GetActualLogicalWidth() / 2);
   int32_t cy = static_cast<int32_t>(attached_window_->GetActualLogicalHeight() / 2);
@@ -461,36 +466,57 @@ void MnkInputDriver::CenterCursor() {
 #endif
 }
 
+bool MnkInputDriver::WindowFocused() const {
+  if (!has_focus_) return false;
+#if REX_PLATFORM_WIN32
+  // Also ask the system: a missed focus event must never leave the cursor
+  // locked to a window the user switched away from (alt-tab under Wine).
+  auto* win32_window = dynamic_cast<rex::ui::Win32Window*>(attached_window_);
+  if (win32_window && win32_window->hwnd() && GetForegroundWindow() != win32_window->hwnd())
+    return false;
+#endif
+  return true;
+}
+
 void MnkInputDriver::UpdateMouseCapture() {
   if (!attached_window_)
     return;
 
-  bool should_capture = IsEnabled() && has_focus_ && is_active();
+  bool should_capture = IsEnabled() && WindowFocused() && is_active();
 
-  // The game polls from its own threads; windows are changed on the UI thread,
-  // in the order requested.
+  // The game polls from its own threads; windows are changed on the UI thread.
+  // The UI thread applies the latest wanted state rather than the one at the
+  // time of the request, so a capture queued just before a focus loss cannot
+  // lock the mouse afterwards.
   if (should_capture != mouse_captured_) {
+    REXLOG_INFO("MnK: capture wanted={} (focus event={}, window focused={}, active={})", should_capture,
+                has_focus_, WindowFocused(), is_active());
     mouse_captured_ = should_capture;
     if (should_capture) {
       // Reset deltas to avoid a spike on capture start
       mouse_dx_ = 0;
       mouse_dy_ = 0;
     }
-    attached_window_->app_context().CallInUIThread([this, should_capture] {
-      if (!attached_window_) return;
-      if (should_capture) {
-        attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
-        attached_window_->CaptureMouse();
-      } else if (attached_window_->IsMouseCaptureRequested()) {
-        attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
-        attached_window_->ReleaseMouse();
-      }
-    });
+    attached_window_->app_context().CallInUIThread([this] { ApplyMouseCapture(); });
   }
 
   // Re-center cursor each frame while captured to prevent edge clamping
   if (mouse_captured_) {
     CenterCursor();
+  }
+}
+
+void MnkInputDriver::ApplyMouseCapture() {
+  if (!attached_window_) return;
+  const bool want = mouse_captured_ && has_focus_;
+  const bool have = attached_window_->IsMouseCaptureRequested();
+  if (want != have) REXLOG_INFO("MnK: mouse {}", want ? "captured" : "released");
+  if (want && !have) {
+    attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+    attached_window_->CaptureMouse();
+  } else if (!want && have) {
+    attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
+    attached_window_->ReleaseMouse();
   }
 }
 
@@ -599,7 +625,7 @@ void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
 void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   std::lock_guard lock(state_mutex_);
   has_focus_ = false;
-  if (REXCVAR_GET(mnk_trace_input)) REXLOG_INFO("MnK input trace focus lost");
+  REXLOG_INFO("MnK: focus lost");
   std::memset(key_down_, 0, sizeof(key_down_));
   mouse_dx_ = 0;
   mouse_dy_ = 0;
@@ -615,7 +641,7 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
 void MnkInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
   std::lock_guard lock(state_mutex_);
   has_focus_ = true;
-  if (REXCVAR_GET(mnk_trace_input)) REXLOG_INFO("MnK input trace focus gained");
+  REXLOG_INFO("MnK: focus gained");
 }
 
 }  // namespace rex::input::mnk
