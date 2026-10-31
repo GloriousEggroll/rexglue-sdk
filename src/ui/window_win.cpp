@@ -317,6 +317,7 @@ bool Win32Window::OpenImpl() {
 
   // Finally show the window.
   ShowWindow(hwnd_, SW_SHOWNORMAL);
+  if (IsFullscreen()) FitFullscreenToMonitor();
 
   // Report the initial actual state after opening, messages for which might
   // have missed if they were processed during CreateWindowExW when the HWND was
@@ -692,10 +693,37 @@ uint32_t Win32Window::GetCurrentDpi() const {
   return GetCurrentSystemDpi();
 }
 
+namespace {
+// Posted from WM_SIZE so the refit runs outside the window manager's resize.
+constexpr UINT kFitFullscreenMessage = WM_APP + 0x1F;
+constexpr uint32_t kMaximumFullscreenRefits = 4;
+}  // namespace
+
+bool Win32Window::FitFullscreenToMonitor() {
+  MONITORINFO monitor_info;
+  monitor_info.cbSize = sizeof(monitor_info);
+  RECT window_rect;
+  const HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+  if (!monitor || !GetMonitorInfo(monitor, &monitor_info) || !GetWindowRect(hwnd_, &window_rect) ||
+      EqualRect(&window_rect, &monitor_info.rcMonitor))
+    return false;
+  // A window sized to the monitor while hidden can be fitted to the work area
+  // when shown or resized by the window manager: Wine/Proton kept the taskbar
+  // over the game (3840x2160 became 3840x2090) until fullscreen was toggled.
+  // Never activate or raise: after alt-tab that would pull focus (and the
+  // captured mouse) straight back to the game.
+  SetWindowPos(hwnd_, nullptr, monitor_info.rcMonitor.left, monitor_info.rcMonitor.top,
+               monitor_info.rcMonitor.right - monitor_info.rcMonitor.left,
+               monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top,
+               SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+  return true;
+}
+
 void Win32Window::ApplyFullscreenEntry(WindowDestructionReceiver& destruction_receiver) {
   if (!IsFullscreen()) {
     return;
   }
+  fullscreen_refits_ = 0;
 
   // https://blogs.msdn.com/b/oldnewthing/archive/2010/04/12/9994016.aspx
   // No reason to use MONITOR_DEFAULTTOPRIMARY instead of
@@ -1113,7 +1141,25 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
         if (destruction_receiver.IsWindowDestroyedOrClosed()) {
           break;
         }
+        // Only while the game is the focused window: a resize that comes with
+        // switching away (alt-tab) is the user's, not a startup work-area fit.
+        if (IsFullscreen() && wParam != SIZE_MINIMIZED && HasFocus() &&
+            fullscreen_refits_ < kMaximumFullscreenRefits) {
+          RECT window_rect;
+          MONITORINFO monitor_info;
+          monitor_info.cbSize = sizeof(monitor_info);
+          const HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+          if (monitor && GetMonitorInfo(monitor, &monitor_info) && GetWindowRect(hwnd_, &window_rect) &&
+              !EqualRect(&window_rect, &monitor_info.rcMonitor)) {
+            ++fullscreen_refits_;
+            PostMessageW(hwnd_, kFitFullscreenMessage, 0, 0);
+          }
+        }
       }
+    } break;
+
+    case kFitFullscreenMessage: {
+      if (IsFullscreen() && HasFocus()) FitFullscreenToMonitor();
     } break;
 
     case WM_PAINT: {

@@ -151,8 +151,14 @@ elseif(UNIX AND NOT APPLE)
         set(REX_PLATFORM "linux-${CMAKE_SYSTEM_PROCESSOR}")
     endif()
     add_compile_definitions(REX_PLATFORM_LINUX=1)
+elseif(APPLE)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        set(REX_PLATFORM "macos-arm64")
+    else()
+        message(FATAL_ERROR "Unsupported macOS architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
 else()
-    message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows and Linux only.")
+    message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows, Linux and macOS.")
 endif()
 
 # Build config as compile definition (multi-config generators don't know config at configure time)
@@ -249,6 +255,11 @@ if(REXGLUE_BUILD_TOOLS AND REXGLUE_USE_VULKAN)
         add_executable(rex-gpu-vulkan-trace-viewer WIN32
             src/graphics/vulkan/trace_viewer_main.cpp
             src/ui/windowed_app_main_win.cpp
+        )
+    elseif(APPLE)
+        add_executable(rex-gpu-vulkan-trace-viewer
+            src/graphics/vulkan/trace_viewer_main.cpp
+            src/ui/windowed_app_main_sdl.cpp
         )
     else()
         add_executable(rex-gpu-vulkan-trace-viewer

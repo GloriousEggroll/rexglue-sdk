@@ -8,7 +8,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
     set(IS_ARM64 FALSE)
     set(IS_X86_64 TRUE)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|ARM64)$")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|ARM64|arm64)$")
     set(IS_ARM64 TRUE)
     set(IS_X86_64 FALSE)
 else()
@@ -204,6 +204,10 @@ if(REXGLUE_USE_VULKAN)
     target_link_libraries(volk PUBLIC Vulkan::Headers)
     target_link_libraries(volk_headers INTERFACE Vulkan::Headers)
     target_compile_options(volk PRIVATE -w)
+    if(APPLE)
+        # Metal surfaces (MoltenVK) for the presenter and Plume.
+        target_compile_definitions(volk PUBLIC VK_USE_PLATFORM_METAL_EXT)
+    endif()
 endif()
 
 #=============================================================================
@@ -261,6 +265,12 @@ set(SDL_METAL OFF CACHE BOOL "" FORCE)
 set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYAUDIO ${REXGLUE_BUILD_TESTS} CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
+if(APPLE)
+    # macOS windows, input events and the Metal layer come from SDL.
+    set(SDL_UNIX_CONSOLE_BUILD OFF CACHE BOOL "" FORCE)
+    set(SDL_VIDEO ON CACHE BOOL "" FORCE)
+    set(SDL_METAL ON CACHE BOOL "" FORCE)
+endif()
 
 # Linux audio backends
 if(UNIX AND NOT APPLE)

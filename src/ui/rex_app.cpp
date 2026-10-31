@@ -72,7 +72,8 @@ class ShaderStorageDialog final : public ImGuiDialog {
                            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                            ImGuiWindowFlags_NoInputs;
     if (ImGui::Begin("##shader_preparation", nullptr, flags)) {
-      const char* phase = status.phase == Phase::kShaders ? "PREPARING SHADERS" :
+      const char* phase = status.phase == Phase::kFinding ? "FINDING SHADERS" :
+                          status.phase == Phase::kShaders ? "PREPARING SHADERS" :
                           status.phase == Phase::kPipelines ? "PREPARING PIPELINES" :
                           status.phase == Phase::kComplete ? "READY" : "READING SHADER CACHE";
       ImGui::TextUnformatted(phase);
@@ -84,6 +85,7 @@ class ShaderStorageDialog final : public ImGuiDialog {
       const float fraction = status.total ? float(status.completed) / float(status.total) : 0.0f;
       ImGui::ProgressBar(fraction, ImVec2(-1, 8), "");
       const char* items = status.phase == Phase::kPipelines ? "pipelines" :
+                          status.phase == Phase::kFinding ? "game files" :
                           status.phase == Phase::kShaders ? "shaders" : "items";
       if (status.skipped) ImGui::Text("Optional %s skipped: %zu", items, status.skipped);
       if (status.failed) ImGui::Text("Failed %s: %zu", items, status.failed);

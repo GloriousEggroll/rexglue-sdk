@@ -66,6 +66,9 @@ class VulkanInstance {
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
 #include <rex/ui/vulkan/functions/instance_khr_android_surface.inc>
 #endif
+#ifdef VK_USE_PLATFORM_METAL_EXT
+    PFN_vkCreateMetalSurfaceEXT vkCreateMetalSurfaceEXT = nullptr;
+#endif
     // VK_KHR_win32_surface (#10)
 #ifdef VK_USE_PLATFORM_WIN32_KHR
 #include <rex/ui/vulkan/functions/instance_khr_win32_surface.inc>
@@ -98,6 +101,7 @@ class VulkanInstance {
     bool ext_1_1_KHR_get_physical_device_properties2 = false;  // #60
     bool ext_EXT_debug_utils = false;                          // #129
     bool ext_KHR_wayland_surface = false;
+    bool ext_EXT_metal_surface = false;
     bool ext_EXT_swapchain_colorspace = false;
     bool ext_KHR_portability_enumeration = false;              // #395
   };

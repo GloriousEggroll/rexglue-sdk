@@ -10,13 +10,18 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include <spdlog/details/log_msg_buffer.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -25,8 +30,16 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/thread.h>
 
 #if REX_PLATFORM_WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <spdlog/sinks/msvc_sink.h>
 #else
 #include <spdlog/sinks/stdout_sinks.h>
@@ -58,6 +71,99 @@ REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files 
 namespace rex {
 
 namespace {
+
+// Writes to the log file from its own thread. A file write can block for tens
+// of milliseconds (an ext4 journal commit under Proton, a slow disk), and the
+// threads that log include the GPU command processor and the guest's render
+// thread; they only queue a copy of each message. Flushes are queued too, so
+// every line still reaches the file promptly. The writer owns its state with
+// the sink: at process exit Windows may already have ended the writer, so the
+// sink never waits for it there (ShutdownLogging drains first).
+class BackgroundSink final : public spdlog::sinks::sink {
+ public:
+  explicit BackgroundSink(spdlog::sink_ptr file) : state_(std::make_shared<State>()) {
+    state_->file = std::move(file);
+    std::thread([state = state_] { Run(*state); }).detach();
+  }
+  ~BackgroundSink() override {
+    state_->stopping = true;
+    state_->ready.notify_one();
+  }
+  void log(const spdlog::details::log_msg& message) override {
+    {
+      std::lock_guard lock(state_->mutex);
+      state_->queue.emplace_back(message);
+    }
+    state_->ready.notify_one();
+  }
+  void flush() override {
+    {
+      std::lock_guard lock(state_->mutex);
+      state_->flush = true;
+    }
+    state_->ready.notify_one();
+  }
+  void set_pattern(const std::string& pattern) override { state_->file->set_pattern(pattern); }
+  void set_formatter(std::unique_ptr<spdlog::formatter> formatter) override {
+    state_->file->set_formatter(std::move(formatter));
+  }
+  // Waits until everything queued so far is written and flushed.
+  bool Drain(std::chrono::milliseconds limit) {
+    std::unique_lock lock(state_->mutex);
+    state_->flush = true;
+    state_->ready.notify_one();
+    return state_->idle.wait_for(lock, limit, [&] {
+      return state_->queue.empty() && !state_->flush && !state_->writing;
+    });
+  }
+
+ private:
+  struct State {
+    spdlog::sink_ptr file;
+    std::mutex mutex;
+    std::condition_variable ready, idle;
+    std::vector<spdlog::details::log_msg_buffer> queue;
+    bool flush = false, writing = false;
+    std::atomic<bool> stopping{false};
+  };
+  static void Run(State& state) {
+    thread::set_current_thread_name("Log Writer");
+    std::vector<spdlog::details::log_msg_buffer> batch;
+    std::unique_lock lock(state.mutex);
+    for (;;) {
+      state.ready.wait_for(lock, std::chrono::milliseconds(100),
+                           [&] { return state.stopping || state.flush || !state.queue.empty(); });
+      batch.swap(state.queue);
+      const bool flush = std::exchange(state.flush, false);
+      state.writing = true;
+      lock.unlock();
+      try {
+        for (const auto& message : batch) state.file->log(message);
+        if (flush) state.file->flush();
+      } catch (...) {
+        // A failed write loses these lines, as a synchronous sink would.
+      }
+      batch.clear();
+      lock.lock();
+      state.writing = false;
+      state.idle.notify_all();
+      if (state.stopping && state.queue.empty()) return;
+    }
+  }
+
+  std::shared_ptr<State> state_;
+};
+std::shared_ptr<BackgroundSink> g_background_file_sink;
+
+#if REX_PLATFORM_WIN32
+LPTOP_LEVEL_EXCEPTION_FILTER g_previous_exception_filter = nullptr;
+// A crash still leaves every line logged before it in the file.
+LONG WINAPI DrainLogBeforeCrash(EXCEPTION_POINTERS* exception) {
+  if (auto sink = g_background_file_sink)
+    sink->Drain(std::chrono::milliseconds(500));
+  return g_previous_exception_filter ? g_previous_exception_filter(exception) : EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
 
 std::vector<LogCategoryEntry> g_registry;
 spdlog::sink_ptr g_console_sink;
@@ -230,7 +336,12 @@ void InitLogging(const LogConfig& config) {
         static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
-    g_file_sink = sink;
+    g_background_file_sink = std::make_shared<BackgroundSink>(sink);
+    g_background_file_sink->set_level(spdlog::level::trace);
+    g_file_sink = g_background_file_sink;
+#if REX_PLATFORM_WIN32
+    g_previous_exception_filter = SetUnhandledExceptionFilter(DrainLogBeforeCrash);
+#endif
   }
 
   g_extra_sinks = config.extra_sinks;
@@ -276,11 +387,15 @@ void ShutdownLogging() {
   for (auto& entry : g_registry)
     if (entry.logger)
       entry.logger->flush();
+  if (g_background_file_sink)
+    g_background_file_sink->Drain(std::chrono::seconds(2));
 
   spdlog::shutdown();
   g_registry.clear();
   g_console_sink.reset();
   g_file_sink.reset();
+  // Drained above; its writer ends once the queue is empty.
+  g_background_file_sink.reset();
   g_early_sink.reset();
   g_extra_sinks.clear();
   g_initialized = false;

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <rex/atomic_shared_ptr.h>
 #include <rex/graphics/native_completion_markers.h>
 
 #include <atomic>
@@ -378,8 +379,8 @@ class CommandProcessor {
   std::mutex direct_work_mutex_;
   std::vector<std::function<void()>> direct_work_;
   std::atomic<bool> direct_work_pending_{false};
-  std::atomic<std::shared_ptr<std::function<bool()>>> direct_idle_hook_;
-  std::atomic<std::shared_ptr<DirectSwapRouter>> direct_swap_router_;
+  rex::AtomicSharedPtr<std::function<bool()>> direct_idle_hook_;
+  rex::AtomicSharedPtr<DirectSwapRouter> direct_swap_router_;
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;

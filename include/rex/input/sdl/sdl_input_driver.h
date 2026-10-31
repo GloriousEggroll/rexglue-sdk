@@ -12,7 +12,10 @@
 #pragma once
 
 #include <array>
+#include <filesystem>
 #include <atomic>
+#include <condition_variable>
+#include <thread>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -38,6 +41,12 @@ namespace rex::input::sdl {
 // supported; until then the gyro moves the right stick instead. Returns false
 // when there is no motion to apply.
 bool TakeGyroLook(uint32_t user_index, double& dx, double& dy);
+
+// File remembering which controller is player 1 (its serial, or its GUID when
+// it has none). Set before the first controller connects; empty disables it.
+// Player 1 returns to that controller at startup even if another one is
+// listed first; controllers connected later always take the next free slot.
+void SetControllerMemoryPath(std::filesystem::path path);
 
 class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener {
  public:
@@ -81,6 +90,17 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     bool state_changed;
     bool is_active;
     GyroState gyro;
+    // Pressed a button since connecting: the game may already be using it.
+    bool had_input;
+    // Serial or GUID, for the player 1 memory.
+    std::string identity;
+    // Physical input; state.gamepad is derived from it with the slot's
+    // mapping (Remap). Bits are SDL gamepad buttons.
+    uint32_t raw_buttons;
+    int16_t raw_lx, raw_ly, raw_rx, raw_ry;
+    uint8_t raw_lt, raw_rt;
+    // A source mapped to "gyro" is held.
+    bool gyro_held;
   };
 
   enum class RepeatState {
@@ -111,8 +131,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
   void OnControllerDeviceSensorLocked(const SDL_Event& event);
   void ApplySetting(std::string_view name, std::string_view value);
-  bool GyroAiming(const ControllerState& controller) const;
-  void ApplyGyroStick(ControllerState& controller, X_INPUT_GAMEPAD& pad);
+  bool GyroEnabled(const ControllerState& controller, size_t slot) const;
+  void ApplyGyroStick(ControllerState& controller, size_t slot, X_INPUT_GAMEPAD& pad);
+  void Remap(ControllerState& controller, size_t slot);
 
   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
   std::optional<size_t> GetControllerIndexFromInstanceID(SDL_JoystickID instance_id);
@@ -120,6 +141,19 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   bool TestSDLVersion() const;
   void UpdateXCapabilities(ControllerState& state);
   void QueueControllerUpdate();
+  // Initializes SDL events and gamepads on the calling thread, which then
+  // pumps SDL events (the UI thread, or the Windows input thread).
+  void InitializeSdl();
+  void ShutdownSdl();
+  // Windows and Linux: SDL's HIDAPI reads (DualSense, DualShock 4) can block
+  // for a second under Wine; pumping on the UI thread then stops
+  // presentation. A dedicated thread owns SDL input instead. macOS keeps it on
+  // the main thread, where SDL also runs the window.
+  void InputThreadMain();
+  std::thread input_thread_;
+  std::mutex pump_mutex_;
+  std::condition_variable pump_condition_;
+  bool pump_requested_ = false, input_thread_stop_ = false, input_thread_ready_ = false;
 
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
@@ -132,15 +166,31 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   std::vector<SDL_Event> pending_events_;
   std::array<KeystrokeState, HID_SDL_USER_COUNT> keystroke_states_;
 
-  // Parsed gyro settings, guarded by controllers_mutex_.
+  // Parsed per-player settings (controllerN_* cvars), guarded by
+  // controllers_mutex_. Indexed by player slot, not by device.
   enum class GyroMode { kOff, kMouse, kJoystick };
   enum class GyroAxis { kYaw, kRoll, kPlayer };
-  GyroMode gyro_mode_ = GyroMode::kOff;
-  GyroAxis gyro_axis_ = GyroAxis::kYaw;
-  bool gyro_while_aiming_ = false;
-  bool gyro_invert_y_ = false;
-  double gyro_sensitivity_ = 1.0;
-  double gyro_stick_deadzone_ = 0.3;
+  enum class GyroActivation { kAlways, kAiming, kButton };
+ public:
+  // Mapping sources: SDL gamepad buttons, then both triggers.
+  static constexpr size_t kTriggerSourceLeft = SDL_GAMEPAD_BUTTON_COUNT, kTriggerSourceRight = kTriggerSourceLeft + 1,
+                          kMappingSources = kTriggerSourceRight + 1;
+  // Mapping targets: an XInput button bit index (0-15), the triggers, none or gyro.
+  static constexpr int8_t kTargetLeftTrigger = 16, kTargetRightTrigger = 17, kTargetNone = -1, kTargetGyro = -2;
+ private:
+  struct PlayerSettings {
+    GyroMode gyro_mode = GyroMode::kOff;
+    GyroAxis gyro_axis = GyroAxis::kYaw;
+    GyroActivation gyro_activation = GyroActivation::kAlways;
+    bool gyro_invert_y = false;
+    double gyro_sensitivity = 1.0;
+    double gyro_stick_deadzone = 0.3;
+    std::array<int8_t, kMappingSources> map{};
+    bool swap_sticks = false;
+    bool invert_look_y = false;
+    double left_deadzone = 0.0, right_deadzone = 0.0;
+  };
+  std::array<PlayerSettings, HID_SDL_USER_COUNT> players_;
   bool gyro_look_supported_ = false;
 };
 

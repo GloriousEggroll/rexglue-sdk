@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 
+#include <rex/ui/hdr_display.h>
 #include <rex/ui/surface.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -33,6 +34,9 @@ class Win32HwndSurface final : public Surface {
   TypeIndex GetType() const override { return kTypeIndex_Win32Hwnd; }
   HINSTANCE hinstance() const { return hinstance_; }
   HWND hwnd() const { return hwnd_; }
+  // HDR state of the monitor the window is on, from DXGI; unavailable when
+  // DXGI cannot describe it (for example under Wine without HDR).
+  HdrDisplay GetHdrDisplay() const;
 
  protected:
   bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override;

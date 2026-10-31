@@ -128,6 +128,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     requested_extensions.emplace("VK_KHR_android_surface",
                                  &vulkan_instance->extensions_.ext_KHR_android_surface);
 #endif
+#ifdef VK_USE_PLATFORM_METAL_EXT
+    requested_extensions.emplace("VK_EXT_metal_surface",
+                                 &vulkan_instance->extensions_.ext_EXT_metal_surface);
+#endif
 #ifdef VK_USE_PLATFORM_WIN32_KHR
     // #10.
     requested_extensions.emplace("VK_KHR_win32_surface",
@@ -399,6 +403,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   if (vulkan_instance->extensions_.ext_KHR_wayland_surface) {
     functions_loaded &= (ifn.vkCreateWaylandSurfaceKHR = reinterpret_cast<PFN_vkCreateWaylandSurfaceKHR>(
         ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, "vkCreateWaylandSurfaceKHR"))) != nullptr;
+  }
+#endif
+#ifdef VK_USE_PLATFORM_METAL_EXT
+  if (vulkan_instance->extensions_.ext_EXT_metal_surface) {
+    functions_loaded &= (ifn.vkCreateMetalSurfaceEXT = reinterpret_cast<PFN_vkCreateMetalSurfaceEXT>(
+        ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, "vkCreateMetalSurfaceEXT"))) != nullptr;
   }
 #endif
 #ifdef VK_USE_PLATFORM_ANDROID_KHR

@@ -63,6 +63,11 @@ if(WIN32)
         window_win.cpp
         windowed_app_context_win.cpp
     )
+elseif(APPLE)
+    set(REXUI_PLATFORM_SOURCES
+        window_sdl.cpp
+        windowed_app_context_sdl.cpp
+    )
 else()
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
@@ -172,6 +177,11 @@ if(WIN32)
         dxgi
         shcore
     )
+elseif(APPLE)
+    add_library(rex_adaptive_sync STATIC adaptive_sync_stub.cpp)
+    target_include_directories(rex_adaptive_sync PUBLIC ${REXGLUE_ROOT}/include)
+    target_link_libraries(rexui PUBLIC rex_adaptive_sync SDL3::SDL3
+        "-framework QuartzCore" "-framework Metal" "-framework Cocoa")
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK3 REQUIRED gtk+-3.0>=3.24.24)

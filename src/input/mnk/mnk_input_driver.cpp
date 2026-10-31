@@ -33,7 +33,7 @@
 #include <windows.h>
 #endif
 
-REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
+REXCVAR_DEFINE_BOOL(mnk_mode, true, "Input", "Enable keyboard/mouse controller emulation");
 REXCVAR_DEFINE_BOOL(mnk_trace_input, false, "Input diagnostics", "Log bounded keyboard focus and controller polling diagnostics");
 REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity")

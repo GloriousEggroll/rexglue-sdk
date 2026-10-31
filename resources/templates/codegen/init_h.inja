@@ -61,9 +61,19 @@ extern PPCFuncMapping PPCFuncMappings[];
   REX_EXTERN(name);            \
   REX_EXTERN(__imp__##name)
 
+#if defined(__APPLE__)
+// Mach-O has no aliases: the weak symbol is a single branch to the
+// implementation (kept out of line so the body is not compiled twice), and a
+// strong definition elsewhere still replaces it.
+#define DEFINE_REX_FUNC(name)                                          \
+  extern "C" __attribute__((noinline)) REX_FUNC(__imp__##name);        \
+  REX_WEAK_FUNC(name) { __imp__##name(ctx, base); }                    \
+  extern "C" __attribute__((noinline)) REX_FUNC(__imp__##name)
+#else
 #define DEFINE_REX_FUNC(name)                                  \
   __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name); \
   REX_EXTERN(__imp__##name)
+#endif
 
 //=============================================================================
 // Function Prologue
@@ -119,10 +129,25 @@ extern PPCFuncMapping PPCFuncMappings[];
 // Memory Access
 //=============================================================================
 
-#if REX_PLATFORM_WIN32
+// Hosts whose allocation granularity exceeds 4 KB (Windows, 64 KB; Apple
+// silicon, 16 KB pages) map the 0xE0 physical heap 0x1000 bytes off.
+#if REX_PLATFORM_WIN32 || REX_PLATFORM_MAC
 #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
 #define REX_PHYS_HOST_OFFSET(addr) 0u
+#endif
+
+// PowerPC memory barriers (sync, lwsync, eieio). x86 orders memory strongly
+// enough that they need no instruction; ARM64, weakly ordered like PowerPC,
+// needs real fences or lock-free guest code observes stale data.
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define REX_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define REX_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
+#define REX_EIEIO() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#else
+#define REX_SYNC() ((void)0)
+#define REX_LWSYNC() ((void)0)
+#define REX_EIEIO() ((void)0)
 #endif
 
 #define REX_RAW_ADDR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))

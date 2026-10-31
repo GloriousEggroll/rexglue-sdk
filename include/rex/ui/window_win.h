@@ -78,6 +78,8 @@ class Win32Window : public Window {
   uint32_t GetCurrentDpi() const;
 
   void ApplyFullscreenEntry(WindowDestructionReceiver& destruction_receiver);
+  // Covers the current monitor; returns false when the window already does.
+  bool FitFullscreenToMonitor();
 
   void HandleSizeUpdate(WindowDestructionReceiver& destruction_receiver);
   // For updating multiple factors that may influence the window size at once,
@@ -115,6 +117,9 @@ class Win32Window : public Window {
   bool batched_size_update_contained_wm_size_ = false;
   bool batched_size_update_contained_wm_paint_ = false;
 
+  // Borderless fullscreen windows resized off the monitor by the window
+  // manager are fitted back a bounded number of times per fullscreen entry.
+  uint32_t fullscreen_refits_ = 0;
   uint32_t pre_fullscreen_dpi_;
   WINDOWPLACEMENT pre_fullscreen_placement_;
   // The client area part of pre_fullscreen_placement_.rcNormalPosition, saved

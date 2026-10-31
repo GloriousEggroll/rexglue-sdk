@@ -186,6 +186,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::shared_ptr<const void> keep_alive;
     // Optional scene inputs for temporal upscaling and frame generation.
     std::shared_ptr<const ui::vulkan::TemporalUpscaleInputs> temporal;
+    // The image is incomplete (draws still waiting on shader compiles): keep
+    // the last presented frame on screen instead of showing this one.
+    bool hold = false;
   };
   using NativeSwapSourceProvider = std::function<std::optional<NativeSwapSource>(
       uint32_t api_frame, uint32_t frontbuffer, uint32_t width, uint32_t height)>;

@@ -80,7 +80,8 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 
   if (proto == Protocol::IPPROTO_VDP) {
     // VDP is a layer on top of UDP.
-    proto = Protocol::IPPROTO_UDP;
+    // IPPROTO_UDP is a plain macro on macOS.
+    proto = static_cast<Protocol>(IPPROTO_UDP);
   }
 
   native_handle_ = socket(af, type, proto);

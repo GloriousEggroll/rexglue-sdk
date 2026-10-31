@@ -8,6 +8,7 @@
 #include <chrono>
 #include <span>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <stdexcept>

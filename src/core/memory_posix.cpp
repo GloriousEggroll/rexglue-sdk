@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <string>
 
 #include <fcntl.h>
@@ -34,6 +35,11 @@
 
 #include <linux/fs.h>
 #include <sys/ioctl.h>
+#endif
+
+#if REX_PLATFORM_MAC
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #endif
 
 #if REX_PLATFORM_ANDROID
@@ -61,6 +67,13 @@ static std::string MakeShmName(const std::filesystem::path& path) {
   if (name.empty() || name[0] != '/') {
     name.insert(name.begin(), '/');
   }
+#if REX_PLATFORM_MAC
+  // Names are limited to PSHMNAMLEN (31) bytes; the name is unlinked right
+  // after creation, so a hash keeps it unique enough.
+  if (name.size() > 31) {
+    name = "/rex_" + std::to_string(std::hash<std::string>{}(name) & 0xFFFFFFFFFFFFull);
+  }
+#endif
   return name;
 }
 
@@ -92,7 +105,7 @@ void AndroidShutdown() {
 #endif
 
 size_t page_size() {
-  return getpagesize();
+  return size_t(sysconf(_SC_PAGESIZE));
 }
 size_t allocation_granularity() {
   return page_size();
@@ -252,6 +265,51 @@ static PageAccess PermsToPageAccess(const char perms[5]) {
 }  // namespace
 #endif  // REX_PLATFORM_LINUX
 
+#if REX_PLATFORM_MAC
+namespace {
+// The mapping covering address, or the next one above it. A Mach call, safe
+// inside the fault handler.
+bool QueryRegion(uintptr_t address, uintptr_t& start, uintptr_t& end, PageAccess& access) {
+  mach_vm_address_t region = address;
+  mach_vm_size_t size = 0;
+  vm_region_basic_info_data_64_t info;
+  mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t object = MACH_PORT_NULL;
+  if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+                     reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS) {
+    return false;
+  }
+  start = uintptr_t(region);
+  end = uintptr_t(region + size);
+  const bool r = info.protection & VM_PROT_READ, w = info.protection & VM_PROT_WRITE,
+             x = info.protection & VM_PROT_EXECUTE;
+  access = !r && !w && !x ? PageAccess::kNoAccess
+           : x            ? (w ? PageAccess::kExecuteReadWrite : PageAccess::kExecuteReadOnly)
+                          : (w ? PageAccess::kReadWrite : PageAccess::kReadOnly);
+  return true;
+}
+
+enum class RangeState { kFree, kMapped, kPartial };
+
+RangeState QueryRange(const void* base, size_t length) {
+  const uintptr_t first = reinterpret_cast<uintptr_t>(base), last = first + length;
+  uintptr_t cursor = first;
+  bool any = false;
+  while (cursor < last) {
+    uintptr_t start, end;
+    PageAccess access;
+    if (!QueryRegion(cursor, start, end, access) || start >= last) {
+      return any ? RangeState::kPartial : RangeState::kFree;
+    }
+    if (start > cursor) return RangeState::kPartial;
+    any = true;
+    cursor = end;
+  }
+  return RangeState::kMapped;
+}
+}  // namespace
+#endif  // REX_PLATFORM_MAC
+
 void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,
                  PageAccess access) {
   // Emulates Windows VirtualAlloc behavior:
@@ -273,6 +331,38 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
       break;
   }
 
+#if REX_PLATFORM_MAC
+  // No MAP_FIXED_NOREPLACE: never replace, commit inside an existing mapping
+  // with mprotect, and map free ranges at the address as a hint.
+  // Guest pages may be smaller than host pages (16 KB): work on the whole host
+  // pages covering the range; committing only makes more memory accessible.
+  if (base_address) {
+    const uintptr_t page = page_size();
+    const uintptr_t first = reinterpret_cast<uintptr_t>(base_address) & ~(page - 1);
+    const uintptr_t last =
+        (reinterpret_cast<uintptr_t>(base_address) + length + page - 1) & ~(page - 1);
+    void* host_base = reinterpret_cast<void*>(first);
+    const size_t host_length = size_t(last - first);
+    switch (QueryRange(host_base, host_length)) {
+      case RangeState::kMapped:
+        if (allocation_type == AllocationType::kReserve) return nullptr;
+        return mprotect(host_base, host_length, static_cast<int>(prot_requested)) == 0
+                   ? base_address
+                   : nullptr;
+      case RangeState::kPartial:
+        return nullptr;
+      case RangeState::kFree:
+        break;
+    }
+    void* hinted = mmap(host_base, host_length, prot_initial, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (hinted == MAP_FAILED) return nullptr;
+    if (hinted != host_base) {
+      munmap(hinted, host_length);
+      return nullptr;
+    }
+    return base_address;
+  }
+#endif
   // Build flags - always use MAP_FIXED_NOREPLACE for fixed addresses
   int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #if defined(MAP_FIXED_NOREPLACE)
@@ -310,6 +400,18 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
 bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocation_type) {
   switch (deallocation_type) {
     case DeallocationType::kDecommit: {
+#if REX_PLATFORM_MAC
+      // Only whole host pages inside the range; their neighbours may be live.
+      {
+        const uintptr_t page = page_size();
+        const uintptr_t first =
+            (reinterpret_cast<uintptr_t>(base_address) + page - 1) & ~(page - 1);
+        const uintptr_t last = (reinterpret_cast<uintptr_t>(base_address) + length) & ~(page - 1);
+        if (last <= first) return true;
+        base_address = reinterpret_cast<void*>(first);
+        length = size_t(last - first);
+      }
+#endif
       // Decommit: remove access first, then release physical pages
       if (mprotect(base_address, length, PROT_NONE) != 0) {
         return false;
@@ -346,6 +448,15 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
       *out_old_access = PermsToPageAccess(e.perms);
     }
   }
+#elif REX_PLATFORM_MAC
+  if (out_old_access) {
+    uintptr_t start, end;
+    PageAccess old_access;
+    if (QueryRegion(reinterpret_cast<uintptr_t>(base_address), start, end, old_access) &&
+        start <= reinterpret_cast<uintptr_t>(base_address)) {
+      *out_old_access = old_access;
+    }
+  }
 #endif
 
   uint32_t prot = ToPosixProtectFlags(access);
@@ -353,7 +464,18 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
-#if !REX_PLATFORM_LINUX
+#if REX_PLATFORM_MAC
+  access_out = PageAccess::kNoAccess;
+  length = 0;
+  const uintptr_t address = reinterpret_cast<uintptr_t>(base_address);
+  uintptr_t start, end;
+  if (!QueryRegion(address, start, end, access_out) || start > address) {
+    access_out = PageAccess::kNoAccess;
+    return false;
+  }
+  length = size_t(end - address);
+  return true;
+#elif !REX_PLATFORM_LINUX
   access_out = PageAccess::kNoAccess;
   length = 0;
   return false;
@@ -511,6 +633,23 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
   }
 
   int flags = MAP_SHARED;
+
+#if REX_PLATFORM_MAC
+  // Map only into a free range, with the address as a hint: probing for a
+  // free base must never replace another mapping, such as the executable or
+  // the C heap (a fully mapped range is no proof of an own reservation).
+  if (base_address) {
+    if (QueryRange(base_address, length) != RangeState::kFree) return nullptr;
+    void* hinted = mmap(base_address, length, ToPosixProtectFlags(access), flags,
+                        static_cast<int>(handle), static_cast<off_t>(file_offset));
+    if (hinted == MAP_FAILED) return nullptr;
+    if (hinted != base_address) {
+      munmap(hinted, length);
+      return nullptr;
+    }
+    return hinted;
+  }
+#endif
 
   // For file views, we need MAP_FIXED to replace existing reservations.
   // The emulator reserves address space first, then maps file views into it.

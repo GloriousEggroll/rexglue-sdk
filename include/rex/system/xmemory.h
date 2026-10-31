@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -31,11 +32,13 @@ class ByteStream;
 
 namespace rex::memory::detail {
 
-/// Compensates for Windows 64KB allocation granularity on the 0xE0 physical heap.
-/// The backing file maps the 0xE0 heap at a 0x1000-byte offset, but MapViewOfFileEx
-/// rounds down to 64KB boundaries. Linux mmap handles 4KB offsets natively.
+/// Compensates for allocation granularity above 4 KB on the 0xE0 physical heap
+/// (Windows, 64 KB; Apple silicon, 16 KB pages). The backing file maps the 0xE0
+/// heap at a 0x1000-byte offset, but views start on granularity boundaries.
+/// Linux mmap handles 4KB offsets natively. Must agree with the generated
+/// REX_PHYS_HOST_OFFSET and the runtime check in Memory::Initialize.
 constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
-#if REX_PLATFORM_WIN32
+#if REX_PLATFORM_WIN32 || REX_PLATFORM_MAC
   return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
 #else
   return 0u;
@@ -416,6 +419,13 @@ class Memory {
   };
   static constexpr size_t kMaxExternalHostWrites=4096;
   ExternalHostWrite BeginExternalHostWrite(void* destination,size_t length);
+  // Host code (not the OS) is about to write [destination, +length) through a
+  // guest memory view. Retires certified snapshots of those pages and restores
+  // their write access up front, one protection change per run, instead of a
+  // write fault per page. Ownership callbacks are not invoked: the write
+  // reaches them exactly as an unprepared one would. False if a page could not
+  // be restored; the write then faults as before.
+  bool PrepareHostWrite(void* destination,size_t length);
   // Exact active OS-writer overlap, independent of optional byte certificates.
   // Hold the global critical region through the subsequent arm/copy to prevent
   // a new overlapping writer from being admitted after this check.
@@ -617,6 +627,7 @@ class Memory {
   bool HasAnyFunctionTable() const;
 
  private:
+  std::array<uintptr_t,4> PhysicalSnapshotAliases() const noexcept;
   bool IsSnapshotHostRange(void* base,size_t length) const noexcept;
   std::unique_lock<std::recursive_mutex> AcquireSnapshotMutationLock();
   bool ProtectHostMemory(void* base,size_t length,PageAccess access,

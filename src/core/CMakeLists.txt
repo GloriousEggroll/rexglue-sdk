@@ -76,7 +76,9 @@ target_include_directories(rexcore PRIVATE
     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
 )
 
-if(UNIX)
+if(APPLE)
+    target_link_libraries(rexcore PRIVATE pthread dl)
+elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()
 
@@ -101,4 +103,13 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
     target_sources(rexcore PRIVATE perf/counter.cpp)
     target_compile_definitions(rexcore PUBLIC
         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
+endif()
+
+if(APPLE)
+    # The ucontext routines used by fibers need X/Open, which also changes the
+    # size of ucontext_t; every user of the SDK headers must agree on it.
+    # Darwin's extensions stay visible.
+    target_compile_definitions(rexcore PUBLIC
+        $<$<COMPILE_LANGUAGE:CXX>:_XOPEN_SOURCE=700>
+        $<$<COMPILE_LANGUAGE:CXX>:_DARWIN_C_SOURCE>)
 endif()

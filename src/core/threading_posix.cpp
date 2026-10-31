@@ -13,6 +13,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <signal.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cerrno>
@@ -24,8 +25,13 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <pthread.h>
 #include <semaphore.h>
+#if REX_PLATFORM_LINUX
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
+#endif
+#if REX_PLATFORM_MAC
+#include <mach/mach.h>
+#endif
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -109,6 +115,17 @@ enum class SignalType {
   k_Count
 };
 
+#if REX_PLATFORM_MAC
+// No real-time signals: the two user signals, in SignalType order.
+int GetSystemSignal(SignalType num) {
+  static_assert(size_t(SignalType::k_Count) <= 2);
+  return num == SignalType::kThreadSuspend ? SIGUSR1 : SIGUSR2;
+}
+
+SignalType GetSystemSignalType(int num) {
+  return num == SIGUSR1 ? SignalType::kThreadSuspend : SignalType::kThreadUserCallback;
+}
+#else
 int GetSystemSignal(SignalType num) {
   auto result = SIGRTMIN + static_cast<int>(num);
   assert_true(result < SIGRTMAX);
@@ -118,6 +135,41 @@ int GetSystemSignal(SignalType num) {
 SignalType GetSystemSignalType(int num) {
   return static_cast<SignalType>(num - SIGRTMIN);
 }
+#endif
+
+// Wakes a thread that suspended itself from its signal handler; posting and
+// waiting must be async-signal-safe.
+#if REX_PLATFORM_MAC
+class SuspendSemaphore {
+ public:
+  SuspendSemaphore() { semaphore_create(mach_task_self(), &semaphore_, SYNC_POLICY_FIFO, 0); }
+  ~SuspendSemaphore() { semaphore_destroy(mach_task_self(), semaphore_); }
+  void Post() { semaphore_signal(semaphore_); }
+  void Wait() {
+    while (semaphore_wait(semaphore_) == KERN_ABORTED) {
+    }
+  }
+
+ private:
+  semaphore_t semaphore_ = 0;
+};
+#else
+class SuspendSemaphore {
+ public:
+  SuspendSemaphore() { sem_init(&semaphore_, 0, 0); }
+  ~SuspendSemaphore() { sem_destroy(&semaphore_); }
+  void Post() { sem_post(&semaphore_); }
+  void Wait() {
+    int ret;
+    do {
+      ret = sem_wait(&semaphore_);
+    } while (ret == -1 && errno == EINTR);
+  }
+
+ private:
+  sem_t semaphore_;
+};
+#endif
 
 std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_handler_installed =
     {};
@@ -145,7 +197,13 @@ void EnableAffinityConfiguration() {}
 // uint64_t ticks() { return mach_absolute_time(); }
 
 uint32_t current_thread_system_id() {
+#if REX_PLATFORM_MAC
+  uint64_t id = 0;
+  pthread_threadid_np(nullptr, &id);
+  return static_cast<uint32_t>(id);
+#else
   return static_cast<uint32_t>(syscall(SYS_gettid));
+#endif
 }
 
 void MaybeYield() {
@@ -278,13 +336,16 @@ class PosixConditionBase {
         wait_result = pthread_cond_timedwait(cond_.native_handle(), native_mutex, &absolute);
 #endif
       }
+#if REX_PLATFORM_LINUX
       if (wait_result == EOWNERDEAD) {
         // The mutex is owned by this waiter. Repair it before evaluating or
         // updating the protected event/semaphore/thread state.
         if (pthread_mutex_consistent(native_mutex) != 0) {
           return WaitResult::kFailed;
         }
-      } else if (wait_result == ENOTRECOVERABLE) {
+      } else
+#endif
+      if (wait_result == ENOTRECOVERABLE) {
         // Unlike EOWNERDEAD, this result does not acquire the mutex. Prevent
         // unique_lock from attempting to unlock a mutex the waiter does not own.
         lock.release();
@@ -634,7 +695,6 @@ class PosixCondition<Thread> : public PosixConditionBase {
         exit_code_(0),
         state_(State::kUninitialized),
         suspend_count_(0) {
-    sem_init(&suspend_sem_, 0, 0);
 #if REX_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
 #endif
@@ -676,7 +736,6 @@ class PosixCondition<Thread> : public PosixConditionBase {
         exit_code_(0),
         state_(State::kRunning),
         suspend_count_(0) {
-    sem_init(&suspend_sem_, 0, 0);
 #if REX_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
 #endif
@@ -720,7 +779,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
     WaitStarted();
     std::unique_lock<std::mutex> lock(state_mutex_);
     if (state_ != State::kUninitialized && state_ != State::kFinished) {
+#if REX_PLATFORM_MAC
+      // macOS only names the calling thread.
+      if (pthread_equal(thread_, pthread_self())) pthread_setname_np(std::string(name).c_str());
+#else
       pthread_setname_np(thread_, std::string(name).c_str());
+#endif
 #if REX_PLATFORM_ANDROID
       SetAndroidPreApi26Name(name);
 #endif
@@ -738,6 +802,17 @@ class PosixCondition<Thread> : public PosixConditionBase {
   }
 #endif
 
+#if REX_PLATFORM_MAC
+  uint32_t system_id() const { return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(thread_)); }
+
+  // macOS has no thread affinity; threads may run on any core.
+  uint64_t affinity_mask() {
+    const long count = std::clamp(sysconf(_SC_NPROCESSORS_ONLN), 1L, 64L);
+    return count == 64 ? ~uint64_t(0) : (uint64_t(1) << count) - 1;
+  }
+
+  void set_affinity_mask(uint64_t) {}
+#else
   uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
 
   uint64_t affinity_mask() {
@@ -780,6 +855,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
     }
 #endif
   }
+#endif
 
   int priority() {
     WaitStarted();
@@ -835,6 +911,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #if REX_PLATFORM_ANDROID
     int result = sigqueue(pthread_gettid_np(thread_),
                           GetSystemSignal(SignalType::kThreadUserCallback), value);
+#elif REX_PLATFORM_MAC
+    // The signal only wakes the thread; no value is needed.
+    (void)value;
+    int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
 #else
     int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
 #endif
@@ -881,7 +961,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (suspend_count_ == 0 && state_ == State::kSuspended) {
       state_ = State::kRunning;
       // Async-signal-safe wakeup for WaitSuspended() from signal handler path.
-      sem_post(&suspend_sem_);
+      suspend_sem_.Post();
     }
     state_signal_.notify_all();
     return true;
@@ -956,13 +1036,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
     state_signal_.wait(lock, [this] { return state_ != State::kUninitialized; });
   }
 
-  /// Uses sem_wait because it may be called from signal handler context.
-  void WaitSuspended() {
-    int ret;
-    do {
-      ret = sem_wait(&suspend_sem_);
-    } while (ret == -1 && errno == EINTR);
-  }
+  /// Async-signal-safe: may be called from signal handler context.
+  void WaitSuspended() { suspend_sem_.Wait(); }
 
   void* native_handle() const override { return reinterpret_cast<void*>(thread_); }
 
@@ -973,14 +1048,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (thread_) {
       pthread_join(thread_, nullptr);
     }
-    sem_destroy(&suspend_sem_);
   }
   pthread_t thread_;
   bool signaled_;
   int exit_code_;
   State state_;             // Protected by state_mutex_
   uint32_t suspend_count_;  // Protected by state_mutex_
-  sem_t suspend_sem_;
+  SuspendSemaphore suspend_sem_;
   mutable std::mutex state_mutex_;
   mutable std::mutex callback_mutex_;
   mutable std::condition_variable state_signal_;
@@ -1446,7 +1520,11 @@ void Thread::Exit(int exit_code) {
 }
 
 void set_current_thread_name(const std::string_view name) {
+#if REX_PLATFORM_MAC
+  pthread_setname_np(std::string(name).c_str());
+#else
   pthread_setname_np(pthread_self(), std::string(name).c_str());
+#endif
 #if REX_PLATFORM_ANDROID
   if (!android_pthread_getname_np_ && current_thread_) {
     current_thread_->condition().SetAndroidPreApi26Name(name);

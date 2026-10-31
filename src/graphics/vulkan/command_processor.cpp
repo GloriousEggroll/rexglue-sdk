@@ -3203,6 +3203,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     }
   }
 
+  if (native_source && native_source->hold) {
+    EndSubmission(true);
+    return;
+  }
   bool skip_present_due_async_placeholder = !native_source && REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
   if (skip_present_due_async_placeholder) {

@@ -145,9 +145,16 @@ bool Memory::SetCertifiedPhysicalSnapshotsEnabled(bool enabled) {
   auto lock=global_critical_region_.Acquire();
   if(!enabled)return !certified_snapshots_ || certified_snapshots_->Disable();
   if(external_snapshot_writers_)return false;
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX || REX_PLATFORM_WIN32
+  // The tracker protects individual 4 KiB pages of every alias. Windows maps
+  // views on 64 KiB boundaries (the 0xE0000000 view at file offset 0 with a
+  // 0x1000 host address offset, see PhysicalSnapshotAliases) but protects 4 KiB
+  // pages, so only the page size must match.
   if(system_page_size_!=PhysicalSnapshotTracker::kPage ||
+     system_allocation_granularity_%PhysicalSnapshotTracker::kPage ||
+#if REX_PLATFORM_LINUX
      system_allocation_granularity_!=PhysicalSnapshotTracker::kPage ||
+#endif
      !virtual_membase_ || !physical_membase_ || !mmio_handler_)return false;
   if(!certified_snapshots_) {
     PhysicalSnapshotTracker::Host host{};
@@ -203,11 +210,8 @@ bool Memory::SetCertifiedPhysicalSnapshotsEnabled(bool enabled) {
       return rex::memory::Protect(reinterpret_cast<void*>(address),bytes,
           access==PhysicalSnapshotTracker::Access::ReadWrite?PageAccess::kReadWrite:PageAccess::kReadOnly);
     };
-    const auto base=reinterpret_cast<uintptr_t>(virtual_membase_);
     try {
-      certified_snapshots_=std::make_unique<PhysicalSnapshotTracker>(host,
-          std::array<uintptr_t,4>{reinterpret_cast<uintptr_t>(physical_membase_),
-                                 base+0xA0000000ull,base+0xC0000000ull,base+0xDFFFF000ull});
+      certified_snapshots_=std::make_unique<PhysicalSnapshotTracker>(host,PhysicalSnapshotAliases());
     } catch(...) { return false; }
     snapshot_tracking_installed_.store(true,std::memory_order_release);
   }
@@ -216,8 +220,7 @@ bool Memory::SetCertifiedPhysicalSnapshotsEnabled(bool enabled) {
   certified_snapshots_->Enable();
   return certified_snapshots_->enabled();
 #else
-  // Existing platform primitives compile everywhere. Windows is deliberately
-  // unsupported until its aliases, granularity and fault fixture are verified.
+  // Mac pages are 16 KiB, larger than the tracker's 4 KiB page.
   return false;
 #endif
 }
@@ -299,13 +302,20 @@ PhysicalSnapshotTracker::Stats Memory::certified_physical_snapshot_stats() {
   return certified_snapshots_?certified_snapshots_->stats():PhysicalSnapshotTracker::Stats{};
 }
 
+// Host address of physical address 0 in each view the tracker protects: the
+// raw physical view, then the 0xA0000000, 0xC0000000 and 0xE0000000 heaps.
+// The 0xE0000000 heap maps physical P at guest 0xE0000000+P-0x1000; with a
+// host address offset the view itself starts at file offset 0 instead.
+std::array<uintptr_t,4> Memory::PhysicalSnapshotAliases() const noexcept {
+  const auto v=reinterpret_cast<uintptr_t>(virtual_membase_);
+  return {reinterpret_cast<uintptr_t>(physical_membase_),v+0xA0000000ull,v+0xC0000000ull,
+          v+0xE0000000ull+heaps_.vE0000000.host_address_offset()-0x1000ull};
+}
 bool Memory::IsSnapshotHostRange(void* base,size_t length) const noexcept {
   if(!virtual_membase_ || !physical_membase_ || !length)return false;
   const auto address=reinterpret_cast<uintptr_t>(base);
   if(length>UINTPTR_MAX-address)return true;
-  const auto v=reinterpret_cast<uintptr_t>(virtual_membase_);
-  for(auto alias:std::array<uintptr_t,4>{reinterpret_cast<uintptr_t>(physical_membase_),
-                                       v+0xA0000000ull,v+0xC0000000ull,v+0xDFFFF000ull})
+  for(auto alias:PhysicalSnapshotAliases())
     if(address<alias+PhysicalSnapshotTracker::kEnd && address+length>alias+PhysicalSnapshotTracker::kFirst)return true;
   return false;
 }
@@ -322,6 +332,12 @@ void* Memory::AllocateHostMemory(void* base,size_t length,AllocationType type,Pa
   if(certified_snapshots_ && !certified_snapshots_->BeforeHostMutation(
       reinterpret_cast<uintptr_t>(base),length))return nullptr;
   return rex::memory::AllocFixed(base,length,type,access);
+}
+bool Memory::PrepareHostWrite(void* destination,size_t length) {
+  if(!IsSnapshotHostRange(destination,length))return true;
+  auto lock=AcquireSnapshotMutationLock();
+  return !certified_snapshots_||certified_snapshots_->BeforeHostMutation(
+      reinterpret_cast<uintptr_t>(destination),length);
 }
 void Memory::InvalidateHostSnapshot(void* base,size_t length) {
   if(!IsSnapshotHostRange(base,length))return;
@@ -457,6 +473,15 @@ bool Memory::Initialize() {
                               0x20000000, 16 * 1024 * 1024, &heaps_.physical);
   heaps_.vE0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xE0000000,
                               0x1FD00000, 4096, &heaps_.physical);
+  // Recompiled code adds the 0xE0 heap's host offset at compile time; it
+  // must match the offset this host's allocation granularity requires.
+  if (heaps_.vE0000000.host_address_offset() !=
+      memory::detail::PhysicalHostOffset(0xE0000000u)) {
+    REXSYS_ERROR("0xE0000000 heap host offset {:#x} does not match the compiled offset {:#x}",
+                 heaps_.vE0000000.host_address_offset(),
+                 memory::detail::PhysicalHostOffset(0xE0000000u));
+    return false;
+  }
 
   // Protect the first and last 64kb of memory.
   heaps_.v00000000.AllocFixed(0x00000000, 0x10000, 0x10000,
@@ -1835,6 +1860,13 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
 
     if (old_protect) {
       *old_protect = FromPageAccess(old_protect_access);
+    }
+  } else if (rex::memory::page_size() > page_size_) {
+    // Host pages are larger than this heap's (16 KB on Apple silicon) and may
+    // hold other allocations: the host keeps the range accessible, and only
+    // the page table records the guest protection.
+    if (old_protect) {
+      *old_protect = page_table_[start_page_number].current_protect;
     }
   } else {
     REXSYS_WARN("BaseHeap::Protect: ignoring request as not 4k page aligned");

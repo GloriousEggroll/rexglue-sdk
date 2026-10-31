@@ -45,6 +45,9 @@
 #if REX_PLATFORM_WIN32
 #include <rex/ui/surface_win.h>
 #endif
+#if REX_PLATFORM_MAC
+#include <rex/ui/window_sdl.h>
+#endif
 
 REXCVAR_DECLARE(bool, vsync);
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -896,6 +899,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
     type_flags |= Surface::kTypeFlag_Win32Hwnd;
   }
 #endif
+#if REX_PLATFORM_MAC
+  if (instance_extensions.ext_EXT_metal_surface) {
+    type_flags |= Surface::kTypeFlag_MetalLayer;
+  }
+#endif
   return type_flags;
 }
 
@@ -1209,6 +1217,10 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   if (new_surface.GetType() == Surface::kTypeIndex_WaylandWindow) {
     hdr_display = static_cast<WaylandWindowSurface&>(new_surface).GetHdrDisplay();
   }
+#elif REX_PLATFORM_WIN32
+  if (new_surface.GetType() == Surface::kTypeIndex_Win32Hwnd) {
+    hdr_display = static_cast<Win32HwndSurface&>(new_surface).GetHdrDisplay();
+  }
 #endif
   paint_context_.display_peak_nits = hdr_display.peak_nits;
 
@@ -1299,6 +1311,15 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         surface_create_info.hwnd = win32_hwnd_surface.hwnd();
         vulkan_surface_create_result = ifn.vkCreateWin32SurfaceKHR(
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
+#endif
+#if REX_PLATFORM_MAC
+      case Surface::kTypeIndex_MetalLayer: {
+        VkMetalSurfaceCreateInfoEXT info{VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT};
+        info.pLayer = static_cast<const CAMetalLayer*>(
+            static_cast<const MetalLayerSurface&>(new_surface).layer());
+        vulkan_surface_create_result = ifn.vkCreateMetalSurfaceEXT(
+            instance, &info, nullptr, &paint_context_.vulkan_surface);
       } break;
 #endif
       default:

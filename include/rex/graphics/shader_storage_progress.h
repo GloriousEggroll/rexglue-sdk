@@ -9,7 +9,8 @@ namespace rex::graphics {
 // A locked snapshot keeps counts and phase consistent during phase changes.
 class ShaderStorageProgress {
  public:
-  enum class Phase { kReading, kShaders, kPipelines, kComplete };
+  // kFinding: scanning the game's files for shaders to compile ahead of time.
+  enum class Phase { kReading, kFinding, kShaders, kPipelines, kComplete };
   enum class Outcome { kPrepared, kSkipped, kFailed };
   struct Snapshot {
     Phase phase = Phase::kReading;

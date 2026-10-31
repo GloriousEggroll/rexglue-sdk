@@ -13,6 +13,8 @@
 
 #include <rex/memory/utils.h>
 
+#include <algorithm>
+
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_SYSTEM | \
                             WINAPI_PARTITION_GAMES)
 #define REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
@@ -170,10 +172,40 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   return true;
 }
 
-bool QueryProtectPages(std::span<const PageProtectionQuery>) {
-  // The optional batch proof remains unsupported until its Windows mapping
-  // fixture is validated. Existing point queries and exact fallback remain.
-  return false;
+bool QueryProtectPages(std::span<const PageProtectionQuery> requests) {
+  // Same bounds and refusals as the POSIX implementation. VirtualQuery reports
+  // the run of identically protected pages from a page-aligned address, so one
+  // call fills many pages; uncommitted pages count as no access.
+  constexpr size_t kMaximumRanges = 16, kMaximumPages = 16384;
+  if (requests.empty() || requests.size() > kMaximumRanges) return false;
+  const size_t page = page_size();
+  if (!page) return false;
+  size_t total = 0;
+  for (const auto& request : requests) {
+    if (!request.address || request.address % page || request.pages.empty() ||
+        request.pages.size() > kMaximumPages - total ||
+        request.pages.size() > (UINTPTR_MAX - request.address) / page)
+      return false;
+    total += request.pages.size();
+  }
+  for (const auto& request : requests) {
+    size_t filled = 0;
+    while (filled < request.pages.size()) {
+      const uintptr_t cursor = request.address + filled * page;
+      MEMORY_BASIC_INFORMATION info{};
+      if (!VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info))) return false;
+      const uintptr_t region = reinterpret_cast<uintptr_t>(info.BaseAddress);
+      if (region != cursor || !info.RegionSize || info.RegionSize % page) return false;
+      if (info.State == MEM_FREE) return false;  // A required mapping has a gap.
+      if (info.State == MEM_COMMIT && (info.Protect & PAGE_GUARD)) return false;
+      const PageAccess access =
+          info.State == MEM_COMMIT ? ToXeniaProtectFlags(info.Protect) : PageAccess::kNoAccess;
+      const size_t count = std::min(info.RegionSize / page, request.pages.size() - filled);
+      std::fill_n(request.pages.begin() + filled, count, access);
+      filled += count;
+    }
+  }
+  return true;
 }
 
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,

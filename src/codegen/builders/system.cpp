@@ -31,20 +31,23 @@ bool build_attn(BuilderContext& ctx) {
 }
 
 bool build_sync(BuilderContext& ctx) {
-  // Memory barrier, x86 has strong ordering so this is a no-op
-  (void)ctx;
+  // Memory barrier: no instruction on strongly ordered x86, a fence on
+  // weakly ordered hosts (ARM64); see REX_SYNC in the generated header.
+  ctx.println("\tREX_SYNC();");
   return true;
 }
 
 bool build_lwsync(BuilderContext& ctx) {
-  // Lightweight memory barrier, x86 has strong ordering so this is a no-op
-  (void)ctx;
+  // Memory barrier: no instruction on strongly ordered x86, a fence on
+  // weakly ordered hosts (ARM64); see REX_LWSYNC in the generated header.
+  ctx.println("\tREX_LWSYNC();");
   return true;
 }
 
 bool build_eieio(BuilderContext& ctx) {
-  // Enforce in-order execution of I/O, x86 has strong ordering so this is a no-op
-  (void)ctx;
+  // Memory barrier: no instruction on strongly ordered x86, a fence on
+  // weakly ordered hosts (ARM64); see REX_EIEIO in the generated header.
+  ctx.println("\tREX_EIEIO();");
   return true;
 }
 

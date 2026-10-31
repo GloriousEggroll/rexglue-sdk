@@ -97,6 +97,15 @@
 
 #if REX_PLATFORM_MAC
 #include <libkern/OSByteOrder.h>
+// Files and offsets are always 64-bit on macOS; the Linux *64 names alias them.
+#define off64_t off_t
+#define stat64 stat
+#define fstat64 fstat
+#define lseek64 lseek
+#define ftello64 ftello
+#define fseeko64 fseeko
+#define ftruncate64 ftruncate
+#define mmap64 mmap
 #endif  // REX_PLATFORM_MAC
 
 #include <bit>
