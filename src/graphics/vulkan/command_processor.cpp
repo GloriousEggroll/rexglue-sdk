@@ -3334,6 +3334,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+  if (REXCVAR_GET(present_frontbuffer_aspect)) {
+    display_width = std::max(uint32_t(1), guest_output_width);
+    display_height = std::max(uint32_t(1), guest_output_height);
+  }
 
   if (REXCVAR_GET(present_anti_lag)) {
     UpdateAntiLag(true, external_frame_number_);

@@ -35,6 +35,9 @@ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
 
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
+REXCVAR_DEFINE_BOOL(present_frontbuffer_aspect, false, "UI/Presenter",
+                    "Show the guest's front buffer at its own aspect ratio instead of the video "
+                    "mode's, for titles rendering at a non-console size");
 
 REXCVAR_DEFINE_INT32(present_safe_area_x, 90, "UI/Presenter",
                      "Horizontal safe area percentage (0-100)")
