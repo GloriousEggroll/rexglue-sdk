@@ -102,6 +102,13 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
 std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
                                                          const XCONTENT_AGGREGATE_DATA& data) {
   uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+  // Aggregate data from the title (XamContentCreateInternal) may name the
+  // user by another XUID than the signed-in profile's (e.g. its online one);
+  // there is only one local user, so use the profile's content then.
+  if (used_xuid != xuid && xuid != 0 &&
+      !std::filesystem::exists(root_path_ / fmt::format("{:016X}", used_xuid))) {
+    used_xuid = xuid;
+  }
 
   // DLCs are stored in common directory
   if (data.content_type == XContentType::kMarketplaceContent) {
@@ -110,7 +117,8 @@ std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
 
   // Content path:
   // content_root/xuid/title_id/content_type/data_file_name/
-  auto package_root = ResolvePackageRoot(used_xuid, data.content_type, data.title_id);
+  const uint32_t title_id = data.title_id ? uint32_t(data.title_id) : kCurrentlyRunningTitleId;
+  auto package_root = ResolvePackageRoot(used_xuid, data.content_type, title_id);
   return package_root / rex::to_path(data.file_name());
 }
 

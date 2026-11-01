@@ -105,9 +105,17 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
     return result;
   }
 
-  if (REXCVAR_GET(xex_apply_patches)) {
-    // Search for xexp patch file
+  // A patch is itself a XEX (default.xexp); it has no patch of its own.
+  const bool is_patch_file = path_.size() > 5 && (path_.back() == 'p' || path_.back() == 'P');
+  if (REXCVAR_GET(xex_apply_patches) && !is_patch_file) {
+    // Search for xexp patch file: beside the XEX, or in a title update
+    // mounted as update: (named after the XEX, e.g. update:\default.xexp).
     auto patch_entry = kernel_state_->file_system()->ResolvePath(path_ + "p");
+    if (!patch_entry) {
+      const auto slash = path_.find_last_of("\\/");
+      const auto name = slash == std::string::npos ? path_ : path_.substr(slash + 1);
+      patch_entry = kernel_state_->file_system()->ResolvePath("update:\\" + name + "p");
+    }
 
     if (patch_entry) {
       auto patch_path = patch_entry->absolute_path();

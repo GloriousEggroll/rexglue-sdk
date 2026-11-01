@@ -220,6 +220,13 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
                      content_license);
       }
     }
+    if (content_data.content_type != XContentType::kMarketplaceContent) {
+      REXKRNL_INFO("Content {} (type {:08X}, user {:016X}, data user {:016X} title {:08X} device {:08X}) as {}: "
+                   "flags {:08X}, disposition {}, result {:08X}",
+                   content_data.file_name(), uint32_t(XContentType(content_data.content_type)), xuid,
+                   uint64_t(content_data.xuid), uint32_t(content_data.title_id), uint32_t(content_data.device_id),
+                   root_name, uint32_t(flags), uint32_t(disposition), result);
+    }
 
     if (license_mask_ptr && XSUCCEEDED(result)) {
       *license_mask_ptr = content_license;

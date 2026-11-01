@@ -23,6 +23,7 @@
 #include <rex/codegen/binary_view.h>
 #include <rex/codegen/codegen.h>
 #include <rex/codegen/codegen_context.h>
+#include <rex/system/flags.h>
 #include <rex/codegen/codegen_writer.h>
 #include <rex/codegen/config.h>
 #include <rex/codegen/template_registry.h>
@@ -171,7 +172,20 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
                                  entryXexPath.string(), gameRoot.string()));
   }
 
-  auto runtime = std::make_unique<Runtime>(gameRoot.string());
+  // A title update's patch (patch_file_path, a default.xexp) is applied to the
+  // entrypoint as the game would load it: its folder is mounted as update:.
+  fs::path updateRoot;
+  if (!entryConfig.patchFilePath.empty()) {
+    auto patch = configDir / entryConfig.patchFilePath;
+    if (!fs::is_regular_file(patch)) {
+      return Err<void>(ErrorCategory::IO,
+                       fmt::format("Title update patch not found: {}", patch.string()));
+    }
+    updateRoot = fs::canonical(patch).parent_path();
+    REXCVAR_SET(xex_apply_patches, true);
+  }
+
+  auto runtime = std::make_unique<Runtime>(gameRoot.string(), fs::path{}, updateRoot);
   auto rtStatus = runtime->Setup(rex::RuntimeConfig{
       .kernel_init = rex::kernel::InitializeKernel,
       .tool_mode = true,
