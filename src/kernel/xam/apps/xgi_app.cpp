@@ -179,14 +179,31 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           session.members.push_back(member);
         }
       });
+      Network::Get().HostingChanged();
       return X_E_SUCCESS;
     }
     case 0x000B0013: {
-      // XSessionJoinRemote(session, count, xuids, private slots)
+      // XSessionJoinRemote(session, count, xuids, private slots); with no
+      // XUIDs, local players leaving: (session, count, 0, user indices).
       uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t xuid_count = memory::load_and_swap<uint32_t>(buffer + 4);
       uint32_t xuids_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
       uint32_t private_slots_array = memory::load_and_swap<uint32_t>(buffer + 12);
+      if (!xuids_ptr) {
+        REXKRNL_INFO("XGISessionLeaveLocal({:08X}, {}, {:08X})", session_ptr, xuid_count,
+                     private_slots_array);
+        Network::Get().WithSession(session_ptr, [&](Network::Session& session) {
+          for (uint32_t i = 0; i < xuid_count && i < 4 && private_slots_array; ++i) {
+            const uint32_t index =
+                memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(private_slots_array + i * 4));
+            std::erase_if(session.members, [&](const Network::Session::Member& member) {
+              return member.user_index == index;
+            });
+          }
+        });
+        Network::Get().HostingChanged();
+        return X_E_SUCCESS;
+      }
       REXKRNL_INFO("XGISessionJoinRemote({:08X}, {}, {:08X}, {:08X})", session_ptr, xuid_count,
                    xuids_ptr, private_slots_array);
       Network::Get().WithSession(session_ptr, [&](Network::Session& session) {
@@ -195,6 +212,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           member.xuid = memory::load_and_swap<uint64_t>(memory_->TranslateVirtual(xuids_ptr + i * 8));
           member.private_slot = private_slots_array &&
               memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(private_slots_array + i * 4));
+          // A player back after a crash may still be listed from before.
+          std::erase_if(session.members, [&](const Network::Session::Member& other) {
+            return other.xuid == member.xuid;
+          });
           session.members.push_back(member);
         }
       });

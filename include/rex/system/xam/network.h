@@ -12,6 +12,11 @@
  * below 1024 maps to 10000 + port on every host OS, keeping Linux and Windows
  * peers compatible without privileges.
  *
+ * Lobby servers (network_lobby_server, network_lan_lobby): traffic goes through
+ * a room on a server instead (network_tunnel.h). Without a configured server
+ * that answers, a game hosting a System Link party runs the server itself
+ * while the party exists, and the other games find it on the LAN.
+ *
  * Several instances on one machine: give each its own loopback address
  * (network_address = 127.0.0.2, 127.0.0.3, ...) and list the others in
  * network_broadcast_peers; broadcasts are then sent to those addresses.
@@ -24,6 +29,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -57,15 +63,18 @@ class Network {
  public:
   static Network& Get();
 
-  // Local IPv4 address in host order: the room's virtual address when playing
-  // through a lobby server (zero until admitted), else network_address, or the
-  // address of the interface with the default route, or loopback.
+  // Local IPv4 address in host order: the virtual address when playing
+  // through a lobby server, else network_address, or the address of the
+  // interface with the default route, or loopback.
   uint32_t local_address();
   // False while joining a lobby room; titles then see a pending address.
   bool address_ready() { return local_address() != 0; }
 
-  // Internet play through a lobby server (network_lobby_server).
+  // Play through a lobby server (network_lobby_server, network_lan_lobby).
   bool tunnel_enabled();
+  // A session was created or deleted: while this machine hosts one and no
+  // configured server is in use, it runs a lobby server for the party.
+  void HostingChanged();
   // True if traffic for `ip` (host order) goes through the lobby tunnel.
   bool TunnelDestination(uint32_t ip);
   bool TunnelSend(uint16_t src_port, uint32_t dst_ip, uint16_t dst_port, const uint8_t* data,
@@ -127,6 +136,7 @@ class Network {
     return true;
   }
   void DeleteSession(uint32_t object);
+  bool HostingSessions();
   // True while any session has a player on another machine, or game traffic
   // from another machine arrived in the last 15 seconds.
   bool RemotePlayersPresent();
@@ -136,6 +146,13 @@ class Network {
   // network_frame_rate_lock while remote players are present so every machine
   // simulates at the same rate.
   static double FrameRateLimit(double limit);
+
+  // A player's game just went away (see NetworkTunnel). The title only notices
+  // by its own timeout, so its connection to that address asks here each frame.
+  void NotePeerGone(uint32_t ip);
+  bool PeerGone(uint32_t ip);
+  // The process is exiting: say goodbye to the room while there is still time.
+  void Shutdown();
 
   // XUserSetContext values (game type, game mode) for session details.
   void SetContext(uint32_t id, uint32_t value);
@@ -158,6 +175,16 @@ class Network {
   uint16_t next_tunnel_port_ = 49152;
   intptr_t wake_socket_ = -1;
   uint16_t wake_port_ = 0;
+  // The party's lobby server while hosting (see HostingChanged).
+  void StartLocalServer();
+  std::mutex host_mutex_;
+  bool local_server_running_ = false;
+  std::thread local_server_thread_;
+  std::chrono::steady_clock::time_point last_hosting_{};
+  std::atomic<bool> shutting_down_{false};
+  std::mutex gone_mutex_;
+  std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> gone_;  // ip -> when
+  std::atomic<bool> any_gone_{false};
 };
 
 }  // namespace rex::system::xam

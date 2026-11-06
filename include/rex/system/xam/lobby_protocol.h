@@ -10,6 +10,12 @@
  * endpoints reach each other. A direct DATA packet carries the sender's token,
  * which the receiver checks against the server's member list; the server sets
  * the token to zero on packets it relays.
+ *
+ * Without a reachable configured server, games look for one on the LAN with
+ * DISCOVER broadcasts to the default port; a game that hosts a System Link
+ * party runs one itself (lobby_server.h). A client asks for the virtual
+ * address it derived from its profile, so its address stays the same
+ * whichever server it ends up on.
  */
 
 #include <array>
@@ -33,7 +39,7 @@ inline constexpr size_t kMaxMembers = 16;
 inline constexpr size_t kNameBytes = 16, kRoomBytes = 32, kPasswordBytes = 32, kReasonBytes = 64;
 
 enum class Type : uint8_t {
-  kHello = 1,      // C->S: xuid, gamertag, title, room, password, nonce
+  kHello = 1,      // C->S: xuid, gamertag, title, room, password, nonce[, requested vip]
   kWelcome = 2,    // S->C: nonce, vip, token, members
   kReject = 3,     // S->C: nonce, reason
   kKeepAlive = 4,  // C->S: vip, token; S->C echo with token zero
@@ -42,6 +48,10 @@ enum class Type : uint8_t {
   kProbe = 7,      // C->C: src vip, token, nonce
   kProbeAck = 8,   // C->C: src vip, token, nonce
   kBye = 9,        // C->S: vip, token
+  kClosing = 10,   // S->C: the server is shutting down
+  kDiscover = 11,  // C->S, LAN broadcast: nonce, title
+  kOffer = 12,     // S->C: nonce, players of that title on the server
+  kNotMember = 13, // S->C: answer to a KEEPALIVE from someone without a seat
 };
 
 inline bool IsVirtual(uint32_t ip) { return (ip & kVirtualMask) == kVirtualNetwork; }

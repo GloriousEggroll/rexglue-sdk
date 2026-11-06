@@ -13,6 +13,8 @@
 #include <rex/system/xam/network_tunnel.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/system/xsocket.h>
+// After xsocket.h: it names enumerators the socket headers define as macros.
+#include <rex/system/xam/lobby_server.h>
 
 #if REX_PLATFORM_WIN32
 #include <winsock2.h>
@@ -27,9 +29,16 @@
 REXCVAR_DEFINE_STRING(network_address, "", "Network",
                       "IPv4 address other players reach you at. Empty detects the address of "
                       "the network interface with the default route");
+REXCVAR_DEFINE_STRING(network_system_link, "auto", "Network",
+                      "System Link mode: lan (a party's host runs the server; others on the local "
+                      "network find it), dedicated (network_lobby_server), auto (dedicated if "
+                      "network_lobby_server is set, else lan)");
 REXCVAR_DEFINE_STRING(network_lobby_server, "", "Network",
-                      "Lobby server for internet play (host or host:port). Empty plays on the "
-                      "local network only");
+                      "Dedicated lobby server (host or host:port) for network_system_link = "
+                      "dedicated");
+REXCVAR_DEFINE_BOOL(network_lan_lobby, true, "Network",
+                    "Without a lobby server that answers, the player who creates a System Link "
+                    "party runs one for it, and other games on the local network find it");
 REXCVAR_DEFINE_STRING(network_lobby_room, "public", "Network",
                       "Room on the lobby server; only players in the same room see each other");
 REXCVAR_DEFINE_STRING(network_lobby_password, "", "Network",
@@ -102,13 +111,25 @@ Network& Network::Get() {
   return *network;
 }
 
+// The dedicated server in use; empty in LAN mode.
+static std::string DedicatedServer() {
+  const std::string mode = REXCVAR_GET(network_system_link);
+  return mode == "lan" ? std::string() : REXCVAR_GET(network_lobby_server);
+}
+
 bool Network::tunnel_enabled() {
-  if (!REXCVAR_GET(network_enabled) || REXCVAR_GET(network_lobby_server).empty()) return false;
+  if (!REXCVAR_GET(network_enabled) ||
+      (DedicatedServer().empty() && !REXCVAR_GET(network_lan_lobby)))
+    return false;
   std::call_once(tunnel_once_, [this] {
     NetworkTunnel::Config config;
-    config.server = REXCVAR_GET(network_lobby_server);
-    config.room = REXCVAR_GET(network_lobby_room);
-    config.password = REXCVAR_GET(network_lobby_password);
+    config.server = DedicatedServer();
+    config.lan = REXCVAR_GET(network_lan_lobby);
+    config.discovery_targets = broadcast_peers();
+    // Rooms and passwords belong to dedicated servers; everyone on a LAN meets
+    // in the same room whatever those settings say.
+    config.room = config.server.empty() ? "public" : REXCVAR_GET(network_lobby_room);
+    config.password = config.server.empty() ? "" : REXCVAR_GET(network_lobby_password);
     if (auto* state = REX_KERNEL_STATE()) {
       config.title_id = state->title_id();
       if (state->user_profile()) {
@@ -117,8 +138,8 @@ bool Network::tunnel_enabled() {
       }
     }
     tunnel_ = std::make_unique<NetworkTunnel>(
-        config, [this](uint32_t src_vip, uint16_t src_port, uint16_t dst_port, const uint8_t* data,
-                       size_t size) {
+        config, [this](uint32_t src_vip, uint16_t src_port, uint16_t dst_port, bool broadcast,
+                       const uint8_t* data, size_t size) {
           uint32_t handle = 0;
           {
             std::lock_guard lock(mutex_);
@@ -128,13 +149,125 @@ bool Network::tunnel_enabled() {
           }
           auto socket = REX_KERNEL_STATE()->object_table()->LookupObject<XSocket>(handle);
           if (!socket) return false;
-          NoteTraffic(src_vip);
+          // Someone browsing the LAN is not someone playing with us.
+          if (!broadcast) NoteTraffic(src_vip);
           socket->QueuePacket(src_vip, src_port, data, size);
           Wake(socket->native_handle());
           return true;
-        });
+        },
+        [this](uint32_t vip) { NotePeerGone(vip); });
   });
   return true;
+}
+
+// This machine's address on the LAN for its own lobby server, so the other
+// players see a reachable endpoint for direct traffic.
+static uint32_t HostAddress() {
+  const std::string configured = REXCVAR_GET(network_address);
+  if (!configured.empty())
+    if (const auto address = ParseIpv4(configured)) return *address;
+  return DetectAddress().value_or(0x7F000001);
+}
+
+bool Network::HostingSessions() {
+  std::lock_guard lock(mutex_);
+  for (const auto& [object, session] : sessions_)
+    if (session.host && session.state != 5)
+      for (const auto& member : session.members)
+        if (member.user_index != 0xFE) return true;
+  return false;
+}
+
+void Network::HostingChanged() {
+  if (shutting_down_ || !tunnel_enabled() || !HostingSessions()) return;
+  std::lock_guard lock(host_mutex_);
+  last_hosting_ = std::chrono::steady_clock::now();
+  if (local_server_running_ || tunnel_->joined_configured()) return;
+  if (local_server_thread_.joinable()) local_server_thread_.join();
+  StartLocalServer();
+}
+
+void Network::StartLocalServer() {
+#if REX_PLATFORM_WIN32
+  using Handle = SOCKET;
+  const auto close_socket = [](Handle h) { ::closesocket(h); };
+#else
+  using Handle = int;
+  const auto close_socket = [](Handle h) { ::close(h); };
+#endif
+  const Handle handle = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(lobby::kDefaultPort);
+  if (::bind(handle, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+    // Usually a server already running on this machine; the LAN search finds it.
+    REXSYS_WARN("Network: cannot host a lobby server on UDP port {}; it is in use",
+                lobby::kDefaultPort);
+    close_socket(handle);
+    return;
+  }
+  local_server_running_ = true;
+  const uint32_t host = HostAddress();
+  REXSYS_INFO("Network: hosting a party; lobby server on UDP {}:{}", Ipv4(host), lobby::kDefaultPort);
+  local_server_thread_ = std::thread([this, handle, close_socket] {
+    lobby::Server server(handle, 16, [](const std::string& line) { REXSYS_INFO("Lobby server: {}", line); });
+    // Runs while the local player is in a hosted session, and a little longer:
+    // titles may replace the party's session with the match's.
+    server.Run([this] {
+      if (shutting_down_) {
+        local_server_running_ = false;
+        return true;
+      }
+      if (HostingSessions()) {
+        std::lock_guard lock(host_mutex_);
+        last_hosting_ = std::chrono::steady_clock::now();
+        return false;
+      }
+      std::lock_guard lock(host_mutex_);
+      if (std::chrono::steady_clock::now() - last_hosting_ < std::chrono::seconds(10)) return false;
+      local_server_running_ = false;
+      return true;
+    });
+    server.Close();
+    close_socket(handle);
+    tunnel_->UseLocalServer(0, 0);
+    REXSYS_INFO("Network: party closed; lobby server stopped");
+  });
+  tunnel_->UseLocalServer(host, lobby::kDefaultPort);
+}
+
+void Network::Shutdown() {
+  shutting_down_ = true;
+  std::thread server;
+  {
+    std::lock_guard lock(host_mutex_);
+    server.swap(local_server_thread_);
+  }
+  if (server.joinable()) server.join();  // It tells the room.
+  // Destroying the tunnel sends BYE. Packets still arriving go nowhere after
+  // this, and sends from the title just report no room.
+  std::call_once(tunnel_once_, [] {});
+  if (tunnel_) tunnel_->Stop();
+}
+
+void Network::NotePeerGone(uint32_t ip) {
+  {
+    std::lock_guard lock(gone_mutex_);
+    gone_[ip] = std::chrono::steady_clock::now();
+  }
+  any_gone_.store(true, std::memory_order_release);
+}
+
+bool Network::PeerGone(uint32_t ip) {
+  if (!any_gone_.load(std::memory_order_acquire)) return false;
+  // Every connection to the address gets a moment to see this; long before the
+  // player could be back, with a new connection, through the title's menus.
+  constexpr auto kNoticeTime = std::chrono::seconds(2);
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard lock(gone_mutex_);
+  std::erase_if(gone_, [&](const auto& entry) { return now - entry.second > kNoticeTime; });
+  if (gone_.empty()) any_gone_.store(false, std::memory_order_release);
+  return gone_.contains(ip);
 }
 
 bool Network::TunnelDestination(uint32_t ip) {
@@ -324,13 +457,16 @@ uint32_t Network::SessionObject(uint32_t handle) {
 }
 
 void Network::DeleteSession(uint32_t object) {
-  std::lock_guard lock(mutex_);
-  if (auto it = sessions_.find(object); it != sessions_.end()) {
-    keys_.erase(KidKey(it->second.info.id));
-    it->second = Session{};
-    it->second.object = object;
-    it->second.state = 5;  // XSESSION_STATE_DELETED
+  {
+    std::lock_guard lock(mutex_);
+    if (auto it = sessions_.find(object); it != sessions_.end()) {
+      keys_.erase(KidKey(it->second.info.id));
+      it->second = Session{};
+      it->second.object = object;
+      it->second.state = 5;  // XSESSION_STATE_DELETED
+    }
   }
+  HostingChanged();
 }
 
 void Network::NoteTraffic(uint32_t ip) {
