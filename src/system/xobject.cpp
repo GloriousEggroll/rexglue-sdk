@@ -383,15 +383,36 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
     as_type = header->type;
   }
 
+  const uint32_t guest_address = kernel_state->memory()->HostToGuestVirtual(native_ptr);
   if (header->wait_list_flink == kXObjSignature) {
-    // Already initialized.
-    // TODO: assert if the type of the object != as_type
+    // Already initialized - unless the guest reused the memory of an object
+    // that is gone (a struct on the stack or freed heap keeps the signature):
+    // the stashed handle then names nothing, or a newer object of another
+    // type or at another address, which callers would cast to the type they
+    // expect (KeSetEvent on such an "event" crashed on a null host event).
     uint32_t handle = header->wait_list_blink;
     auto object = kernel_state->object_table()->LookupObject<XObject>(handle);
-
-    // TODO(benvanik): assert nothing has been changed in the struct.
-    return object;
-  } else {
+    Type expected = Type::Undefined;
+    switch (as_type) {
+      case 0:
+      case 1:
+        expected = Type::Event;
+        break;
+      case 2:
+        expected = Type::Mutant;
+        break;
+      case 5:
+        expected = Type::Semaphore;
+        break;
+    }
+    if (object && (expected == Type::Undefined || object->type() == expected) &&
+        (!object->guest_object_ptr_ || object->guest_object_ptr_ == guest_address)) {
+      return object;
+    }
+    REXKRNL_WARN("Native object at {:08X}: stale handle {:08X}, initializing it anew",
+                 guest_address, handle);
+  }
+  {
     // First use, create new.
     // https://www.nirsoft.net/kernel_struct/vista/KOBJECTS.html
     XObject* object = nullptr;
@@ -438,6 +459,11 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
     // Stash pointer in struct.
     // FIXME: This assumes the object contains a dispatch header (some don't!)
     StashHandle(header, object->handle());
+    // Remembered so a later lookup can tell this object from one that reused
+    // the memory; never freed, as allocated_guest_object_ stays false.
+    if (!object->guest_object_ptr_) {
+      object->guest_object_ptr_ = guest_address;
+    }
 
     return object_ref<XObject>(object);
   }

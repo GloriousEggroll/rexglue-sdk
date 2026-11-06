@@ -35,6 +35,10 @@ REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, !REX_PLATFORM_MAC, "UI/Vulka
                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
                     "fallback primitive emulation paths)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vulkan_ray_tracing, true, "UI/Vulkan",
+                    "Enable ray queries and transform feedback when the GPU supports them, for "
+                    "renderers that add ray-traced effects")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, true, "UI/Vulkan",
                     "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
                     "allow fallback to solid fill for line/point polygon modes)")
@@ -201,6 +205,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // #477. Also exposed by Mesa's anti-lag layer.
     XE_UI_VULKAN_STRUCT_EXTENSION(AMD_anti_lag)
   }
+  if (with_gpu_emulation && get_physical_device_properties2_supported &&
+      properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0) && REXCVAR_GET(vulkan_ray_tracing)) {
+    XE_UI_VULKAN_STRUCT_EXTENSION(KHR_acceleration_structure)
+    XE_UI_VULKAN_STRUCT_EXTENSION(KHR_ray_query)
+    XE_UI_VULKAN_STRUCT_EXTENSION(KHR_deferred_host_operations)
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_transform_feedback)
+  }
   std::vector<std::unique_ptr<bool>> vendor_extensions_enabled;
   for (const std::string& name :
        GetVendorUpscalerDeviceExtensions(vulkan_instance->instance(), physical_device)) {
@@ -354,6 +365,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceAntiLagFeaturesAMD,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD>
       features_AMD_anti_lag;
+  VulkanFeatures<VkPhysicalDeviceAccelerationStructureFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR>
+      features_KHR_acceleration_structure;
+  VulkanFeatures<VkPhysicalDeviceRayQueryFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR>
+      features_KHR_ray_query;
+  VulkanFeatures<VkPhysicalDeviceTransformFeedbackFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT>
+      features_EXT_transform_feedback;
   // Requested only by vendor upscalers (XeSS).
   VulkanFeatures<VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT>
@@ -407,6 +427,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_AMD_anti_lag) {
       features_AMD_anti_lag.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_acceleration_structure) {
+      features_KHR_acceleration_structure.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_ray_query) {
+      features_KHR_ray_query.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_EXT_transform_feedback) {
+      features_EXT_transform_feedback.Link(supported_features_2, device_create_info);
     }
     if (ext_EXT_mutable_descriptor_type) {
       features_EXT_mutable_descriptor_type.Link(supported_features_2, device_create_info);
@@ -774,6 +803,25 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_EXT_robustness2, nullDescriptor)
     }
+  }
+
+  {
+    // Ray queries need buffer device addresses (core 1.2, enabled above).
+    auto& ext = device->extensions_;
+    const bool ray_query = ext.ext_KHR_acceleration_structure && ext.ext_KHR_ray_query &&
+                           ext.ext_KHR_deferred_host_operations &&
+                           features_KHR_acceleration_structure.supported.accelerationStructure &&
+                           features_KHR_ray_query.supported.rayQuery &&
+                           features_1_2.enabled.bufferDeviceAddress;
+    features_KHR_acceleration_structure.enabled.accelerationStructure = ray_query;
+    features_KHR_ray_query.enabled.rayQuery = ray_query;
+    ext.ext_KHR_acceleration_structure = ext.ext_KHR_ray_query =
+        ext.ext_KHR_deferred_host_operations = ray_query;
+    features_EXT_transform_feedback.enabled.transformFeedback =
+        ext.ext_EXT_transform_feedback && features_EXT_transform_feedback.supported.transformFeedback;
+    ext.ext_EXT_transform_feedback = features_EXT_transform_feedback.enabled.transformFeedback;
+    if (ray_query) REXLOG_INFO("* rayQuery");
+    if (ext.ext_EXT_transform_feedback) REXLOG_INFO("* transformFeedback");
   }
 
   if (device->extensions_.ext_AMD_anti_lag) {

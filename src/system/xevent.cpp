@@ -43,8 +43,10 @@ void XEvent::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
       manual_reset_ = false;
       break;
     default:
+      // Never leave the object without a host event: Set and waits use it.
       assert_always();
-      return;
+      manual_reset_ = false;
+      break;
   }
 
   bool initial_state = header->signal_state ? true : false;

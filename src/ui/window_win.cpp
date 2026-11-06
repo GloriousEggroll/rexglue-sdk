@@ -136,6 +136,21 @@ uint32_t Win32Window::GetMediumDpi() const {
   return USER_DEFAULT_SCREEN_DPI;
 }
 
+// The current mode of the monitor the window is on.
+double Win32Window::GetMonitorRefreshRateHz() const {
+  MONITORINFOEXW info{};
+  info.cbSize = sizeof(info);
+  const HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTOPRIMARY);
+  DEVMODEW mode{};
+  mode.dmSize = sizeof(mode);
+  if (monitor && GetMonitorInfoW(monitor, &info) &&
+      EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) &&
+      mode.dmDisplayFrequency > 1) {
+    return double(mode.dmDisplayFrequency);
+  }
+  return 60.0;
+}
+
 bool Win32Window::OpenImpl() {
   const Win32WindowedAppContext& win32_app_context =
       static_cast<const Win32WindowedAppContext&>(app_context());

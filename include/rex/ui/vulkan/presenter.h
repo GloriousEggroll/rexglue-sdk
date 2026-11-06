@@ -160,7 +160,6 @@ class VulkanPresenter final : public Presenter {
                               bool& is_8bpc_out_ref) override;
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
-  void AwaitPaintSubmission(uint64_t submission) override;
   void ReleaseGpuEffects() override;
 
  private:
@@ -475,27 +474,17 @@ class VulkanPresenter final : public Presenter {
                                 uint32_t output_height, const GuestOutputPaintConfig& config,
                                 const TemporalUpscaleInputs& inputs);
   void DestroyTemporalUpscalerContext();
-  // Frame generation (FSR 3.1 frame interpolation, dispatched directly; the
-  // presenter paces the generated and real presents itself).
-  bool EnsureFrameGeneration(uint32_t render_width, uint32_t render_height,
-                             uint32_t display_width, uint32_t display_height);
-  void DestroyFrameGeneration();
   // Composites the HUD (where the producer's mask marks it) from `source`
-  // over `target` (GENERAL, storage); used after temporal upscaling and on
-  // generated frames.
+  // over `target` (GENERAL, storage); used after temporal upscaling.
   bool EnsureHudComposite();
   void DestroyHudComposite();
-  // With `hudless`, instead writes the temporal upscaler's input to `target`
-  // at render resolution: `source` with the HUD replaced by `hudless`.
+  // `hudless` is `source` before its HUD; translucent HUD then keeps the
+  // target's own scene under it. With `upscaler_input`, instead writes the
+  // temporal upscaler's input to `target` at render resolution: `source` with
+  // the HUD replaced by `hudless`.
   void RecordHudComposite(VkCommandBuffer command_buffer, VkImageView target, VkExtent2D extent,
                           VkImageView source, VkImageView mask, size_t set_index,
-                          VkImageView hudless = VK_NULL_HANDLE);
-  // Generates the frame between the previous and `real` (FSR output) into
-  // `output`, then restores the HUD from `real`. `real` is in
-  // SHADER_READ_ONLY_OPTIMAL and `output` in GENERAL.
-  bool DispatchFrameGeneration(VkCommandBuffer command_buffer, const GuestOutputImage& real,
-                               const GuestOutputImage& output, const TemporalUpscaleInputs& inputs,
-                               VkImageView hud_source, size_t descriptor_slot);
+                          VkImageView hudless = VK_NULL_HANDLE, bool upscaler_input = false);
 #endif
 
   const VulkanDevice* vulkan_device_;
@@ -560,31 +549,14 @@ class VulkanPresenter final : public Presenter {
   // DLSS or XeSS when present_effect selects one and it is available.
   std::unique_ptr<VendorUpscaler> vendor_upscaler_;
   std::string vendor_upscaler_choice_;
-  void* frame_generation_context_ = nullptr;
-  uint32_t frame_generation_render_width_ = 0, frame_generation_render_height_ = 0;
-  uint32_t frame_generation_display_width_ = 0, frame_generation_display_height_ = 0;
-  uint64_t frame_generation_frame_id_ = 0;
-  bool frame_generation_history_ = false;
-  // Scene frame of the last interpolated real frame: frame generation's
-  // motion vectors span exactly one scene frame.
-  uint64_t frame_generation_last_input_ = UINT64_MAX;
-  // The upscaled real frame while frame generation is on; the paint chain's
-  // FSR output image holds the generated frame until the paced repaint.
-  std::unique_ptr<GuestOutputImage> frame_generation_real_;
-  bool frame_generation_real_pending_ = false;
-  // Smoothed interval between game frames painted with frame generation; the
-  // real frame is shown half of it after the generated one.
-  std::chrono::steady_clock::time_point frame_generation_last_paint_{};
-  std::chrono::duration<float, std::milli> frame_generation_interval_{};
-  VkDescriptorSetLayout frame_generation_hud_set_layout_ = VK_NULL_HANDLE;
-  VkPipelineLayout frame_generation_hud_layout_ = VK_NULL_HANDLE;
-  VkPipeline frame_generation_hud_pipeline_ = VK_NULL_HANDLE;
-  VkDescriptorPool frame_generation_hud_pool_ = VK_NULL_HANDLE;
-  // Three per paint submission: upscaler input, HUD composite, generated frame.
-  std::array<VkDescriptorSet, 9> frame_generation_hud_sets_{};
+  VkDescriptorSetLayout hud_composite_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout hud_composite_layout_ = VK_NULL_HANDLE;
+  VkPipeline hud_composite_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool hud_composite_pool_ = VK_NULL_HANDLE;
+  // Two per paint submission: upscaler input, HUD composite.
+  std::array<VkDescriptorSet, 2 * PaintContext::kSubmissionCount> hud_composite_sets_{};
   // The guest frame without its HUD, fed to the temporal upscaler.
   std::unique_ptr<GuestOutputImage> temporal_upscaler_input_;
-  bool frame_generation_logged_ = false;
 #endif
 };
 

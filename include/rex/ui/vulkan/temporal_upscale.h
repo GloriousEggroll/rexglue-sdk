@@ -1,5 +1,5 @@
 #pragma once
-// Per-frame inputs for temporal upscaling and frame generation, produced by a
+// Per-frame inputs for temporal upscaling, produced by a
 // renderer that knows the scene (depth, motion, jitter) and consumed by the
 // presenter. All images live on the presenter's VkDevice and are in
 // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL once the producing submission has

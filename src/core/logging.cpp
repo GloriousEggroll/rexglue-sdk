@@ -40,6 +40,9 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <csignal>
+#include <cstdlib>
+#include <exception>
 #include <spdlog/sinks/msvc_sink.h>
 #else
 #include <spdlog/sinks/stdout_sinks.h>
@@ -157,11 +160,82 @@ std::shared_ptr<BackgroundSink> g_background_file_sink;
 
 #if REX_PLATFORM_WIN32
 LPTOP_LEVEL_EXCEPTION_FILTER g_previous_exception_filter = nullptr;
-// A crash still leaves every line logged before it in the file.
-LONG WINAPI DrainLogBeforeCrash(EXCEPTION_POINTERS* exception) {
+
+// "module+offset" for a code address, as the hitch tracer prints them.
+std::string DescribeAddress(const void* address) {
+  HMODULE module = nullptr;
+  char name[MAX_PATH] = "?";
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         static_cast<LPCSTR>(address), &module) &&
+      module) {
+    char path[MAX_PATH];
+    if (DWORD length = GetModuleFileNameA(module, path, MAX_PATH)) {
+      const char* base = path + length;
+      while (base > path && base[-1] != '\\' && base[-1] != '/') --base;
+      snprintf(name, sizeof(name), "%s", base);
+    }
+    return fmt::format("{}+{:x}", name,
+                       reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module));
+  }
+  return fmt::format("{}", address);
+}
+
+// Logs what killed the process and the calling thread's stack, then waits
+// for the log file to receive everything.
+void LogFatal(std::string_view what) {
+  void* frames[48];
+  const USHORT count = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
+  std::string stack;
+  for (USHORT i = 0; i < count; ++i) {
+    if (i) stack += " <- ";
+    stack += DescribeAddress(frames[i]);
+  }
+  REXLOG_CRITICAL("Fatal: {} on thread {}; stack: {}", what, GetCurrentThreadId(), stack);
   if (auto sink = g_background_file_sink)
+    sink->Drain(std::chrono::milliseconds(1000));
+}
+
+// A crash still leaves every line logged before it in the file, and the
+// crash itself.
+LONG WINAPI DrainLogBeforeCrash(EXCEPTION_POINTERS* exception) {
+  const EXCEPTION_RECORD* record = exception ? exception->ExceptionRecord : nullptr;
+  if (record) {
+    std::string what = fmt::format("exception {:08X} at {}", uint32_t(record->ExceptionCode),
+                                   DescribeAddress(record->ExceptionAddress));
+    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2)
+      what += fmt::format(" ({} {:x})",
+                          record->ExceptionInformation[0] == 1   ? "writing"
+                          : record->ExceptionInformation[0] == 8 ? "executing"
+                                                                 : "reading",
+                          record->ExceptionInformation[1]);
+    LogFatal(what);
+  } else if (auto sink = g_background_file_sink) {
     sink->Drain(std::chrono::milliseconds(500));
+  }
   return g_previous_exception_filter ? g_previous_exception_filter(exception) : EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Ends that bypass the unhandled exception filter.
+void InstallFatalHandlers() {
+  std::set_terminate([] {
+    std::string what = "std::terminate";
+    if (auto current = std::current_exception()) {
+      try {
+        std::rethrow_exception(current);
+      } catch (const std::exception& e) {
+        what += fmt::format(" (uncaught exception: {})", e.what());
+      } catch (...) {
+        what += " (uncaught non-standard exception)";
+      }
+    }
+    LogFatal(what);
+    std::abort();
+  });
+  signal(SIGABRT, [](int) { LogFatal("abort"); });
+  _set_invalid_parameter_handler([](const wchar_t*, const wchar_t*, const wchar_t*, unsigned int,
+                                    uintptr_t) { LogFatal("C runtime invalid parameter"); });
+  _set_purecall_handler([] { LogFatal("pure virtual call"); });
 }
 #endif
 
@@ -341,6 +415,7 @@ void InitLogging(const LogConfig& config) {
     g_file_sink = g_background_file_sink;
 #if REX_PLATFORM_WIN32
     g_previous_exception_filter = SetUnhandledExceptionFilter(DrainLogBeforeCrash);
+    InstallFatalHandlers();
 #endif
   }
 

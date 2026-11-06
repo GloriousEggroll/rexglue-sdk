@@ -45,6 +45,7 @@ class Win32Window : public Window {
   void* GetNativeWindowHandle() const override { return reinterpret_cast<void*>(hwnd_); }
 
   uint32_t GetMediumDpi() const override;
+  double GetMonitorRefreshRateHz() const override;
 
  protected:
   bool OpenImpl() override;

@@ -359,7 +359,7 @@ class Presenter {
   // Called at graphics shutdown while the device is alive: stops painting
   // helpers and releases third-party GPU effect contexts (FidelityFX), which
   // must not outlive the device.
-  virtual void ReleaseGpuEffects() { StopFrameGenerationPacer(); }
+  virtual void ReleaseGpuEffects() {}
 
  protected:
   enum class PaintResult {
@@ -706,19 +706,6 @@ class Presenter {
   // For calling from the painting implementations if requested.
   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
 
-  // Frame generation: after presenting a generated frame in paint submission
-  // `generated_submission`, paint again `delay` after the GPU has finished
-  // that submission, so the real frame follows the generated one on screen
-  // rather than queueing right behind it. A newer request replaces an older
-  // one. The implementation must stop the pacer in its destructor, before
-  // painting state is destroyed.
-  void ScheduleFrameGenerationRepaint(uint64_t generated_submission,
-                                      std::chrono::steady_clock::duration delay);
-  void StopFrameGenerationPacer();
-  // Blocks until a paint submission has completed on the GPU. Called by the
-  // frame generation pacer with the painting lock held.
-  virtual void AwaitPaintSubmission(uint64_t /* submission */) {}
-
  private:
   enum class PaintMode {
     // Don't paint at all.
@@ -893,18 +880,6 @@ class Presenter {
   std::mutex paint_mode_mutex_;
   // UI thread: writable, guest output thread: read-only.
   PaintMode paint_mode_ = PaintMode::kNone;
-
-  // Frame generation pacer (see ScheduleFrameGenerationRepaint).
-  void FrameGenerationPacerThread();
-  std::mutex frame_generation_pacer_mutex_;
-  std::condition_variable frame_generation_pacer_wake_;
-  std::thread frame_generation_pacer_thread_;
-  bool frame_generation_pacer_stop_ = false;
-  bool frame_generation_pacer_pending_ = false;
-  // Incremented by every request, so a waiting pacer notices a newer one.
-  uint64_t frame_generation_pacer_sequence_ = 0;
-  uint64_t frame_generation_pacer_submission_ = 0;
-  std::chrono::steady_clock::duration frame_generation_pacer_delay_{};
 
   // These fields can be accessed _exclusively_ by either the UI thread or the
   // guest output thread, depending on paint_mode_.

@@ -31,7 +31,6 @@
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 #include <ffx_api/ffx_api.h>
-#include <ffx_api/ffx_framegeneration.h>
 #include <ffx_api/ffx_upscale.h>
 #include <ffx_api/vk/ffx_api_vk.h>
 #endif
@@ -60,9 +59,6 @@ REXCVAR_DEFINE_DOUBLE(present_fsr3_ghosting_reduction, 1.0, "UI/Presenter",
                       "FSR 3.1: shorten the history from 0 (AMD default, sharpest when still) to "
                       "1 (default: least ghosting on animation without motion vectors, more "
                       "shimmer)");
-REXCVAR_DEFINE_BOOL(present_frame_generation, false, "UI/Presenter",
-                    "FSR 3.1 frame generation: show a generated frame between game frames. "
-                    "Needs present_effect=fsr3 and a renderer that supplies scene inputs");
 REXCVAR_DEFINE_BOOL(present_gpu_timestamps, false, "UI/Presenter",
                     "Observe existing paint GPU duration without additional waits")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -223,12 +219,10 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
 void VulkanPresenter::ReleaseGpuEffects() {
   Presenter::ReleaseGpuEffects();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-  if (temporal_upscaler_context_ || frame_generation_context_ || vendor_upscaler_ ||
-      temporal_upscaler_input_) {
+  if (temporal_upscaler_context_ || vendor_upscaler_ || temporal_upscaler_input_) {
     paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
     REXLOG_INFO("VulkanPresenter: releasing upscaler contexts");
     vendor_upscaler_.reset();
-    DestroyFrameGeneration();
     DestroyTemporalUpscalerContext();
     temporal_upscaler_input_.reset();
   }
@@ -237,8 +231,6 @@ void VulkanPresenter::ReleaseGpuEffects() {
 }
 
 VulkanPresenter::~VulkanPresenter() {
-  // The pacer paints through this object; stop it before anything goes away.
-  StopFrameGenerationPacer();
   // Destroy the swapchain after its images are not used for drawing anymore.
   // This is a confusing part in Vulkan, as vkQueuePresentKHR doesn't signal a
   // fence clearly indicating when it's safe to destroy a swapchain, so we
@@ -258,7 +250,6 @@ VulkanPresenter::~VulkanPresenter() {
   guest_output_image_refresher_submission_tracker_.Shutdown();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   vendor_upscaler_.reset();
-  DestroyFrameGeneration();
   DestroyHudComposite();
   DestroyTemporalUpscalerContext();
 #endif
@@ -397,10 +388,12 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
       output_image == VK_NULL_HANDLE || !input_width || !input_height || !output_width ||
       !output_height || inputs.width != input_width || inputs.height != input_height ||
       !inputs.depth.image || !inputs.motion_vectors.image) {
-    static std::atomic<bool> logged = false;
-    if (!logged.exchange(true)) {
-      REXLOG_WARN("VulkanPresenter: temporal upscaler inputs rejected: input {}x{}, scene inputs "
-                  "{}x{}, depth {}, motion {}", input_width, input_height, inputs.width,
+    // The first rejection, then every 600th (a persistent mismatch means
+    // the upscaler never runs).
+    static std::atomic<uint64_t> rejections = 0;
+    if (const uint64_t n = ++rejections; n == 1 || n % 600 == 0) {
+      REXLOG_WARN("VulkanPresenter: temporal upscaler inputs rejected ({} frames): input {}x{}, scene inputs "
+                  "{}x{}, depth {}, motion {}", n, input_width, input_height, inputs.width,
                   inputs.height, inputs.depth.image != VK_NULL_HANDLE,
                   inputs.motion_vectors.image != VK_NULL_HANDLE);
     }
@@ -552,34 +545,19 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
   return true;
 }
 
-void VulkanPresenter::DestroyFrameGeneration() {
-  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
-  const VkDevice device = vulkan_device_->device();
-  if (frame_generation_context_) {
-    ffxContext* context = reinterpret_cast<ffxContext*>(&frame_generation_context_);
-    ffxDestroyContext(context, nullptr);
-    frame_generation_context_ = nullptr;
-  }
-  frame_generation_real_.reset();
-  frame_generation_real_pending_ = false;
-  frame_generation_history_ = false;
-  frame_generation_render_width_ = frame_generation_render_height_ = 0;
-  frame_generation_display_width_ = frame_generation_display_height_ = 0;
-}
-
 void VulkanPresenter::DestroyHudComposite() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
-  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, frame_generation_hud_pipeline_);
-  util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device, frame_generation_hud_layout_);
-  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device, frame_generation_hud_pool_);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, hud_composite_pipeline_);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device, hud_composite_layout_);
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device, hud_composite_pool_);
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
-                             frame_generation_hud_set_layout_);
-  frame_generation_hud_sets_ = {};
+                             hud_composite_set_layout_);
+  hud_composite_sets_ = {};
 }
 
 bool VulkanPresenter::EnsureHudComposite() {
-  if (frame_generation_hud_pipeline_) {
+  if (hud_composite_pipeline_) {
     return true;
   }
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
@@ -604,26 +582,27 @@ bool VulkanPresenter::EnsureHudComposite() {
   VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
   VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   layout_info.setLayoutCount = 1;
-  layout_info.pSetLayouts = &frame_generation_hud_set_layout_;
+  layout_info.pSetLayouts = &hud_composite_set_layout_;
   layout_info.pushConstantRangeCount = 1;
   layout_info.pPushConstantRanges = &push;
   VkShaderModuleCreateInfo module_info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
   module_info.codeSize = sizeof(shaders::frame_generation_hud_cs);
   module_info.pCode = shaders::frame_generation_hud_cs;
   VkShaderModule module = VK_NULL_HANDLE;
+  constexpr uint32_t kSets = uint32_t(std::tuple_size_v<decltype(hud_composite_sets_)>);
   const VkDescriptorPoolSize pool_sizes[] = {
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 27},
-      {VK_DESCRIPTOR_TYPE_SAMPLER, 9}};
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kSets}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * kSets},
+      {VK_DESCRIPTOR_TYPE_SAMPLER, kSets}};
   VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-  pool_info.maxSets = 9;
+  pool_info.maxSets = kSets;
   pool_info.poolSizeCount = 3;
   pool_info.pPoolSizes = pool_sizes;
   if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
-                                      &frame_generation_hud_set_layout_) != VK_SUCCESS ||
-      dfn.vkCreatePipelineLayout(device, &layout_info, nullptr, &frame_generation_hud_layout_) !=
+                                      &hud_composite_set_layout_) != VK_SUCCESS ||
+      dfn.vkCreatePipelineLayout(device, &layout_info, nullptr, &hud_composite_layout_) !=
           VK_SUCCESS ||
       dfn.vkCreateShaderModule(device, &module_info, nullptr, &module) != VK_SUCCESS ||
-      dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &frame_generation_hud_pool_) !=
+      dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &hud_composite_pool_) !=
           VK_SUCCESS) {
     if (module) dfn.vkDestroyShaderModule(device, module, nullptr);
     DestroyHudComposite();
@@ -634,18 +613,18 @@ bool VulkanPresenter::EnsureHudComposite() {
   pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
   pipeline_info.stage.module = module;
   pipeline_info.stage.pName = "main";
-  pipeline_info.layout = frame_generation_hud_layout_;
+  pipeline_info.layout = hud_composite_layout_;
   const VkResult pipeline_result = dfn.vkCreateComputePipelines(
-      device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &frame_generation_hud_pipeline_);
+      device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &hud_composite_pipeline_);
   dfn.vkDestroyShaderModule(device, module, nullptr);
-  std::array<VkDescriptorSetLayout, 9> set_layouts;
-  set_layouts.fill(frame_generation_hud_set_layout_);
+  std::array<VkDescriptorSetLayout, kSets> set_layouts;
+  set_layouts.fill(hud_composite_set_layout_);
   VkDescriptorSetAllocateInfo allocate_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-  allocate_info.descriptorPool = frame_generation_hud_pool_;
+  allocate_info.descriptorPool = hud_composite_pool_;
   allocate_info.descriptorSetCount = uint32_t(set_layouts.size());
   allocate_info.pSetLayouts = set_layouts.data();
   if (pipeline_result != VK_SUCCESS ||
-      dfn.vkAllocateDescriptorSets(device, &allocate_info, frame_generation_hud_sets_.data()) !=
+      dfn.vkAllocateDescriptorSets(device, &allocate_info, hud_composite_sets_.data()) !=
           VK_SUCCESS) {
     DestroyHudComposite();
     return false;
@@ -656,10 +635,10 @@ bool VulkanPresenter::EnsureHudComposite() {
 void VulkanPresenter::RecordHudComposite(VkCommandBuffer command_buffer, VkImageView target,
                                          VkExtent2D extent, VkImageView source,
                                          VkImageView mask, size_t set_index,
-                                         VkImageView hudless) {
+                                         VkImageView hudless, bool upscaler_input) {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
-  const VkDescriptorSet set = frame_generation_hud_sets_[set_index % frame_generation_hud_sets_.size()];
-  // Binding 3 is the immutable sampler; binding 4 is read only in input mode.
+  const VkDescriptorSet set = hud_composite_sets_[set_index % hud_composite_sets_.size()];
+  // Binding 3 is the immutable sampler.
   VkDescriptorImageInfo images[4] = {
       {VK_NULL_HANDLE, target, VK_IMAGE_LAYOUT_GENERAL},
       {VK_NULL_HANDLE, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -683,180 +662,19 @@ void VulkanPresenter::RecordHudComposite(VkCommandBuffer command_buffer, VkImage
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0,
                            nullptr);
   dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                        frame_generation_hud_pipeline_);
+                        hud_composite_pipeline_);
   dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              frame_generation_hud_layout_, 0, 1, &set, 0, nullptr);
+                              hud_composite_layout_, 0, 1, &set, 0, nullptr);
   const uint32_t constants[3] = {
       extent.width, extent.height,
-      hudless ? 2u : uint32_t(REXCVAR_GET(present_temporal_debug_view))};
-  dfn.vkCmdPushConstants(command_buffer, frame_generation_hud_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+      upscaler_input ? 2u : uint32_t(REXCVAR_GET(present_temporal_debug_view))};
+  dfn.vkCmdPushConstants(command_buffer, hud_composite_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
                          0, sizeof(constants), constants);
   dfn.vkCmdDispatch(command_buffer, (extent.width + 7) / 8, (extent.height + 7) / 8, 1);
 }
 
-bool VulkanPresenter::EnsureFrameGeneration(uint32_t render_width, uint32_t render_height,
-                                            uint32_t display_width, uint32_t display_height) {
-  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
-  const VkDevice device = vulkan_device_->device();
-  if (frame_generation_context_ && frame_generation_render_width_ == render_width &&
-      frame_generation_render_height_ == render_height &&
-      frame_generation_display_width_ == display_width &&
-      frame_generation_display_height_ == display_height) {
-    return true;
-  }
-  // Size changes recreate everything; the paint submissions that used the old
-  // objects are awaited first.
-  paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
-  DestroyFrameGeneration();
-
-  if (!EnsureHudComposite()) {
-    return false;
-  }
-
-  frame_generation_real_ = GuestOutputImage::Create(vulkan_device_, display_width, display_height);
-  if (!frame_generation_real_) {
-    DestroyFrameGeneration();
-    return false;
-  }
-
-  ffxCreateContextDescFrameGeneration create_desc = {};
-  create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
-  create_desc.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED |
-                      FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
-  create_desc.displaySize = {display_width, display_height};
-  create_desc.maxRenderSize = {render_width, render_height};
-  create_desc.backBufferFormat = FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM;
-  ffxCreateBackendVKDesc backend_desc = {};
-  backend_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
-  backend_desc.vkDevice = device;
-  backend_desc.vkPhysicalDevice = vulkan_device_->physical_device();
-  PFN_vkGetDeviceProcAddr vk_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-      vulkan_device_->vulkan_instance()->functions().vkGetInstanceProcAddr(
-          vulkan_device_->vulkan_instance()->instance(), "vkGetDeviceProcAddr"));
-  if (!vk_device_proc_addr) {
-    DestroyFrameGeneration();
-    return false;
-  }
-  g_ffx_vk_get_device_proc_addr.store(vk_device_proc_addr, std::memory_order_relaxed);
-  backend_desc.vkDeviceProcAddr = FfxVkGetDeviceProcAddrCompat;
-  create_desc.header.pNext = &backend_desc.header;
-  ffxContext* context = reinterpret_cast<ffxContext*>(&frame_generation_context_);
-  if (ffxCreateContext(context, &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
-    frame_generation_context_ = nullptr;
-    REXLOG_WARN("VulkanPresenter: Failed to create the FidelityFX frame generation context");
-    DestroyFrameGeneration();
-    return false;
-  }
-  ffxConfigureDescFrameGeneration configure = {};
-  configure.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
-  configure.frameGenerationEnabled = true;
-  // No FidelityFX swapchain: interpolation only (the presenter paces). The
-  // notification would call a swapchain hook that is null off Windows.
-  configure.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
-  configure.frameID = frame_generation_frame_id_;
-  if (ffxConfigure(context, &configure.header) != FFX_API_RETURN_OK) {
-    REXLOG_WARN("VulkanPresenter: Failed to configure FidelityFX frame generation");
-    DestroyFrameGeneration();
-    return false;
-  }
-  frame_generation_render_width_ = render_width;
-  frame_generation_render_height_ = render_height;
-  frame_generation_display_width_ = display_width;
-  frame_generation_display_height_ = display_height;
-  if (!frame_generation_logged_) {
-    frame_generation_logged_ = true;
-    REXLOG_INFO("VulkanPresenter: FSR 3.1 frame generation {}x{} -> {}x{}", render_width,
-                render_height, display_width, display_height);
-  }
-  return true;
-}
-
 float VulkanPresenter::TemporalGhostingReduction() {
   return float(std::clamp(REXCVAR_GET(present_fsr3_ghosting_reduction), 0.0, 1.0));
-}
-
-bool VulkanPresenter::DispatchFrameGeneration(VkCommandBuffer command_buffer,
-                                              const GuestOutputImage& real,
-                                              const GuestOutputImage& output,
-                                              const TemporalUpscaleInputs& inputs,
-                                              VkImageView hud_source,
-                                              size_t descriptor_slot) {
-  ffxContext* context = reinterpret_cast<ffxContext*>(&frame_generation_context_);
-  if (!frame_generation_context_ || !inputs.depth.image || !inputs.motion_vectors.image) {
-    return false;
-  }
-  auto describe = [](VkImage image, VkFormat format, uint32_t width, uint32_t height,
-                     uint32_t usage, uint32_t state) {
-    VkImageCreateInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    info.imageType = VK_IMAGE_TYPE_2D;
-    info.format = format;
-    info.extent = {width, height, 1};
-    info.mipLevels = 1;
-    info.arrayLayers = 1;
-    info.samples = VK_SAMPLE_COUNT_1_BIT;
-    info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
-    return ffxApiGetResourceVK(reinterpret_cast<void*>(image),
-                               ffxApiGetImageResourceDescriptionVK(image, info, usage), state);
-  };
-  const uint64_t frame_id = ++frame_generation_frame_id_;
-
-  ffxDispatchDescFrameGenerationPrepare prepare = {};
-  prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
-  prepare.frameID = frame_id;
-  prepare.commandList = command_buffer;
-  prepare.renderSize = {inputs.width, inputs.height};
-  prepare.jitterOffset = {inputs.jitter_x, inputs.jitter_y};
-  prepare.motionVectorScale = {1.0f, 1.0f};
-  prepare.frameTimeDelta = inputs.frame_time_ms;
-  prepare.cameraNear = inputs.camera_near;
-  prepare.cameraFar = inputs.camera_far;
-  prepare.cameraFovAngleVertical = inputs.fov_y_radians;
-  prepare.viewSpaceToMetersFactor = inputs.view_space_to_meters;
-  prepare.depth = describe(inputs.depth.image, inputs.depth.format, inputs.width, inputs.height,
-                           FFX_API_RESOURCE_USAGE_READ_ONLY,
-                           FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-  prepare.motionVectors =
-      describe(inputs.motion_vectors.image, inputs.motion_vectors.format, inputs.width,
-               inputs.height, FFX_API_RESOURCE_USAGE_READ_ONLY,
-               FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-  if (ffxDispatch(context, &prepare.header) != FFX_API_RETURN_OK) {
-    frame_generation_history_ = false;
-    return false;
-  }
-
-  const VkExtent2D extent = output.extent();
-  ffxDispatchDescFrameGeneration dispatch = {};
-  dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
-  dispatch.commandList = command_buffer;
-  dispatch.presentColor =
-      describe(real.image(), kGuestOutputFormat, extent.width, extent.height,
-               FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-  dispatch.outputs[0] =
-      describe(output.image(), kGuestOutputFormat, extent.width, extent.height,
-               FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
-  dispatch.numGeneratedFrames = 1;
-  const bool consecutive = inputs.frame_id == frame_generation_last_input_ + 1;
-  frame_generation_last_input_ = inputs.frame_id;
-  dispatch.reset = inputs.reset || !frame_generation_history_ || !consecutive;
-  dispatch.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
-  dispatch.minMaxLuminance[0] = 0.0f;
-  dispatch.minMaxLuminance[1] = 1.0f;
-  dispatch.frameID = frame_id;
-  if (ffxDispatch(context, &dispatch.header) != FFX_API_RETURN_OK) {
-    frame_generation_history_ = false;
-    return false;
-  }
-  frame_generation_history_ = true;
-
-  // The real frame is interpolated without its HUD; put the HUD of the guest
-  // frame over the generated one.
-  if (inputs.hudless_color.image && inputs.reactive.view) {
-    RecordHudComposite(command_buffer, output.view(), extent, hud_source, inputs.reactive.view,
-                       descriptor_slot * 3 + 1);
-  }
-  return true;
 }
 #endif
 
@@ -1707,7 +1525,6 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     // surface) moved to a different display, for instance.
     return VK_NULL_HANDLE;
   }
-
   // TODO(Triang3l): Support transforms.
   if (!(surface_capabilities.supportedTransforms &
         (VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR | VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR))) {
@@ -2074,11 +1891,6 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   }
 
   return true;
-}
-
-void VulkanPresenter::AwaitPaintSubmission(uint64_t submission) {
-  paint_context_.submission_tracker.AwaitSubmissionCompletion(
-      std::min(submission, paint_context_.submission_tracker.GetCurrentSubmission()));
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
@@ -2543,64 +2355,23 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             };
             constexpr VkPipelineStageFlags kReadStages =
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-            // Shows the real frame after a generated one: copy it into the
-            // image the rest of the chain reads.
-            auto restore_real_frame = [&]() {
-              const VkExtent2D extent = frame_generation_real_->extent();
-              image_barrier(frame_generation_real_->image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
-                            VK_ACCESS_TRANSFER_READ_BIT, kReadStages, VK_PIPELINE_STAGE_TRANSFER_BIT);
-              image_barrier(output_image, VK_IMAGE_LAYOUT_UNDEFINED,
-                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                            kReadStages, VK_PIPELINE_STAGE_TRANSFER_BIT);
-              VkImageCopy copy = {};
-              copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-              copy.dstSubresource = copy.srcSubresource;
-              copy.extent = {extent.width, extent.height, 1};
-              dfn.vkCmdCopyImage(draw_command_buffer, frame_generation_real_->image(),
-                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, output_image,
-                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-              image_barrier(frame_generation_real_->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, kReadStages);
-              image_barrier(output_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                            VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, kReadStages);
-            };
             if (guest_output_refresh_serial == temporal_upscaler_last_serial_ &&
                 output_image == temporal_upscaler_last_output_) {
-              // A repaint of the frame already upscaled into this image: the
-              // paced real frame after a generated one, or a plain repaint.
-              if (frame_generation_real_pending_ && frame_generation_real_) {
-                restore_real_frame();
-                frame_generation_real_pending_ = false;
-              }
+              // A repaint of the frame already upscaled into this image.
               continue;
             }
 
             uint32_t effect_input_width = 0, effect_input_height = 0;
             guest_output_flow.GetEffectInputSize(i, effect_input_width, effect_input_height);
-            const bool frame_generation =
-                REXCVAR_GET(present_frame_generation) &&
-                EnsureFrameGeneration(effect_input_width, effect_input_height,
-                                      effect_rect_size.first, effect_rect_size.second);
-            if (!REXCVAR_GET(present_frame_generation) && frame_generation_context_) {
-              paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
-              DestroyFrameGeneration();
-            }
-            // With frame generation the upscaler writes the real frame aside
-            // and the chain's image receives the generated frame.
-            VkImage upscale_image = frame_generation ? frame_generation_real_->image() : output_image;
+            VkImage upscale_image = output_image;
             image_barrier(upscale_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
                           VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             temporal_upscaler_last_serial_ = 0;
-            frame_generation_real_pending_ = false;
             const VkImageView source_view =
                 i ? paint_context_.guest_output_intermediate_images[i - 1]->view()
                   : guest_output_image->view();
-            const VkImageView upscale_view =
-                frame_generation ? frame_generation_real_->view() : output.view();
+            const VkImageView upscale_view = output.view();
             // The upscaler gets the frame without its HUD: text in its history
             // would smear with the scene's motion around the composited HUD.
             VkImage upscale_source_image = source_image;
@@ -2625,7 +2396,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                 RecordHudComposite(draw_command_buffer, temporal_upscaler_input_->view(),
                                    {effect_input_width, effect_input_height}, source_view,
                                    guest_output_temporal_inputs->reactive.view,
-                                   size_t(current_paint_submission_index) * 3 + 2, hudless.view);
+                                   size_t(current_paint_submission_index) * 2 + 1, hudless.view,
+                                   true);
                 image_barrier(temporal_upscaler_input_->image(), VK_IMAGE_LAYOUT_GENERAL,
                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                               VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
@@ -2643,76 +2415,22 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
               temporal_upscaler_last_serial_ = guest_output_refresh_serial;
               temporal_upscaler_last_output_ = output_image;
               // The HUD is not jittered: take it from the guest frame,
-              // scaled, rather than through the temporal upscaler. With frame
-              // generation, only after the HUD-less real frame has been
-              // interpolated, so text is never warped.
+              // scaled, rather than through the temporal upscaler.
               const bool hud_composite =
                   (guest_output_temporal_inputs->hudless_color.image ||
                    REXCVAR_GET(present_temporal_debug_view)) &&
                   guest_output_temporal_inputs->reactive.view && EnsureHudComposite();
-              auto composite_hud = [&] {
+              if (hud_composite) {
                 RecordHudComposite(draw_command_buffer, upscale_view,
                                    {effect_rect_size.first, effect_rect_size.second}, source_view,
                                    guest_output_temporal_inputs->reactive.view,
-                                   size_t(current_paint_submission_index) * 3);
-              };
-              if (hud_composite && !frame_generation) {
-                composite_hud();
+                                   size_t(current_paint_submission_index) * 2,
+                                   guest_output_temporal_inputs->hudless_color.view);
               }
               image_barrier(upscale_image, VK_IMAGE_LAYOUT_GENERAL,
                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
                             VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                             kReadStages);
-              if (frame_generation) {
-                image_barrier(output_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
-                              VK_ACCESS_SHADER_WRITE_BIT, kReadStages,
-                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                const bool generated = DispatchFrameGeneration(
-                    draw_command_buffer, *frame_generation_real_, output,
-                    *guest_output_temporal_inputs, source_view,
-                    size_t(current_paint_submission_index));
-                if (hud_composite) {
-                  image_barrier(upscale_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
-                                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                  composite_hud();
-                  image_barrier(upscale_image, VK_IMAGE_LAYOUT_GENERAL,
-                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kReadStages);
-                }
-                if (generated) {
-                  image_barrier(output_image, VK_IMAGE_LAYOUT_GENERAL,
-                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kReadStages);
-                  // Real frame halfway to the next game frame, counted from
-                  // when the generated frame reaches the screen.
-                  frame_generation_real_pending_ = true;
-                  const auto now = std::chrono::steady_clock::now();
-                  const std::chrono::duration<float, std::milli> interval =
-                      now - frame_generation_last_paint_;
-                  frame_generation_last_paint_ = now;
-                  if (interval.count() < 100.0f) {
-                    frame_generation_interval_ =
-                        frame_generation_interval_.count() > 0.0f
-                            ? frame_generation_interval_ * 0.9f + interval * 0.1f
-                            : interval;
-                  }
-                  const float half_ms = std::clamp(
-                      frame_generation_interval_.count() > 0.0f
-                          ? frame_generation_interval_.count() * 0.5f
-                          : guest_output_temporal_inputs->frame_time_ms * 0.5f,
-                      1.0f, 50.0f);
-                  ScheduleFrameGenerationRepaint(
-                      current_paint_submission_index,
-                      std::chrono::microseconds(int64_t(half_ms * 1000.0f)));
-                } else {
-                  restore_real_frame();
-                }
-              }
               continue;
             }
           }

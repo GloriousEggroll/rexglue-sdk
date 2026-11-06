@@ -1,21 +1,26 @@
 #version 450
-// Puts the HUD of a real frame over an image wherever the producer's HUD mask
-// (green channel of its mask, render resolution, sampled bilinearly) marks it: over the output of a
-// temporal upscaler (the HUD is not jittered, so it must not go through it),
-// and over generated frames (interpolation warps the whole image). The real
-// frame is sampled bilinearly, at render or display resolution.
+// Puts the HUD of the guest frame over the output of a temporal upscaler
+// wherever the producer's HUD mask (green channel of its mask, render
+// resolution, sampled bilinearly) marks it: the HUD is not jittered, so it
+// must not go through the upscaler. The guest frame is sampled bilinearly.
+// Translucent HUD (panels, fades) also shows the guest frame's scene, which
+// does not match the upscaled one. The mask's blue channel holds how much of
+// the scene shows through (the producer's estimate; 0 when unknown), so the
+// image keeps that share of its own scene and gets only the HUD's own
+// contribution (real - hudless * transmittance) on top.
 // Mode 2 builds the temporal upscaler's input at render resolution instead:
 // the real frame, with the HUD (and a one-pixel border for its soft edges)
 // replaced by the frame before the HUD, so text never enters the history.
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 0, rgb10_a2) uniform image2D generated;
+layout(set = 0, binding = 0, rgb10_a2) uniform image2D target;
 layout(set = 0, binding = 1) uniform texture2D real_frame;
 layout(set = 0, binding = 2) uniform texture2D hud_mask;
 layout(set = 0, binding = 3) uniform sampler linear_sampler;
-layout(set = 0, binding = 4) uniform texture2D hudless_frame;  // Mode 2 only.
+layout(set = 0, binding = 4) uniform texture2D hudless_frame;  // The real frame before its HUD.
 layout(push_constant) uniform Constants {
   uvec2 size;
-  uint mode;  // 0: composite the HUD; 1: debug tint (reactive red, HUD green);
+  uint mode;  // 0: composite the HUD; 1: debug tint (reactive red, HUD green,
+              // game motion blue);
               // 2: upscaler input without the HUD
 } pc;
 
@@ -32,7 +37,7 @@ void main() {
       }
     }
     const ivec2 p = ivec2(pixel);
-    imageStore(generated, p, hud > 0.0
+    imageStore(target, p, hud > 0.0
         ? texelFetch(sampler2D(hudless_frame, linear_sampler), p, 0)
         : texelFetch(sampler2D(real_frame, linear_sampler), p, 0));
     return;
@@ -41,14 +46,24 @@ void main() {
   // Widen the soft edge of the upsampled mask so HUD outlines are covered.
   const float hud = clamp(textureLod(sampler2D(hud_mask, linear_sampler), uv, 0.0).g * 2.0, 0.0, 1.0);
   if (pc.mode == 1u) {
-    const vec2 mask = textureLod(sampler2D(hud_mask, linear_sampler), uv, 0.0).rg;
-    const vec4 base = imageLoad(generated, ivec2(pixel));
-    imageStore(generated, ivec2(pixel),
-               vec4(mix(base.rgb, vec3(1.0, 0.0, 0.0), mask.r * 0.6) * (1.0 - mask.g * 0.5) +
+    const vec4 mask = textureLod(sampler2D(hud_mask, linear_sampler), uv, 0.0);
+    const vec4 base = imageLoad(target, ivec2(pixel));
+    // Blue: the game's own motion (dark: drawn as not moving, the player).
+    // Yellow: game motion clamped to its maximum length.
+    const vec3 object = mask.a > 0.75 ? vec3(0.0, 0.4, 1.0) : mask.a > 0.375 ? vec3(0.0, 0.0, 0.5)
+                                                                             : vec3(1.0, 1.0, 0.0);
+    imageStore(target, ivec2(pixel),
+               vec4(mix(mix(base.rgb, vec3(1.0, 0.0, 0.0), mask.r * 0.6), object,
+                        mask.a > 0.0 ? 0.5 : 0.0) * (1.0 - mask.g * 0.5) +
                         vec3(0.0, mask.g * 0.5, 0.0), base.a));
     return;
   }
   if (hud <= 0.0) return;
   const vec4 real = textureLod(sampler2D(real_frame, linear_sampler), uv, 0.0);
-  imageStore(generated, ivec2(pixel), mix(imageLoad(generated, ivec2(pixel)), real, hud));
+  const vec4 hudless = textureLod(sampler2D(hudless_frame, linear_sampler), uv, 0.0);
+  const float transmittance = textureLod(sampler2D(hud_mask, linear_sampler), uv, 0.0).b;
+  const vec4 base = imageLoad(target, ivec2(pixel));
+  const vec3 composited =
+      clamp(base.rgb * transmittance + real.rgb - hudless.rgb * transmittance, 0.0, 1.0);
+  imageStore(target, ivec2(pixel), vec4(mix(base.rgb, composited, hud), mix(base.a, real.a, hud)));
 }

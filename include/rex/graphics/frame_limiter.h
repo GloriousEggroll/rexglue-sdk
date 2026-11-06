@@ -21,7 +21,12 @@ class FrameLimiter {
   void Wait(double limit) {
     auto now = Clock::now();
     auto deadline = Deadline(now, limit);
-    if (deadline > now) std::this_thread::sleep_until(deadline);
+    // Sleeping can overshoot by a millisecond or more (Windows timer
+    // granularity, Wine): sleep to just short of the deadline, then yield
+    // until it, so capped frames are evenly spaced.
+    constexpr auto kSpin = std::chrono::microseconds(1500);
+    if (deadline - now > kSpin) std::this_thread::sleep_until(deadline - kSpin);
+    while (Clock::now() < deadline) std::this_thread::yield();
     Presented(Clock::now());
   }
 

@@ -3234,6 +3234,15 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     swap_texture_view = native_source->view;
     frontbuffer_width_scaled = frontbuffer_width_unscaled = native_source->width;
     frontbuffer_height_scaled = frontbuffer_height_unscaled = native_source->height;
+    // A native renderer drawing at an integer multiple of the guest size
+    // (internal resolution scaling) presents its front buffer at that size:
+    // the guest swap size is then the unscaled one, not a crop of the image.
+    if (frontbuffer_width && frontbuffer_height && native_source->width > frontbuffer_width &&
+        native_source->width % frontbuffer_width == 0 &&
+        native_source->height == frontbuffer_height * (native_source->width / frontbuffer_width)) {
+      frontbuffer_width_unscaled = frontbuffer_width;
+      frontbuffer_height_unscaled = frontbuffer_height;
+    }
     frontbuffer_format = native_source->format;
   } else {
     native_scene_authority_.Reference(NativeSceneAuthority::ReferenceOperation::SwapSource,"Xenia swap-source lookup requested");

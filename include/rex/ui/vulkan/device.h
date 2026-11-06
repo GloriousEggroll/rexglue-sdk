@@ -215,6 +215,13 @@ class VulkanDevice {
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
     // With the antiLag feature (else false).
     bool ext_AMD_anti_lag = false;  // #477
+    // Ray queries against acceleration structures, with their features
+    // (accelerationStructure, rayQuery) enabled; all three or none.
+    bool ext_KHR_acceleration_structure = false;  // #151
+    bool ext_KHR_ray_query = false;               // #349
+    bool ext_KHR_deferred_host_operations = false;  // #269
+    // With the transformFeedback feature (else false).
+    bool ext_EXT_transform_feedback = false;  // #29
   };
 
   const Extensions& extensions() const { return extensions_; }
