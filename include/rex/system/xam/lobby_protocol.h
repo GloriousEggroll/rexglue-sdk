@@ -1,7 +1,7 @@
 #pragma once
 /**
  * Wire protocol between game instances and the lobby server
- * (squarehole-lobby), over UDP. All integers are little endian.
+ * (gears3-lobby), over UDP. All integers are little endian.
  *
  * Clients join a room on the server and receive a virtual IPv4 address
  * (10.69.0.0/16) that stands for them on the room's virtual LAN, plus a

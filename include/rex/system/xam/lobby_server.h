@@ -2,7 +2,7 @@
 /**
  * The lobby server (see lobby_protocol.h): rooms, virtual addresses, member
  * lists, broadcast fan-out and relay. Header-only, so the standalone
- * squarehole-lobby and the game's built-in LAN server share it.
+ * gears3-lobby and the game's built-in LAN server share it.
  *
  * Usage: open and bind a UDP socket, construct a Server on it and call Run()
  * on a thread until its `stop` returns true; Close() then tells every member the server
