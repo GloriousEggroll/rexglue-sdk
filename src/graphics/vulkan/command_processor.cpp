@@ -2957,7 +2957,8 @@ bool VulkanCommandProcessor::CanUseNativeQueryAuthority() {
   }
   return REXCVAR_GET(occlusion_query_enable)&&occlusion_query_resources_available_&&
       occlusion_query_pool_!=VK_NULL_HANDLE&&occlusion_query_readback_mapping_&&
-      render_target_cache_&&render_target_cache_->GetPath()==RenderTargetCache::Path::kPixelShaderInterlock&&
+      render_target_cache_&&(render_target_cache_->GetPath()==RenderTargetCache::Path::kPixelShaderInterlock||
+      (native_host_render_targets_&&render_target_cache_->GetPath()==RenderTargetCache::Path::kHostRenderTargets))&&
       !render_target_cache_->IsDrawResolutionScaled();
 }
 

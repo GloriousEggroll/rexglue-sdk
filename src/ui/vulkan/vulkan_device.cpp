@@ -35,6 +35,10 @@ REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, !REX_PLATFORM_MAC, "UI/Vulka
                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
                     "fallback primitive emulation paths)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vulkan_fragment_shader_interlock, true, "UI/Vulkan",
+                    "Use fragment shader interlock where the driver has it (off: behave like a driver "
+                    "without it, such as AMD's on Windows)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_ray_tracing, true, "UI/Vulkan",
                     "Enable ray queries and transform feedback when the GPU supports them, for "
                     "renderers that add ray-traced effects")
@@ -247,7 +251,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       // #198. Also must be enabled for VK_KHR_spirv_1_4.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_shader_float_controls, 1, 2)
       // #252.
-      XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
+      if (REXCVAR_GET(vulkan_fragment_shader_interlock))
+        XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
       // #55.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
       // #277.

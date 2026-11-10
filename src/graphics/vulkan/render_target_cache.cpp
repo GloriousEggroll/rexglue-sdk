@@ -1228,7 +1228,9 @@ void VulkanRenderTargetCache::InitializeTraceCompleteDownloads() {
 }
 
 bool VulkanRenderTargetCache::PrepareNativeStateTransfer(bool write) {
-  if (GetPath() != Path::kPixelShaderInterlock || IsDrawResolutionScaled()) return false;
+  // With host render targets the buffer is only read, for the native
+  // renderer's initial EDRAM contents.
+  if ((GetPath() != Path::kPixelShaderInterlock && write) || IsDrawResolutionScaled()) return false;
   UseEdramBuffer(write ? EdramBufferUsage::kComputeWrite : EdramBufferUsage::kComputeRead);
   if (write) MarkEdramBufferModified();
   return true;

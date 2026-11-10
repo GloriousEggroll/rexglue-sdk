@@ -224,6 +224,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Startup preflight before guest execution. Waits for the GPU-thread context
   // setup through its callback queue; never reads partially initialized pools.
   bool CanUseNativeQueryAuthority();
+  // The native renderer draws into its own host render targets, so this
+  // processor may use host render targets too (drivers without fragment
+  // shader interlock). Call before CanUseNativeQueryAuthority.
+  void AllowNativeWithHostRenderTargets(bool allow) { native_host_render_targets_ = allow; }
   // Terminal teardown after guest execution stops. Prevents any further
   // rendering, fences existing work, and destroys provider-owned GPU resources
   // while the shared Vulkan device remains alive. Not a runtime fallback.
@@ -768,6 +772,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool in_native_draw_boundary_=false,native_draw_submission_prepared_=false,in_native_swap_boundary_=false;
   uint64_t native_query_generation_=0;
   bool native_query_authority_=false,native_query_authority_retired_=false,native_query_authority_armed_=false;
+  std::atomic<bool> native_host_render_targets_{false};
   bool native_rendering_shutdown_=false;
   std::atomic<bool> native_rendering_shutdown_requested_{false};
   std::optional<NativeQueryBoundary> active_native_query_boundary_;
