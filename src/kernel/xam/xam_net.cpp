@@ -47,7 +47,9 @@
 #endif
 
 REXCVAR_DEFINE_BOOL(network_enabled, true, "Network",
-                    "Allow Xbox network APIs to create host sockets");
+                    "Reach other machines; off keeps game sockets on this machine, like a console "
+                    "without a network cable")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {
 namespace kernel {
@@ -270,18 +272,9 @@ u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
 }
 
 u32 NetDll_WSAStartup_entry(u32 caller, u16 version, ppc_ptr_t<X_WSADATA> data_ptr) {
-  if (!REXCVAR_GET(network_enabled)) {
-    if (data_ptr) {
-      data_ptr->version = version;
-      data_ptr->version_high = version;
-      data_ptr->description[0] = '\0';
-      data_ptr->system_status[0] = '\0';
-      data_ptr->max_sockets = 0;
-      data_ptr->max_udpdg = 0;
-    }
-    REXKRNL_INFO("NetDll_WSAStartup: host networking disabled");
-    return 0;
-  }
+  // With networking off, sockets still work but stay on this machine (see
+  // Network::local_address), like a console without a cable: Gears 3 hosts
+  // even a solo campaign as a session and loads an empty level without them.
 
 // TODO(benvanik): abstraction layer needed.
 #if REX_PLATFORM_WIN32
@@ -671,10 +664,6 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
 }
 
 u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
-  if (!REXCVAR_GET(network_enabled)) {
-    return SetSocketError(kWsaNetDown);
-  }
-
   XSocket* socket = new XSocket(REX_KERNEL_STATE());
   X_STATUS result =
       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
@@ -734,10 +723,6 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
 
 i32 NetDll_getsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
                             mapped_void optval_ptr, mapped_u32 optlen_ptr) {
-  if (!REXCVAR_GET(network_enabled)) {
-    return static_cast<i32>(SetSocketError(kWsaNetDown));
-  }
-
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     return static_cast<i32>(SetSocketError(0x2736));  // WSAENOTSOCK

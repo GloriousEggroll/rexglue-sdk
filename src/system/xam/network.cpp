@@ -335,6 +335,8 @@ bool Network::IsWake(uint32_t ip, uint16_t port) {
 
 uint32_t Network::local_address() {
   if (tunnel_enabled()) return tunnel_->vip();
+  // Networking off: sockets bind to loopback, so nothing leaves this machine.
+  if (!REXCVAR_GET(network_enabled)) return 0x7F000001;
   std::lock_guard lock(mutex_);
   if (!local_address_) {
     const std::string configured = REXCVAR_GET(network_address);
